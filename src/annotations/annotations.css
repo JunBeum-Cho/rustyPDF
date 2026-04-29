@@ -1,0 +1,200 @@
+.annotation-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  touch-action: none;
+}
+
+.annotation-shape {
+  cursor: grab;
+  pointer-events: visiblePainted;
+  vector-effect: non-scaling-stroke;
+}
+
+.annotation-shape.selected,
+.annotation-text-object.selected {
+  outline: none;
+}
+
+.annotation-shape.selected {
+  filter: drop-shadow(0 0 1.5px var(--accent));
+}
+
+.annotation-draft {
+  pointer-events: none;
+  stroke-dasharray: 6 4;
+}
+
+.annotation-text-object {
+  cursor: grab;
+  overflow: visible;
+}
+
+.annotation-text {
+  min-width: 100%;
+  min-height: 100%;
+  padding: 4px 6px;
+  border: 1px solid currentColor;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
+  user-select: none;
+}
+
+.annotation-text-edit {
+  display: block;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 4px 6px;
+  border: 1px solid currentColor;
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  font-family: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  line-height: 1.25;
+  resize: none;
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  user-select: text;
+  -webkit-user-select: text;
+  caret-color: currentColor;
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 35%, transparent);
+}
+
+.annotation-text-edit::placeholder {
+  color: color-mix(in srgb, currentColor 50%, transparent);
+}
+
+.annotation-text-object.editing {
+  cursor: text;
+}
+
+.annotation-handle {
+  fill: var(--surface);
+  stroke: var(--accent);
+  stroke-width: 1.5px;
+  cursor: nwse-resize;
+}
+
+.annotation-handle.handle-ne,
+.annotation-handle.handle-sw {
+  cursor: nesw-resize;
+}
+
+.annotation-handle.handle-endpoint {
+  cursor: move;
+  rx: 5;
+  ry: 5;
+}
+
+.annotation-bbox {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1px;
+  stroke-dasharray: 4 3;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+
+.annotation-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 15px;
+}
+
+.annotation-tool-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.annotation-tool-group button {
+  padding: 6px 8px;
+  border-radius: 7px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-dim);
+  min-width: 32px;
+  height: 32px;
+}
+
+.annotation-tool-group button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: transparent;
+}
+
+.annotation-toolbar button.active,
+.annotation-tool-group button.active {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  background: var(--accent);
+}
+
+.annotation-toolbar button.active:hover {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+.annotation-color {
+  display: inline-flex;
+  align-items: center;
+}
+
+.annotation-color input {
+  width: 32px;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.annotation-number {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 15px;
+}
+
+.annotation-number input {
+  width: 52px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+  font-size: 15px;
+}
+
+.annotation-number input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.annotation-save-status {
+  min-width: 60px;
+  color: var(--text-dim);
+  font-size: 13px;
+  letter-spacing: -0.005em;
+}
+
+.annotation-save-status.error {
+  color: var(--text);
+  font-weight: 600;
+}
