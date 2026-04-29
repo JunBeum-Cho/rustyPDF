@@ -270,10 +270,9 @@ async fn note_recent_document(app: tauri::AppHandle, path: String) -> Result<(),
     Ok(())
 }
 
-/// Replace the macOS dock-tile menu with a "최근 사용한 파일 열기" submenu of
-/// the given recents (most-recent first). Clicks on items emit an
-/// "open-pdfs" Tauri event back to the frontend. Same main-thread caveat as
-/// `note_recent_document` applies.
+/// Replace the macOS dock-tile custom menu with the given recents
+/// (most-recent first). Clicks on items emit an "open-pdfs" Tauri event back
+/// to the frontend. Same main-thread caveat as `note_recent_document` applies.
 #[tauri::command(rename_all = "camelCase")]
 async fn set_dock_recents(
     app: tauri::AppHandle,
@@ -295,13 +294,12 @@ async fn set_dock_recents(
 }
 
 #[cfg(target_os = "macos")]
-#[allow(unused_variables, dead_code)]
-fn note_recent_document_native_disabled(path: &str) {
-    // We invoke `NSDocumentController` via Apple's `objc_msgSend` ABI through
-    // `objc2::msg_send!`. Keeping the call narrow avoids dragging in the full
-    // appkit binding for this one feature. The call is best-effort: any obj-c
-    // exception or missing symbol just means the file won't show in the dock
-    // recent-items menu — the in-app recents list is unaffected.
+fn note_recent_document_native(path: &str) {
+    // We invoke `NSDocumentController` through Apple's `objc_msgSend` ABI.
+    // Keeping the call narrow avoids dragging in the full AppKit binding for
+    // this one feature. The call is best-effort: any missing symbol just means
+    // the file won't show in the system recent-documents list; the in-app
+    // recents list is unaffected.
     use std::ffi::c_void;
     use std::os::raw::c_char;
 
@@ -318,6 +316,7 @@ fn note_recent_document_native_disabled(path: &str) {
     // type — we only need a couple of forms here.
     type MsgSend0 = unsafe extern "C" fn(Object, Sel) -> Object;
     type MsgSend1Ptr = unsafe extern "C" fn(Object, Sel, *const c_void) -> Object;
+    type MsgSendVoid1Ptr = unsafe extern "C" fn(Object, Sel, *const c_void);
     type MsgSendPtr = unsafe extern "C" fn(Class, Sel, *const c_char) -> Object;
 
     extern "C" {
@@ -372,14 +371,9 @@ fn note_recent_document_native_disabled(path: &str) {
             return;
         }
         let note = sel_registerName(s("noteNewRecentDocumentURL:").as_ptr());
-        send_obj(controller, note, url as *const c_void);
+        let send_void: MsgSendVoid1Ptr = std::mem::transmute(objc_msgSend as *const ());
+        send_void(controller, note, url as *const c_void);
     }
-}
-
-#[cfg(target_os = "macos")]
-fn note_recent_document_native(_path: &str) {
-    // TEMPORARILY DISABLED — see comment on `set_dock_recents_native`.
-    // Re-enable once the obj-c FFI is moved off raw msgSend casts.
 }
 
 #[cfg(target_os = "windows")]
@@ -407,44 +401,50 @@ fn note_recent_document_native(_path: &str) {}
 
 #[cfg(target_os = "macos")]
 mod dock_menu {
-    //! Dynamic obj-c class that backs the dock-tile recent-items menu.
-    //! AppKit's "Open Recent" submenu only shows up automatically for
-    //! NSDocument-based apps. For us, we have to build the menu ourselves
-    //! and hook clicks through a custom target/action pair. We use
-    //! `objc_allocateClassPair` once at startup to register a class whose
-    //! single method just forwards the menu item's representedObject (the
-    //! file path) into the Rust side via a channel.
+    //! Dynamic obj-c hooks for the app Dock menu.
+    //!
+    //! AppKit asks the NSApplication delegate for `applicationDockMenu:` when
+    //! the user opens the Dock context menu. Tauri's delegate class does not
+    //! implement that optional method, so we add it at runtime and return a
+    //! menu built from the frontend's persisted recent-file list. Menu item
+    //! clicks are routed through a tiny target/action object whose single
+    //! method forwards the item's representedObject path back to the webview.
     use parking_lot::Mutex;
     use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int};
+    use std::os::raw::c_char;
     use std::sync::OnceLock;
     use tauri::{AppHandle, Emitter, Manager};
 
     type Sel = *const c_void;
     type Class = *const c_void;
     type Object = *mut c_void;
-    type Imp = unsafe extern "C" fn(Object, Sel, Object);
 
     extern "C" {
         fn sel_registerName(name: *const c_char) -> Sel;
         fn objc_getClass(name: *const c_char) -> Class;
         fn objc_allocateClassPair(superclass: Class, name: *const c_char, extra_bytes: usize) -> Class;
         fn objc_registerClassPair(cls: Class);
-        fn class_addMethod(cls: Class, name: Sel, imp: Imp, types: *const c_char) -> bool;
+        fn class_addMethod(
+            cls: Class,
+            name: Sel,
+            imp: *const c_void,
+            types: *const c_char,
+        ) -> bool;
+        fn object_getClass(obj: Object) -> Class;
         fn objc_msgSend();
     }
 
     type MsgSend0 = unsafe extern "C" fn(Object, Sel) -> Object;
     type MsgSend1 = unsafe extern "C" fn(Object, Sel, Object) -> Object;
     type MsgSend1Ptr = unsafe extern "C" fn(Object, Sel, *const c_void) -> Object;
-    type MsgSend2 = unsafe extern "C" fn(Object, Sel, Object, Object) -> Object;
     type MsgSend3StringSelString =
         unsafe extern "C" fn(Object, Sel, *const c_void, Sel, *const c_void) -> Object;
-    type MsgSendIntRet = unsafe extern "C" fn(Object, Sel, c_int) -> Object;
-    type MsgSendBool = unsafe extern "C" fn(Object, Sel, bool) -> Object;
     type MsgSendVoidPtr = unsafe extern "C" fn(Object, Sel) -> *const c_void;
 
     static APP_HANDLE: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
+    static RECENT_ITEMS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+    static CURRENT_MENU: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+    static DOCK_MENU_METHOD_INSTALLED: OnceLock<Mutex<bool>> = OnceLock::new();
     // Pointers aren't Send/Sync, but ObjC class objects and instances are
     // shared globally and never deallocated for our app lifetime, so it's
     // safe to store as opaque integers and round-trip through casts.
@@ -453,6 +453,18 @@ mod dock_menu {
 
     fn handle_lock() -> &'static Mutex<Option<AppHandle>> {
         APP_HANDLE.get_or_init(|| Mutex::new(None))
+    }
+
+    fn recent_items_lock() -> &'static Mutex<Vec<(String, String)>> {
+        RECENT_ITEMS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn current_menu_lock() -> &'static Mutex<Option<usize>> {
+        CURRENT_MENU.get_or_init(|| Mutex::new(None))
+    }
+
+    fn dock_menu_method_installed_lock() -> &'static Mutex<bool> {
+        DOCK_MENU_METHOD_INSTALLED.get_or_init(|| Mutex::new(false))
     }
 
     fn cstr(s: &str) -> std::ffi::CString {
@@ -504,6 +516,7 @@ mod dock_menu {
     // catch foreign exceptions" on app startup.
     const CLASS_NAME: &[u8] = b"RustpdfDockHandler\0";
     const METHOD_TYPES: &[u8] = b"v@:@\0";
+    const DOCK_MENU_METHOD_TYPES: &[u8] = b"@@:@\0";
 
     unsafe fn ensure_class() -> Class {
         if let Some(c) = HANDLER_CLASS.get() {
@@ -530,7 +543,12 @@ mod dock_menu {
             // Method type encoding: void return ('v'), self ('@'), _cmd (':'),
             // sender ('@'). See Apple's "Type Encodings" docs.
             let sel = sel_registerName(cstr("openRecent:").as_ptr());
-            class_addMethod(cls, sel, handle_click, METHOD_TYPES.as_ptr() as *const c_char);
+            class_addMethod(
+                cls,
+                sel,
+                handle_click as *const () as *const c_void,
+                METHOD_TYPES.as_ptr() as *const c_char,
+            );
             objc_registerClassPair(cls);
             cls
         };
@@ -570,17 +588,75 @@ mod dock_menu {
         *handle_lock().lock() = Some(app.clone());
     }
 
-    pub fn set_recents(paths: &[String], names: &[String]) {
+    extern "C" fn application_dock_menu(_self: Object, _cmd: Sel, _sender: Object) -> Object {
+        unsafe {
+            let menu = build_menu();
+            *current_menu_lock().lock() = if menu.is_null() {
+                None
+            } else {
+                Some(menu as usize)
+            };
+            menu
+        }
+    }
+
+    unsafe fn ensure_application_dock_menu_method() {
+        let mut installed = dock_menu_method_installed_lock().lock();
+        if *installed {
+            return;
+        }
+
+        let send0: MsgSend0 = std::mem::transmute(objc_msgSend as *const ());
+        let ns_app_class = objc_getClass(cstr("NSApplication").as_ptr());
+        if ns_app_class.is_null() {
+            return;
+        }
+        let shared = sel_registerName(cstr("sharedApplication").as_ptr());
+        let app = send0(ns_app_class as Object, shared);
+        if app.is_null() {
+            return;
+        }
+        let delegate_sel = sel_registerName(cstr("delegate").as_ptr());
+        let delegate = send0(app, delegate_sel);
+        if delegate.is_null() {
+            return;
+        }
+        let delegate_class = object_getClass(delegate);
+        if delegate_class.is_null() {
+            return;
+        }
+
+        let dock_menu_sel = sel_registerName(cstr("applicationDockMenu:").as_ptr());
+        let added = class_addMethod(
+            delegate_class,
+            dock_menu_sel,
+            application_dock_menu as *const () as *const c_void,
+            DOCK_MENU_METHOD_TYPES.as_ptr() as *const c_char,
+        );
+        // If AppKit/Tauri already provides this optional delegate method, do
+        // not replace it. Current Tauri builds do not, so `added` is the path
+        // that enables our recents menu.
+        if added {
+            *installed = true;
+        }
+    }
+
+    unsafe fn build_menu() -> Object {
+        let items = recent_items_lock().lock().clone();
+        if items.is_empty() {
+            return std::ptr::null_mut();
+        }
+
         unsafe {
             let send0: MsgSend0 = std::mem::transmute(objc_msgSend as *const ());
             let send1: MsgSend1 = std::mem::transmute(objc_msgSend as *const ());
             let send3: MsgSend3StringSelString =
                 std::mem::transmute(objc_msgSend as *const ());
 
-            // [NSMenu alloc] init]
+            // [[NSMenu alloc] init]
             let ns_menu_class = objc_getClass(cstr("NSMenu").as_ptr());
             if ns_menu_class.is_null() {
-                return;
+                return std::ptr::null_mut();
             }
             let alloc = sel_registerName(cstr("alloc").as_ptr());
             let init = sel_registerName(cstr("init").as_ptr());
@@ -589,12 +665,12 @@ mod dock_menu {
             let action_sel = sel_registerName(cstr("openRecent:").as_ptr());
             let target = ensure_shared_handler();
             if target.is_null() {
-                return;
+                return std::ptr::null_mut();
             }
 
             let ns_menu_item_class = objc_getClass(cstr("NSMenuItem").as_ptr());
             if ns_menu_item_class.is_null() {
-                return;
+                return std::ptr::null_mut();
             }
             let init_with = sel_registerName(
                 cstr("initWithTitle:action:keyEquivalent:").as_ptr(),
@@ -603,11 +679,17 @@ mod dock_menu {
             let set_represented = sel_registerName(cstr("setRepresentedObject:").as_ptr());
             let add_item = sel_registerName(cstr("addItem:").as_ptr());
 
-            for (path, name) in paths.iter().zip(names.iter()) {
+            for (path, name) in items.iter() {
                 let title = ns_string(name);
                 let key = ns_string("");
                 let alloced = send0(ns_menu_item_class as Object, alloc);
-                let item = send3(alloced, init_with, title as *const c_void, action_sel, key as *const c_void);
+                let item = send3(
+                    alloced,
+                    init_with,
+                    title as *const c_void,
+                    action_sel,
+                    key as *const c_void,
+                );
                 if item.is_null() {
                     continue;
                 }
@@ -617,47 +699,28 @@ mod dock_menu {
                 send1(menu, add_item, item);
             }
 
-            // Set the dock tile menu: [[NSApp dockTile] setMenu:menu]
-            let ns_app_class = objc_getClass(cstr("NSApplication").as_ptr());
-            if ns_app_class.is_null() {
-                return;
-            }
-            let shared = sel_registerName(cstr("sharedApplication").as_ptr());
-            let app = send0(ns_app_class as Object, shared);
-            if app.is_null() {
-                return;
-            }
-            let dock_tile_sel = sel_registerName(cstr("dockTile").as_ptr());
-            let dock_tile = send0(app, dock_tile_sel);
-            if dock_tile.is_null() {
-                return;
-            }
-            let set_menu = sel_registerName(cstr("setMenu:").as_ptr());
-            send1(dock_tile, set_menu, menu);
+            menu
         }
     }
 
-    // Silence unused warnings for type aliases that aren't read directly by
-    // current code paths but are kept for documentation.
-    #[allow(dead_code)]
-    fn _silence_unused(
-        _: MsgSend2,
-        _: MsgSendIntRet,
-        _: MsgSendBool,
-    ) {
+    pub fn set_recents(paths: &[String], names: &[String]) {
+        let items = paths
+            .iter()
+            .zip(names.iter())
+            .take(10)
+            .map(|(path, name)| (path.clone(), name.clone()))
+            .collect();
+        *recent_items_lock().lock() = items;
+        unsafe {
+            ensure_application_dock_menu_method();
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn set_dock_recents_native(app: &tauri::AppHandle, _paths: &[String], _names: &[String]) {
-    // TEMPORARILY DISABLED: registering a custom NSMenu on the dock tile via
-    // raw objc FFI was throwing an NSException at startup that Rust's
-    // panic-abort runtime can't catch. The in-app welcome-screen recents
-    // list is unaffected and remains the canonical UI for now. Re-enable
-    // this once the FFI path is hardened (likely via objc2 crate rather
-    // than hand-rolled msgSend casts).
+fn set_dock_recents_native(app: &tauri::AppHandle, paths: &[String], names: &[String]) {
     dock_menu::install_app_handle(app);
-    let _ = dock_menu::set_recents;
+    dock_menu::set_recents(paths, names);
 }
 
 #[cfg(not(target_os = "macos"))]

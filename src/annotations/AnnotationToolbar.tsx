@@ -72,23 +72,6 @@ export function AnnotationToolbar() {
               return;
             }
             setAnnotationColor(color);
-            // For text annotations, the canonical "color" lives inside the
-            // rich-text spans. Push the change into the editor so highlighted
-            // text actually picks it up — otherwise the color picker only
-            // affects the annotation's outer style.
-            const tab = activeTab();
-            const editingTextAnnotation =
-              tab?.annotations.items.find(
-                (a) => a.id === tab.annotations.editingId && a.type === "text",
-              ) ??
-              tab?.annotations.items.find(
-                (a) =>
-                  a.type === "text" &&
-                  tab.annotations.selectedIds.includes(a.id),
-              );
-            if (editingTextAnnotation) {
-              setFontColor(color);
-            }
           }}
         />
       </label>

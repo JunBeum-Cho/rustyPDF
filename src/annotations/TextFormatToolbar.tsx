@@ -9,11 +9,16 @@ import {
 } from "lucide-solid";
 import { activeTab } from "../state/document";
 import {
+  alignSelectedText,
   annotationStore,
+  hasSelectedTextAnnotation,
   setAnnotationFontFamily,
   setAnnotationFontSize,
   setAnnotationUiFontFamily,
   setAnnotationUiFontSize,
+  toggleSelectedTextBold,
+  toggleSelectedTextItalic,
+  toggleSelectedTextUnderline,
 } from "./store";
 import {
   COMMON_FONTS,
@@ -81,6 +86,40 @@ export function TextFormatToolbar() {
     setAnnotationFontSize(fontSize);
   };
 
+  const applyBold = () => {
+    if (getActiveEditor()) {
+      toggleBold();
+      return;
+    }
+    if (hasSelectedTextAnnotation()) toggleSelectedTextBold();
+  };
+
+  const applyItalic = () => {
+    if (getActiveEditor()) {
+      toggleItalic();
+      return;
+    }
+    if (hasSelectedTextAnnotation()) toggleSelectedTextItalic();
+  };
+
+  const applyUnderline = () => {
+    if (getActiveEditor()) {
+      toggleUnderline();
+      return;
+    }
+    if (hasSelectedTextAnnotation()) toggleSelectedTextUnderline();
+  };
+
+  const applyAlign = (align: "left" | "center" | "right") => {
+    if (getActiveEditor()) {
+      if (align === "left") alignLeft();
+      if (align === "center") alignCenter();
+      if (align === "right") alignRight();
+      return;
+    }
+    if (hasSelectedTextAnnotation()) alignSelectedText(align);
+  };
+
   return (
     <Show when={isTextContext()}>
       <div class="text-format-toolbar" aria-label="text formatting">
@@ -120,7 +159,7 @@ export function TextFormatToolbar() {
             type="button"
             title="굵게 (Cmd+B)"
             onMouseDown={guardFocus}
-            onClick={action(toggleBold)}
+            onClick={action(applyBold)}
           >
             <Bold size={ICON} />
           </button>
@@ -128,7 +167,7 @@ export function TextFormatToolbar() {
             type="button"
             title="기울임 (Cmd+I)"
             onMouseDown={guardFocus}
-            onClick={action(toggleItalic)}
+            onClick={action(applyItalic)}
           >
             <Italic size={ICON} />
           </button>
@@ -136,7 +175,7 @@ export function TextFormatToolbar() {
             type="button"
             title="밑줄 (Cmd+U)"
             onMouseDown={guardFocus}
-            onClick={action(toggleUnderline)}
+            onClick={action(applyUnderline)}
           >
             <Underline size={ICON} />
           </button>
@@ -147,7 +186,7 @@ export function TextFormatToolbar() {
             type="button"
             title="왼쪽 정렬"
             onMouseDown={guardFocus}
-            onClick={action(alignLeft)}
+            onClick={action(() => applyAlign("left"))}
           >
             <AlignLeft size={ICON} />
           </button>
@@ -155,7 +194,7 @@ export function TextFormatToolbar() {
             type="button"
             title="가운데 정렬"
             onMouseDown={guardFocus}
-            onClick={action(alignCenter)}
+            onClick={action(() => applyAlign("center"))}
           >
             <AlignCenter size={ICON} />
           </button>
@@ -163,7 +202,7 @@ export function TextFormatToolbar() {
             type="button"
             title="오른쪽 정렬"
             onMouseDown={guardFocus}
-            onClick={action(alignRight)}
+            onClick={action(() => applyAlign("right"))}
           >
             <AlignRight size={ICON} />
           </button>

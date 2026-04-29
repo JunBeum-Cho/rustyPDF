@@ -35,7 +35,7 @@ import {
 } from "./textFormat";
 import {
   captureRegion,
-  copyDeferredPngToClipboard,
+  copyPngToClipboard,
   emitToast,
   saveCaptureAs,
 } from "../capture/capture";
@@ -93,6 +93,9 @@ type DragState =
 // reference, which forces <For> to remount the row and breaks both dblclick
 // (target lost between the two clicks) and re-entry into edit mode.
 const DRAG_THRESHOLD = 2;
+
+const TEXT_DOUBLE_CLICK_MS = 500;
+const TEXT_DOUBLE_CLICK_DISTANCE_PX = 8;
 
 const MIN_SIZE = 4;
 
@@ -161,6 +164,14 @@ const clearNativeTextSelection = () => {
   }
 };
 
+const activeTextEditor = () => {
+  const active = document.activeElement;
+  return active instanceof HTMLElement &&
+    active.classList.contains("annotation-text-edit")
+    ? active
+    : null;
+};
+
 const textStyleChanged = (
   annotation: Annotation,
   patch: TextStylePatch,
@@ -175,6 +186,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   const [draft, setDraft] = createSignal<Draft>(null);
   const [dragState, setDragState] = createSignal<DragState>(null);
   let layerRef: SVGSVGElement | undefined;
+  let lastTextClick:
+    | { id: string; time: number; clientX: number; clientY: number }
+    | null = null;
 
   const pageAnnotations = createMemo(() =>
     annotationStore.items.filter((annotation) => annotation.page === props.page.index),
@@ -245,6 +259,17 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
 
   const onLayerPointerDown: JSX.EventHandlerUnion<SVGSVGElement, PointerEvent> = (event) => {
     if (event.button !== 0) {
+      return;
+    }
+    lastTextClick = null;
+    if (annotationStore.editingId) {
+      const editor = activeTextEditor();
+      if (editor) {
+        editor.blur();
+      } else {
+        stopEditingAnnotation();
+      }
+      clearAnnotationSelection();
       return;
     }
     // Clicking empty page area always clears the current selection — this
@@ -368,14 +393,6 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       if (currentDraft.type === "capture") {
         const rect = normalizeRect(currentDraft.start, currentDraft.current);
         if (rect.w >= MIN_SIZE && rect.h >= MIN_SIZE) {
-          // CRITICAL: WebKit (Tauri's macOS webview) requires
-          // `navigator.clipboard.write` to be invoked synchronously inside
-          // the user gesture. If we `await captureRegion(...)` first, the
-          // gesture has expired and the write is rejected. So we kick off
-          // the backend render to get a Promise, then immediately call the
-          // deferred-clipboard helper which constructs a `ClipboardItem`
-          // around the still-pending Blob — Safari/WebKit treat that as
-          // belonging to the live gesture and accept it.
           const pngPromise = captureRegion({
             pageIndex: props.page.index,
             x: rect.x,
@@ -384,31 +401,34 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
             h: rect.h,
           });
 
-          // Surface render errors via toast independently of the clipboard
-          // path — otherwise a failed capture is silent.
-          pngPromise.catch((error) => {
-            console.error("capture failed", error);
-            emitToast(
-              `캡처 실패: ${error instanceof Error ? error.message : String(error)}`,
-              "error",
-            );
-          });
-
-          // Synchronously initiate the clipboard write within the gesture.
-          copyDeferredPngToClipboard(pngPromise).then(
-            () => emitToast("스크린샷이 클립보드에 복사됐습니다"),
-            async (clipErr) => {
-              console.warn("clipboard write failed", clipErr);
+          pngPromise.then(
+            (buf) => {
+              emitToast("스크린샷이 준비됐습니다", "info", {
+                timeoutMs: null,
+                actions: [
+                  {
+                    label: "내 컴퓨터로 저장하기",
+                    run: async () => {
+                      const saved = await saveCaptureAs(buf);
+                      if (saved) emitToast("스크린샷을 저장했습니다");
+                    },
+                  },
+                  {
+                    label: "클립보드에 복사하기",
+                    run: async () => {
+                      await copyPngToClipboard(buf);
+                      emitToast("스크린샷이 클립보드에 복사됐습니다");
+                    },
+                  },
+                ],
+              });
+            },
+            (error) => {
+              console.error("capture failed", error);
               emitToast(
-                "클립보드 복사 실패 — 저장 다이얼로그가 열립니다",
+                `캡처 실패: ${error instanceof Error ? error.message : String(error)}`,
                 "error",
               );
-              try {
-                const buf = await pngPromise;
-                await saveCaptureAs(buf);
-              } catch (e) {
-                console.error("save fallback failed", e);
-              }
             },
           );
         }
@@ -431,12 +451,58 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       }
       return;
     }
-    if (dragState()) {
+    const currentDrag = dragState();
+    if (currentDrag) {
+      if (
+        currentDrag.mode === "move" &&
+        !currentDrag.moved &&
+        currentDrag.ids.length === 1
+      ) {
+        const clicked = currentDrag.originals.find(
+          (annotation) => annotation.id === currentDrag.ids[0],
+        );
+        if (clicked?.type === "text") {
+          lastTextClick = {
+            id: clicked.id,
+            time: event.timeStamp || performance.now(),
+            clientX: event.clientX,
+            clientY: event.clientY,
+          };
+        } else {
+          lastTextClick = null;
+        }
+      }
       setDragState(null);
       if (event.currentTarget.hasPointerCapture(event.pointerId)) {
         event.currentTarget.releasePointerCapture(event.pointerId);
       }
     }
+  };
+
+  const shouldEditTextFromPointerDown = (
+    event: PointerEvent,
+    annotation: Annotation,
+  ) => {
+    if (annotation.type !== "text") {
+      lastTextClick = null;
+      return false;
+    }
+    if (event.detail >= 2) {
+      lastTextClick = null;
+      return true;
+    }
+    const previous = lastTextClick;
+    if (!previous || previous.id !== annotation.id) return false;
+    const elapsed = (event.timeStamp || performance.now()) - previous.time;
+    const moved = Math.hypot(
+      event.clientX - previous.clientX,
+      event.clientY - previous.clientY,
+    );
+    const isDoubleClick =
+      elapsed <= TEXT_DOUBLE_CLICK_MS &&
+      moved <= TEXT_DOUBLE_CLICK_DISTANCE_PX;
+    if (isDoubleClick) lastTextClick = null;
+    return isDoubleClick;
   };
 
   const startMove = (event: PointerEvent, annotation: Annotation) => {
@@ -449,6 +515,12 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     event.stopPropagation();
     event.preventDefault();
     clearNativeTextSelection();
+    if (shouldEditTextFromPointerDown(event, annotation)) {
+      selectAnnotation(annotation.id);
+      startEditingAnnotation(annotation.id);
+      setDragState(null);
+      return;
+    }
     const append = event.shiftKey || event.metaKey || event.ctrlKey;
     if (!selectedIds().has(annotation.id) || append) {
       selectAnnotation(annotation.id, append);
@@ -746,6 +818,10 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                   color: annotation.style.color,
                   "font-size": `${fontSize()}px`,
                   "font-family": annotation.style.fontFamily ?? "inherit",
+                  "font-weight": annotation.style.fontWeight ?? "normal",
+                  "font-style": annotation.style.fontStyle ?? "normal",
+                  "text-decoration": annotation.style.textDecoration ?? "none",
+                  "text-align": annotation.style.textAlign ?? "left",
                 }}
                 // innerHTML so existing rich-text styling round-trips. The
                 // empty-state placeholder is rendered via CSS ::before when
@@ -761,6 +837,10 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                 color: annotation.style.color,
                 "font-size": `${fontSize()}px`,
                 "font-family": annotation.style.fontFamily ?? "inherit",
+                "font-weight": annotation.style.fontWeight ?? "normal",
+                "font-style": annotation.style.fontStyle ?? "normal",
+                "text-decoration": annotation.style.textDecoration ?? "none",
+                "text-align": annotation.style.textAlign ?? "left",
               }}
               attr:data-annotation-zoom={props.zoom}
               ref={(el) => {

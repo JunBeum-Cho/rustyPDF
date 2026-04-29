@@ -13,22 +13,50 @@
 
 .toast-item {
   pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px;
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  padding: 10px 16px;
+  border-radius: 8px;
+  padding: 10px 12px;
   font-size: 13px;
   box-shadow: var(--shadow);
   cursor: pointer;
   animation: toast-in 0.2s ease-out;
-  max-width: 480px;
-  text-align: center;
+  max-width: min(640px, calc(100vw - 32px));
+  text-align: left;
 }
 
 .toast-item.error {
   border-color: #dc2626;
   color: #dc2626;
+}
+
+.toast-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.toast-action {
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.toast-action:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 @keyframes toast-in {

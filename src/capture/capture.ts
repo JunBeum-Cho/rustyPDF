@@ -93,7 +93,17 @@ export async function saveCaptureAs(buf: ArrayBuffer): Promise<boolean> {
   return true;
 }
 
-interface ToastEvent {
+export interface ToastAction {
+  label: string;
+  run: () => void | Promise<void>;
+}
+
+export interface ToastOptions {
+  actions?: ToastAction[];
+  timeoutMs?: number | null;
+}
+
+export interface ToastEvent extends ToastOptions {
   message: string;
   kind?: "info" | "error";
 }
@@ -102,6 +112,10 @@ let toastEmitter: ((event: ToastEvent) => void) | null = null;
 export const setToastEmitter = (fn: ((event: ToastEvent) => void) | null) => {
   toastEmitter = fn;
 };
-export const emitToast = (message: string, kind: "info" | "error" = "info") => {
-  if (toastEmitter) toastEmitter({ message, kind });
+export const emitToast = (
+  message: string,
+  kind: "info" | "error" = "info",
+  options: ToastOptions = {},
+) => {
+  if (toastEmitter) toastEmitter({ message, kind, ...options });
 };

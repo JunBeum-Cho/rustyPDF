@@ -150,6 +150,78 @@ export const setAnnotationTool = (tool: AnnotationTool) => {
   setDocumentStore("annotationUi", "tool", tool);
 };
 
+const patchTouchesTextDisplay = (patch: Partial<Annotation["style"]>) =>
+  patch.color !== undefined ||
+  patch.fontSize !== undefined ||
+  patch.fontFamily !== undefined ||
+  patch.fontWeight !== undefined ||
+  patch.fontStyle !== undefined ||
+  patch.textDecoration !== undefined ||
+  patch.textAlign !== undefined;
+
+const unwrapElements = (root: DocumentFragment, selector: string) => {
+  root.querySelectorAll<HTMLElement>(selector).forEach((element) => {
+    const parent = element.parentNode;
+    if (!parent) return;
+    while (element.firstChild) {
+      parent.insertBefore(element.firstChild, element);
+    }
+    parent.removeChild(element);
+  });
+};
+
+const stripTextStyleOverrides = (
+  html: string,
+  patch: Partial<Annotation["style"]>,
+) => {
+  if (!html || typeof document === "undefined") return html;
+
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  template.content.querySelectorAll<HTMLElement>("*").forEach((element) => {
+    if (patch.color !== undefined) {
+      element.style.removeProperty("color");
+      element.removeAttribute("color");
+    }
+    if (patch.fontSize !== undefined) {
+      element.style.removeProperty("font-size");
+      element.removeAttribute("size");
+    }
+    if (patch.fontFamily !== undefined) {
+      element.style.removeProperty("font-family");
+      element.removeAttribute("face");
+    }
+    if (patch.fontWeight !== undefined) {
+      element.style.removeProperty("font-weight");
+    }
+    if (patch.fontStyle !== undefined) {
+      element.style.removeProperty("font-style");
+    }
+    if (patch.textDecoration !== undefined) {
+      element.style.removeProperty("text-decoration");
+      element.style.removeProperty("text-decoration-line");
+    }
+    if (patch.textAlign !== undefined) {
+      element.style.removeProperty("text-align");
+      element.removeAttribute("align");
+    }
+    if (element.getAttribute("style")?.trim() === "") {
+      element.removeAttribute("style");
+    }
+  });
+  if (patch.fontWeight !== undefined) {
+    unwrapElements(template.content, "b,strong");
+  }
+  if (patch.fontStyle !== undefined) {
+    unwrapElements(template.content, "i,em");
+  }
+  if (patch.textDecoration !== undefined) {
+    unwrapElements(template.content, "u");
+  }
+
+  return template.innerHTML;
+};
+
 const applyStyleToSelected = (patch: Partial<Annotation["style"]>) => {
   const tab = activeTab();
   if (!tab) return;
@@ -163,6 +235,20 @@ const applyStyleToSelected = (patch: Partial<Annotation["style"]>) => {
       if (annotation.type === "highlight") {
         if (patch.color !== undefined) nextStyle.fill = patch.color;
         nextStyle.width = 0;
+      }
+      if (
+        annotation.type === "text" &&
+        patchTouchesTextDisplay(patch) &&
+        annotation.payload?.html
+      ) {
+        return {
+          ...annotation,
+          style: nextStyle,
+          payload: {
+            ...annotation.payload,
+            html: stripTextStyleOverrides(annotation.payload.html, patch),
+          },
+        };
       }
       return { ...annotation, style: nextStyle };
     });
@@ -200,6 +286,56 @@ export const setAnnotationFontFamily = (fontFamily: string) => {
 
 export const setAnnotationUiFontFamily = (fontFamily: string) => {
   setDocumentStore("annotationUi", "fontFamily", fontFamily);
+};
+
+const selectedTextAnnotations = () => {
+  const tab = activeTab();
+  if (!tab) return [];
+  const selected = new Set(tab.annotations.selectedIds);
+  return tab.annotations.items.filter(
+    (annotation) => annotation.type === "text" && selected.has(annotation.id),
+  );
+};
+
+export const hasSelectedTextAnnotation = () =>
+  selectedTextAnnotations().length > 0;
+
+export const toggleSelectedTextBold = () => {
+  const selected = selectedTextAnnotations();
+  if (selected.length === 0) return;
+  const allBold = selected.every(
+    (annotation) =>
+      annotation.style.fontWeight === "700" ||
+      annotation.style.fontWeight === "bold",
+  );
+  applyStyleToSelected({ fontWeight: allBold ? "normal" : "700" });
+};
+
+export const toggleSelectedTextItalic = () => {
+  const selected = selectedTextAnnotations();
+  if (selected.length === 0) return;
+  const allItalic = selected.every(
+    (annotation) => annotation.style.fontStyle === "italic",
+  );
+  applyStyleToSelected({ fontStyle: allItalic ? "normal" : "italic" });
+};
+
+export const toggleSelectedTextUnderline = () => {
+  const selected = selectedTextAnnotations();
+  if (selected.length === 0) return;
+  const allUnderlined = selected.every(
+    (annotation) => annotation.style.textDecoration === "underline",
+  );
+  applyStyleToSelected({
+    textDecoration: allUnderlined ? "none" : "underline",
+  });
+};
+
+export const alignSelectedText = (
+  textAlign: NonNullable<Annotation["style"]["textAlign"]>,
+) => {
+  if (selectedTextAnnotations().length === 0) return;
+  applyStyleToSelected({ textAlign });
 };
 
 export const selectAnnotation = (id: string, append = false) => {

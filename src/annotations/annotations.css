@@ -46,6 +46,7 @@
 .annotation-text-object {
   cursor: grab;
   overflow: visible;
+  pointer-events: all;
 }
 
 .annotation-text {

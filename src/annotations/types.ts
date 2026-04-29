@@ -29,6 +29,10 @@ export interface AnnotationStyle {
   opacity?: number;
   fontSize?: number;
   fontFamily?: string;
+  fontWeight?: string;
+  fontStyle?: string;
+  textDecoration?: string;
+  textAlign?: "left" | "center" | "right" | "justify";
 }
 
 export interface Annotation {

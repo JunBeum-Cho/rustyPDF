@@ -21,6 +21,27 @@ function isEditableTarget(t: EventTarget | null): boolean {
   return tag === "INPUT" || tag === "TEXTAREA" || t.isContentEditable;
 }
 
+function isAnnotationToolbarTarget(t: EventTarget | null): boolean {
+  return t instanceof HTMLElement && Boolean(t.closest(".annotation-toolbar"));
+}
+
+function handleUndoRedo(e: KeyboardEvent): boolean {
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod) return false;
+  if (e.key === "z" || e.key === "Z") {
+    e.preventDefault();
+    if (e.shiftKey) redoAnnotations();
+    else undoAnnotations();
+    return true;
+  }
+  if (e.key === "y" || e.key === "Y") {
+    e.preventDefault();
+    redoAnnotations();
+    return true;
+  }
+  return false;
+}
+
 function nextZoom() {
   const tab = activeTab();
   if (!tab) return;
@@ -79,7 +100,10 @@ export function installKeyboardShortcuts() {
     applyTheme(uiStore.theme);
 
     const onKey = (e: KeyboardEvent) => {
-      if (isEditableTarget(e.target)) return;
+      if (isEditableTarget(e.target)) {
+        if (isAnnotationToolbarTarget(e.target) && handleUndoRedo(e)) return;
+        return;
+      }
 
       const mod = e.metaKey || e.ctrlKey;
       const tab = activeTab();
@@ -129,17 +153,7 @@ export function installKeyboardShortcuts() {
         cycleTab(e.shiftKey ? -1 : 1);
         return;
       }
-      if (mod && (e.key === "z" || e.key === "Z")) {
-        e.preventDefault();
-        if (e.shiftKey) redoAnnotations();
-        else undoAnnotations();
-        return;
-      }
-      if (mod && (e.key === "y" || e.key === "Y")) {
-        e.preventDefault();
-        redoAnnotations();
-        return;
-      }
+      if (handleUndoRedo(e)) return;
 
       if (!mod) {
         switch (e.key) {

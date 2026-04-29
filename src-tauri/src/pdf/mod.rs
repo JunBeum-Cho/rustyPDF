@@ -50,6 +50,10 @@ pub fn create_pdfium() -> Result<Pdfium, PdfError> {
         if let Some(parent) = exe.parent() {
             candidates.push(parent.join(&lib_name));
             candidates.push(parent.join("../Frameworks").join(&lib_name));
+            candidates.push(parent.join("../Resources/lib").join(&lib_name));
+            candidates.push(parent.join("../Resources").join(&lib_name));
+            candidates.push(parent.join("resources/lib").join(&lib_name));
+            candidates.push(parent.join("resources").join(&lib_name));
         }
     }
 

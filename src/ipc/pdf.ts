@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { emitToast } from "../capture/capture";
 import {
   annotationStore,
   markAnnotationsSavedForTab,
@@ -41,6 +42,9 @@ interface OpenedDocPayload {
 const EAGER_PREFETCH_LIMIT_BYTES = 30 * 1024 * 1024;
 
 export type DirtyChoice = "save" | "discard" | "cancel";
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 export async function flushAnnotationSaveForTab(tabId: string): Promise<void> {
   const idx = findTabIndex(tabId);
@@ -144,18 +148,29 @@ export async function openPdf(path: string): Promise<void> {
       replaceAnnotationsForTab(tab.tabId, []);
     }
   } catch (e) {
+    const message = errorMessage(e);
     setDocumentStore({
       loading: false,
-      error: e instanceof Error ? e.message : String(e),
+      error: message,
     });
+    emitToast(`PDF 열기 실패: ${message}`, "error");
   }
 }
 
 export async function openPdfDialog(): Promise<void> {
-  const selected = await open({
-    multiple: true,
-    filters: [{ name: "PDF", extensions: ["pdf"] }],
-  });
+  let selected: string | string[] | null;
+  try {
+    selected = await open({
+      multiple: true,
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+  } catch (error) {
+    const message = errorMessage(error);
+    console.error("open pdf dialog failed", error);
+    setDocumentStore({ loading: false, error: message });
+    emitToast(`파일 선택 창을 열 수 없습니다: ${message}`, "error");
+    return;
+  }
   if (Array.isArray(selected)) {
     for (const path of selected) {
       await openPdf(path);
