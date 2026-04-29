@@ -100,11 +100,37 @@ export const resizeRect = (
   rect: Rect,
   handle: "nw" | "ne" | "sw" | "se",
   delta: Point,
+  /**
+   * When true, preserve the original rect's aspect ratio. The dragged corner
+   * still goes where the cursor is on its dominant axis; the other axis is
+   * slaved to keep w/h constant. This matches how Photoshop / Figma /
+   * Keynote behave with Shift+drag on image handles.
+   */
+  preserveAspect = false,
 ): Rect => {
-  const left = handle.includes("w") ? rect.x + delta.x : rect.x;
-  const right = handle.includes("e") ? rect.x + rect.w + delta.x : rect.x + rect.w;
-  const top = handle.includes("n") ? rect.y + delta.y : rect.y;
-  const bottom = handle.includes("s") ? rect.y + rect.h + delta.y : rect.y + rect.h;
+  let dx = delta.x;
+  let dy = delta.y;
+  if (preserveAspect && rect.w > 0 && rect.h > 0) {
+    const aspect = rect.h / rect.w;
+    const xSign = handle.includes("w") ? -1 : 1;
+    const ySign = handle.includes("n") ? -1 : 1;
+    const newW = rect.w + xSign * dx;
+    const newH = rect.h + ySign * dy;
+    // Pick whichever axis the user pulled further (relative to the rect's
+    // own dimensions) and slave the other to it. Without this comparison,
+    // small horizontal jitter would jump the height around or vice versa.
+    if (Math.abs(newW - rect.w) * aspect >= Math.abs(newH - rect.h)) {
+      const targetH = newW * aspect;
+      dy = ySign * (targetH - rect.h);
+    } else {
+      const targetW = newH / aspect;
+      dx = xSign * (targetW - rect.w);
+    }
+  }
+  const left = handle.includes("w") ? rect.x + dx : rect.x;
+  const right = handle.includes("e") ? rect.x + rect.w + dx : rect.x + rect.w;
+  const top = handle.includes("n") ? rect.y + dy : rect.y;
+  const bottom = handle.includes("s") ? rect.y + rect.h + dy : rect.y + rect.h;
   return normalizeRect({ x: left, y: top }, { x: right, y: bottom });
 };
 

@@ -1,5 +1,5 @@
-import { For, createEffect, createSignal, on } from "solid-js";
-import { ocrPdfLines, type OcrLine } from "../ipc/pdf";
+import { For, createEffect, createSignal, on, onMount } from "solid-js";
+import { ocrPdfLines, pdfNativeTextLines, type OcrLine } from "../ipc/pdf";
 import { activeTab } from "../state/document";
 import { ocrState } from "./ocr";
 import "./textLayer.css";
@@ -13,16 +13,16 @@ interface Props {
 
 /**
  * Invisible-but-selectable text overlay aligned with the rendered page
- * bitmap. Lets the user drag-select OCR'd text and copy it via the standard
- * browser keyboard shortcut. Each line is positioned in normalized 0–1
- * coords from the OCR engine, scaled into the page's display rectangle.
+ * bitmap. Each line is positioned in normalized 0–1 coords from the OCR /
+ * pdfium text extraction; we measure the rendered glyph width at the
+ * current zoom and apply `transform: scaleX(...)` so the system font's
+ * natural width is squashed/stretched to exactly fill the original PDF
+ * font's bbox width. Without this fix-up the selection highlight drifts
+ * progressively the further you zoom from 100%.
  */
 export function TextLayer(props: Props) {
   const [lines, setLines] = createSignal<OcrLine[]>([]);
 
-  // Pull lines whenever the page or its OCR status changes (newly recognized
-  // page → fetch). The dependency on `done` size is what triggers refresh
-  // after a manual OCR run finishes.
   createEffect(
     on(
       () => {
@@ -33,13 +33,17 @@ export function TextLayer(props: Props) {
       },
       async (deps) => {
         if (!deps) return;
-        const [docId, pageIndex, _doneCount] = deps;
-        void _doneCount;
+        const [docId, pageIndex] = deps;
         try {
-          const fetched = await ocrPdfLines(docId, pageIndex);
-          setLines(fetched ?? []);
+          const native = await pdfNativeTextLines(docId, pageIndex);
+          if (native.length > 0) {
+            setLines(native);
+            return;
+          }
+          const ocr = await ocrPdfLines(docId, pageIndex);
+          setLines(ocr ?? []);
         } catch (error) {
-          console.warn("ocr lines fetch failed", error);
+          console.warn("text-layer fetch failed", error);
           setLines([]);
         }
       },
@@ -55,33 +59,70 @@ export function TextLayer(props: Props) {
       }}
     >
       <For each={lines()}>
-        {(line) => {
-          // Normalized → display pixels.
-          const left = line.x * props.width;
-          const top = line.y * props.height;
-          const w = line.w * props.width;
-          const h = line.h * props.height;
-          // Use bbox height as the font size — close enough for most fonts
-          // that selection highlight matches the actual ink bounds. We
-          // letter-stretch so the rendered text fills the bbox width and
-          // selection covers the OCR ink rather than overflowing.
-          return (
-            <span
-              class="ocr-text-line"
-              style={{
-                left: `${left}px`,
-                top: `${top}px`,
-                width: `${w}px`,
-                height: `${h}px`,
-                "font-size": `${h}px`,
-                "line-height": `${h}px`,
-              }}
-            >
-              {line.text}
-            </span>
-          );
-        }}
+        {(line) => <Line line={line} pageWidth={() => props.width} pageHeight={() => props.height} />}
       </For>
     </div>
+  );
+}
+
+interface LineProps {
+  line: OcrLine;
+  pageWidth: () => number;
+  pageHeight: () => number;
+}
+
+function Line(props: LineProps) {
+  let span!: HTMLSpanElement;
+  const [scaleX, setScaleX] = createSignal(1);
+
+  // Re-measure whenever the page dimensions change. `scrollWidth` reports
+  // the unscaled natural glyph width, while `targetWidth` is the bbox
+  // mapped into the current display. Applying `scaleX = target / natural`
+  // makes the rendered text exactly fill the bbox so the user's selection
+  // highlight matches the original PDF ink.
+  const measure = () => {
+    if (!span) return;
+    const target = props.line.w * props.pageWidth();
+    // Read the natural width with scaleX = 1; the previous transform is
+    // applied via CSS variable below so we can temporarily neutralise it
+    // by measuring `scrollWidth` (which is layout-only and ignores transforms).
+    const natural = span.scrollWidth;
+    if (natural <= 0 || target <= 0) {
+      setScaleX(1);
+      return;
+    }
+    setScaleX(target / natural);
+  };
+
+  onMount(() => {
+    // Wait one frame for the browser to lay out the text at the requested
+    // font-size before measuring; otherwise scrollWidth reads as 0 on
+    // first render in some webkit builds.
+    requestAnimationFrame(measure);
+  });
+
+  // Re-measure on zoom / page-size change.
+  createEffect(
+    on(
+      () => [props.pageWidth(), props.pageHeight()] as const,
+      () => requestAnimationFrame(measure),
+    ),
+  );
+
+  return (
+    <span
+      ref={span}
+      class="ocr-text-line"
+      style={{
+        left: `${props.line.x * props.pageWidth()}px`,
+        top: `${props.line.y * props.pageHeight()}px`,
+        height: `${props.line.h * props.pageHeight()}px`,
+        "font-size": `${props.line.h * props.pageHeight()}px`,
+        "line-height": `${props.line.h * props.pageHeight()}px`,
+        transform: `scaleX(${scaleX()})`,
+      }}
+    >
+      {props.line.text}
+    </span>
   );
 }

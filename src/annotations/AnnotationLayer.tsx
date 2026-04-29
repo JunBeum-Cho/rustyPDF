@@ -28,8 +28,10 @@ import {
   updateAnnotationsLive,
 } from "./store";
 import {
+  readEditorStylePatch,
   registerEditor,
   unregisterEditor,
+  type TextStylePatch,
 } from "./textFormat";
 import {
   captureRegion,
@@ -99,6 +101,7 @@ const styleForTool = (type: AnnotationKind) => {
     color: annotationStore.color,
     width: annotationStore.strokeWidth,
     fontSize: annotationStore.fontSize,
+    fontFamily: annotationStore.fontFamily,
   };
   if (type === "highlight") {
     return {
@@ -150,6 +153,23 @@ const htmlIsEmpty = (html: string) => {
   tmp.innerHTML = html;
   return tmp.textContent?.trim() === "";
 };
+
+const clearNativeTextSelection = () => {
+  const selection = window.getSelection();
+  if (selection && selection.rangeCount > 0) {
+    selection.removeAllRanges();
+  }
+};
+
+const textStyleChanged = (
+  annotation: Annotation,
+  patch: TextStylePatch,
+) =>
+  (patch.color !== undefined && patch.color !== annotation.style.color) ||
+  (patch.fontSize !== undefined &&
+    patch.fontSize !== (annotation.style.fontSize ?? 16)) ||
+  (patch.fontFamily !== undefined &&
+    patch.fontFamily !== annotation.style.fontFamily);
 
 export function AnnotationLayer(props: AnnotationLayerProps) {
   const [draft, setDraft] = createSignal<Draft>(null);
@@ -286,6 +306,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     if (!currentDrag) {
       return;
     }
+    clearNativeTextSelection();
     const point = eventToPagePoint(event);
     const delta = {
       x: point.x - currentDrag.start.x,
@@ -317,9 +338,19 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         };
       });
     } else if (currentDrag.mode === "resize") {
+      // Shift / Ctrl / Meta → preserve aspect ratio. Always-on for images
+      // would feel right but other shape types (rectangle, ellipse) often
+      // need free resize, so we gate on modifier keys uniformly.
+      const preserveAspect =
+        event.shiftKey || event.ctrlKey || event.metaKey;
       updateAnnotationLive(currentDrag.id, (annotation) => ({
         ...annotation,
-        rect: resizeRect(currentDrag.original, currentDrag.handle, delta),
+        rect: resizeRect(
+          currentDrag.original,
+          currentDrag.handle,
+          delta,
+          preserveAspect,
+        ),
       }));
     } else {
       updateAnnotationLive(currentDrag.id, (annotation) => {
@@ -416,6 +447,8 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     // which tool is active. Without stopPropagation the event bubbles to the
     // layer and starts a new draft on top of the annotation we just clicked.
     event.stopPropagation();
+    event.preventDefault();
+    clearNativeTextSelection();
     const append = event.shiftKey || event.metaKey || event.ctrlKey;
     if (!selectedIds().has(annotation.id) || append) {
       selectAnnotation(annotation.id, append);
@@ -443,6 +476,8 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       return;
     }
     event.stopPropagation();
+    event.preventDefault();
+    clearNativeTextSelection();
     selectAnnotation(annotation.id);
     setDragState({
       mode: "resize",
@@ -464,6 +499,8 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       return;
     }
     event.stopPropagation();
+    event.preventDefault();
+    clearNativeTextSelection();
     selectAnnotation(annotation.id);
     setDragState({
       mode: "endpoint",
@@ -485,7 +522,11 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     startEditingAnnotation(annotation.id);
   };
 
-  const commitTextEdit = (annotation: Annotation, html: string) => {
+  const commitTextEdit = (
+    annotation: Annotation,
+    html: string,
+    stylePatch: TextStylePatch = {},
+  ) => {
     if (annotationStore.editingId !== annotation.id) {
       return;
     }
@@ -494,13 +535,14 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       // skip history because addAnnotation already pushed an entry — leaving
       // both would mean the user has to undo twice for an aborted text.
       removeAnnotation(annotation.id, { record: false });
-    } else if (html !== annotationHtml(annotation)) {
+    } else if (html !== annotationHtml(annotation) || textStyleChanged(annotation, stylePatch)) {
       // Derive a plain-text mirror so search and legacy consumers still work.
       const tmp = document.createElement("div");
       tmp.innerHTML = html;
       const text = tmp.textContent ?? "";
       updateAnnotation(annotation.id, (item) => ({
         ...item,
+        style: { ...item.style, ...stylePatch },
         payload: { ...item.payload, html, text },
       }));
     }
@@ -703,6 +745,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                 style={{
                   color: annotation.style.color,
                   "font-size": `${fontSize()}px`,
+                  "font-family": annotation.style.fontFamily ?? "inherit",
                 }}
                 // innerHTML so existing rich-text styling round-trips. The
                 // empty-state placeholder is rendered via CSS ::before when
@@ -717,13 +760,22 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               style={{
                 color: annotation.style.color,
                 "font-size": `${fontSize()}px`,
+                "font-family": annotation.style.fontFamily ?? "inherit",
               }}
+              attr:data-annotation-zoom={props.zoom}
               ref={(el) => {
                 if (!el) return;
                 // Uncontrolled by design — we seed innerHTML once and let
                 // execCommand / Selection drive subsequent edits. Re-binding
                 // innerHTML on every keystroke would blow away the caret.
                 el.innerHTML = annotationHtml(annotation);
+                el.dataset.annotationColor = annotation.style.color;
+                el.dataset.annotationFontSize = String(annotation.style.fontSize ?? 16);
+                if (annotation.style.fontFamily) {
+                  el.dataset.annotationFontFamily = annotation.style.fontFamily;
+                } else {
+                  delete el.dataset.annotationFontFamily;
+                }
                 registerEditor(el);
                 requestAnimationFrame(() => {
                   el.focus();
@@ -744,8 +796,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               onFocus={(event) => registerEditor(event.currentTarget)}
               onBlur={(event) => {
                 const html = event.currentTarget.innerHTML;
+                const stylePatch = readEditorStylePatch(event.currentTarget);
                 unregisterEditor(event.currentTarget);
-                commitTextEdit(annotation, html);
+                commitTextEdit(annotation, html, stylePatch);
               }}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
@@ -850,6 +903,19 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     <svg
       ref={layerRef}
       class="annotation-layer"
+      // In "select" mode the user expects empty areas of the page to be
+      // "transparent" to clicks so they can drag-select the text layer
+      // below. Drawing tools (text/highlight/rect/...) need the SVG to
+      // catch pointer events on empty areas, so we toggle a class instead
+      // of always intercepting. Annotation shapes themselves always keep
+      // pointer-events on so click-to-select still works in select mode.
+      classList={{
+        "passes-through":
+          annotationStore.tool === "select" &&
+          annotationStore.editingId === null &&
+          dragState() === null &&
+          draft() === null,
+      }}
       width={props.width}
       height={props.height}
       viewBox={`0 0 ${displaySize().width * props.zoom} ${displaySize().height * props.zoom}`}

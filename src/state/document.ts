@@ -56,6 +56,7 @@ export interface AnnotationUiState {
   color: string;
   strokeWidth: number;
   fontSize: number;
+  fontFamily: string;
 }
 
 export interface DocumentState {
@@ -76,6 +77,7 @@ const [documentStore, setDocumentStore] = createStore<DocumentState>({
     color: "#e11d48",
     strokeWidth: 2,
     fontSize: 16,
+    fontFamily: "Pretendard Variable",
   },
 });
 

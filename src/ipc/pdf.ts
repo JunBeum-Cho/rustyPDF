@@ -394,6 +394,13 @@ export async function ocrPdfLines(
   });
 }
 
+export async function pdfNativeTextLines(
+  docId: string,
+  pageIndex: number,
+): Promise<OcrLine[]> {
+  return await invoke<OcrLine[]>("pdf_text_lines", { docId, pageIndex });
+}
+
 export async function ocrPdfStatus(docId: string): Promise<number[]> {
   return await invoke<number[]>("pdf_ocr_status", { docId });
 }

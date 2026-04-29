@@ -8,12 +8,19 @@ import {
   Underline,
 } from "lucide-solid";
 import { activeTab } from "../state/document";
-import { annotationStore } from "./store";
+import {
+  annotationStore,
+  setAnnotationFontFamily,
+  setAnnotationFontSize,
+  setAnnotationUiFontFamily,
+  setAnnotationUiFontSize,
+} from "./store";
 import {
   COMMON_FONTS,
   alignCenter,
   alignLeft,
   alignRight,
+  getActiveEditor,
   setFontFamily,
   setFontSizePx,
   toggleBold,
@@ -25,9 +32,7 @@ const ICON = 14;
 
 /**
  * Visible only when a text annotation has the user's attention — either
- * selected or actively being edited. Each control is wired so it doesn't
- * steal focus from the contenteditable: clicks are dispatched on mousedown
- * with preventDefault so the editor's selection survives.
+ * selected or actively being edited.
  */
 export function TextFormatToolbar() {
   const isTextContext = createMemo(() => {
@@ -48,14 +53,32 @@ export function TextFormatToolbar() {
     return false;
   });
 
-  // Buttons must NOT steal focus from the contenteditable. Mousedown is the
-  // first event in the focus-change chain — preventing default there keeps
-  // the editor focused so execCommand can target the live selection.
+  // Formatting buttons must NOT steal focus from the contenteditable.
+  // Native controls such as <select> and <input> must keep their default
+  // mousedown behavior, otherwise the dropdown/spinner never opens.
   const guardFocus = (event: MouseEvent) => event.preventDefault();
 
   const action = (fn: () => void) => (event: MouseEvent) => {
     event.preventDefault();
     fn();
+  };
+
+  const applyFontFamily = (fontFamily: string) => {
+    if (getActiveEditor()) {
+      setAnnotationUiFontFamily(fontFamily);
+      setFontFamily(fontFamily);
+      return;
+    }
+    setAnnotationFontFamily(fontFamily);
+  };
+
+  const applyFontSize = (fontSize: number) => {
+    if (getActiveEditor()) {
+      setAnnotationUiFontSize(fontSize);
+      setFontSizePx(fontSize);
+      return;
+    }
+    setAnnotationFontSize(fontSize);
   };
 
   return (
@@ -64,10 +87,10 @@ export function TextFormatToolbar() {
         <select
           class="text-format-select"
           title="폰트"
-          onMouseDown={guardFocus}
+          value={annotationStore.fontFamily}
           onChange={(event) => {
             const value = event.currentTarget.value;
-            if (value) setFontFamily(value);
+            if (value) applyFontFamily(value);
           }}
         >
           <option value="">폰트</option>
@@ -85,10 +108,9 @@ export function TextFormatToolbar() {
             min="8"
             max="120"
             value={annotationStore.fontSize}
-            onMouseDown={guardFocus}
             onInput={(event) => {
               const px = Number(event.currentTarget.value);
-              if (Number.isFinite(px) && px >= 6) setFontSizePx(px);
+              if (Number.isFinite(px) && px >= 6) applyFontSize(px);
             }}
           />
         </label>

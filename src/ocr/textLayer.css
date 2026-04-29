@@ -27,12 +27,16 @@
   cursor: text;
   user-select: text;
   -webkit-user-select: text;
-  /* Stretch the glyphs to fill the bounding box so the selection rect
-     tracks the OCR ink rather than the natural text width. */
+  /* `top left` keeps `left`/`top` positions stable when we scaleX —
+     otherwise the box would visually shift as the scale ratio changes. */
   transform-origin: top left;
   font-family: -apple-system, system-ui, sans-serif;
   font-weight: 400;
   letter-spacing: 0;
+  /* Don't let the scaled glyph spill into adjacent lines — the bounding
+     rect we set per-span (height, font-size) is the authoritative box. */
+  display: inline-block;
+  overflow: hidden;
 }
 
 .ocr-text-line::selection {

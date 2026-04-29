@@ -28,6 +28,7 @@ export interface AnnotationStyle {
   fill?: string;
   opacity?: number;
   fontSize?: number;
+  fontFamily?: string;
 }
 
 export interface Annotation {

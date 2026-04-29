@@ -67,6 +67,9 @@ export const annotationStore = {
   get fontSize(): number {
     return documentStore.annotationUi.fontSize;
   },
+  get fontFamily(): string {
+    return documentStore.annotationUi.fontFamily;
+  },
 };
 
 export const createAnnotationId = () => {
@@ -172,6 +175,10 @@ export const setAnnotationColor = (color: string) => {
   applyStyleToSelected({ color });
 };
 
+export const setAnnotationUiColor = (color: string) => {
+  setDocumentStore("annotationUi", "color", color);
+};
+
 export const setAnnotationStrokeWidth = (strokeWidth: number) => {
   setDocumentStore("annotationUi", "strokeWidth", strokeWidth);
   applyStyleToSelected({ width: strokeWidth });
@@ -180,6 +187,19 @@ export const setAnnotationStrokeWidth = (strokeWidth: number) => {
 export const setAnnotationFontSize = (fontSize: number) => {
   setDocumentStore("annotationUi", "fontSize", fontSize);
   applyStyleToSelected({ fontSize });
+};
+
+export const setAnnotationUiFontSize = (fontSize: number) => {
+  setDocumentStore("annotationUi", "fontSize", fontSize);
+};
+
+export const setAnnotationFontFamily = (fontFamily: string) => {
+  setDocumentStore("annotationUi", "fontFamily", fontFamily);
+  applyStyleToSelected({ fontFamily });
+};
+
+export const setAnnotationUiFontFamily = (fontFamily: string) => {
+  setDocumentStore("annotationUi", "fontFamily", fontFamily);
 };
 
 export const selectAnnotation = (id: string, append = false) => {

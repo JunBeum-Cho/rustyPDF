@@ -5,10 +5,28 @@
   touch-action: none;
 }
 
+/*
+ * In select mode (no drawing tool active and nothing being edited), the
+ * SVG itself ignores pointer events so the user can drag across empty
+ * regions of the page to highlight the text layer below. Painted shapes
+ * (annotations + handles) keep their own pointer-events so clicking them
+ * still selects/moves them.
+ */
+.annotation-layer.passes-through {
+  pointer-events: none;
+}
+
 .annotation-shape {
   cursor: grab;
   pointer-events: visiblePainted;
   vector-effect: non-scaling-stroke;
+}
+
+.annotation-layer.passes-through .annotation-shape,
+.annotation-layer.passes-through .annotation-handle,
+.annotation-layer.passes-through .annotation-text-object,
+.annotation-layer.passes-through .annotation-image {
+  pointer-events: auto;
 }
 
 .annotation-shape.selected,

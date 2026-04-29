@@ -730,6 +730,7 @@ pub fn run() {
             pdf_capture_region,
             pdf_ocr_page,
             pdf_ocr_lines,
+            pdf_text_lines,
             pdf_ocr_status,
             annotations_load,
             annotations_save,

@@ -20,12 +20,13 @@ import {
   annotationStore,
   redoAnnotations,
   setAnnotationColor,
+  setAnnotationUiColor,
   setAnnotationStrokeWidth,
   setAnnotationTool,
   undoAnnotations,
 } from "./store";
 import { TextFormatToolbar } from "./TextFormatToolbar";
-import { setFontColor } from "./textFormat";
+import { getActiveEditor, setFontColor } from "./textFormat";
 import type { AnnotationTool } from "./types";
 
 const ICON_SIZE = 16;
@@ -65,6 +66,11 @@ export function AnnotationToolbar() {
           value={annotationStore.color}
           onInput={(event) => {
             const color = event.currentTarget.value;
+            if (getActiveEditor()) {
+              setAnnotationUiColor(color);
+              setFontColor(color);
+              return;
+            }
             setAnnotationColor(color);
             // For text annotations, the canonical "color" lives inside the
             // rich-text spans. Push the change into the editor so highlighted
