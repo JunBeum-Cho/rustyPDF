@@ -1,7 +1,12 @@
 import { onCleanup, onMount } from "solid-js";
-import { documentStore, setDocumentStore } from "./state/document";
+import {
+  activeTab,
+  documentStore,
+  setActiveTab,
+  updateActiveTab,
+} from "./state/document";
 import { applyTheme, setUiStore, uiStore } from "./state/ui";
-import { requestOpenPdfDialog } from "./ipc/pdf";
+import { closeTab, requestOpenPdfDialog, saveActivePdf } from "./ipc/pdf";
 import {
   deleteSelectedAnnotations,
   redoAnnotations,
@@ -13,38 +18,41 @@ const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 function isEditableTarget(t: EventTarget | null): boolean {
   if (!(t instanceof HTMLElement)) return false;
   const tag = t.tagName;
-  return (
-    tag === "INPUT" ||
-    tag === "TEXTAREA" ||
-    t.isContentEditable
-  );
+  return tag === "INPUT" || tag === "TEXTAREA" || t.isContentEditable;
 }
 
 function nextZoom() {
-  const next = ZOOM_STEPS.find((z) => z > documentStore.zoom);
-  if (next) setDocumentStore("zoom", next);
+  const tab = activeTab();
+  if (!tab) return;
+  const next = ZOOM_STEPS.find((z) => z > tab.zoom);
+  if (next) updateActiveTab((t) => { t.zoom = next; });
 }
 
 function prevZoom() {
-  const prev = [...ZOOM_STEPS].reverse().find((z) => z < documentStore.zoom);
-  if (prev) setDocumentStore("zoom", prev);
+  const tab = activeTab();
+  if (!tab) return;
+  const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
+  if (prev) updateActiveTab((t) => { t.zoom = prev; });
 }
 
 function rotate(direction: 1 | -1) {
-  const r = ((documentStore.rotation + direction * 90 + 360) % 360) as
+  const tab = activeTab();
+  if (!tab) return;
+  const r = ((tab.rotation + direction * 90 + 360) % 360) as
     | 0
     | 90
     | 180
     | 270;
-  setDocumentStore("rotation", r);
+  updateActiveTab((t) => { t.rotation = r; });
 }
 
 function gotoPage(delta: number) {
-  if (!documentStore.doc) return;
-  const max = documentStore.doc.pageCount - 1;
-  setDocumentStore("currentPage", (p) =>
-    Math.max(0, Math.min(max, p + delta))
-  );
+  const tab = activeTab();
+  if (!tab) return;
+  const max = tab.pageCount - 1;
+  updateActiveTab((t) => {
+    t.currentPage = Math.max(0, Math.min(max, t.currentPage + delta));
+  });
 }
 
 function toggleTheme() {
@@ -58,6 +66,14 @@ function toggleTheme() {
   applyTheme(next);
 }
 
+function cycleTab(direction: 1 | -1) {
+  const tabs = documentStore.tabs;
+  if (tabs.length === 0) return;
+  const idx = tabs.findIndex((t) => t.tabId === documentStore.activeTabId);
+  const next = (idx + direction + tabs.length) % tabs.length;
+  setActiveTab(tabs[next].tabId);
+}
+
 export function installKeyboardShortcuts() {
   onMount(() => {
     applyTheme(uiStore.theme);
@@ -66,6 +82,7 @@ export function installKeyboardShortcuts() {
       if (isEditableTarget(e.target)) return;
 
       const mod = e.metaKey || e.ctrlKey;
+      const tab = activeTab();
 
       if (mod && (e.key === "+" || e.key === "=")) {
         e.preventDefault();
@@ -79,7 +96,7 @@ export function installKeyboardShortcuts() {
       }
       if (mod && e.key === "0") {
         e.preventDefault();
-        setDocumentStore("zoom", 1);
+        updateActiveTab((t) => { t.zoom = 1; });
         return;
       }
       if (mod && (e.key === "o" || e.key === "O")) {
@@ -97,13 +114,25 @@ export function installKeyboardShortcuts() {
         setUiStore("sidebarOpen", (v) => !v);
         return;
       }
+      if (mod && (e.key === "w" || e.key === "W")) {
+        e.preventDefault();
+        if (tab) void closeTab(tab.tabId);
+        return;
+      }
+      if (mod && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        if (tab) void saveActivePdf(e.shiftKey);
+        return;
+      }
+      if (mod && e.key === "Tab") {
+        e.preventDefault();
+        cycleTab(e.shiftKey ? -1 : 1);
+        return;
+      }
       if (mod && (e.key === "z" || e.key === "Z")) {
         e.preventDefault();
-        if (e.shiftKey) {
-          redoAnnotations();
-        } else {
-          undoAnnotations();
-        }
+        if (e.shiftKey) redoAnnotations();
+        else undoAnnotations();
         return;
       }
       if (mod && (e.key === "y" || e.key === "Y")) {
@@ -112,7 +141,6 @@ export function installKeyboardShortcuts() {
         return;
       }
 
-      // unmodified
       if (!mod) {
         switch (e.key) {
           case "Backspace":
@@ -141,15 +169,12 @@ export function installKeyboardShortcuts() {
             break;
           case "Home":
             e.preventDefault();
-            setDocumentStore("currentPage", 0);
+            updateActiveTab((t) => { t.currentPage = 0; });
             break;
           case "End":
             e.preventDefault();
-            if (documentStore.doc) {
-              setDocumentStore(
-                "currentPage",
-                documentStore.doc.pageCount - 1
-              );
+            if (tab) {
+              updateActiveTab((t) => { t.currentPage = t.pageCount - 1; });
             }
             break;
         }

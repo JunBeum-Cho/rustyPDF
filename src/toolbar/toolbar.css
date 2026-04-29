@@ -112,6 +112,21 @@
   color: var(--accent-fg);
 }
 
+.toolbar-btn.save-dirty {
+  position: relative;
+}
+
+.toolbar-btn.save-dirty::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #f59e0b;
+}
+
 .toolbar button.active:hover,
 .toolbar-btn.active:hover {
   background: var(--accent);

@@ -1,24 +1,15 @@
-import { createStore, produce } from "solid-js/store";
+import {
+  activeTab,
+  documentStore,
+  emptyAnnotationTabState,
+  findTabIndex,
+  setDocumentStore,
+  updateActiveTab,
+  updateTabById,
+  type AnnotationTabState,
+  type SaveStatus,
+} from "../state/document";
 import type { Annotation, AnnotationTool } from "./types";
-
-type SaveStatus = "idle" | "saving" | "saved" | "error";
-
-interface AnnotationState {
-  items: Annotation[];
-  selectedIds: string[];
-  editingId: string | null;
-  tool: AnnotationTool;
-  color: string;
-  strokeWidth: number;
-  fontSize: number;
-  dirty: boolean;
-  saveStatus: SaveStatus;
-  saveError: string | null;
-  lastSavedAt: string | null;
-  loadedPath: string | null;
-  history: Annotation[][];
-  future: Annotation[][];
-}
 
 const HISTORY_LIMIT = 80;
 
@@ -31,22 +22,52 @@ const cloneAnnotations = (items: Annotation[]) =>
     payload: item.payload ? { ...item.payload } : undefined,
   }));
 
-export const [annotationStore, setAnnotationStore] = createStore<AnnotationState>({
-  items: [],
-  selectedIds: [],
-  editingId: null,
-  tool: "select",
-  color: "#e11d48",
-  strokeWidth: 2,
-  fontSize: 16,
-  dirty: false,
-  saveStatus: "idle",
-  saveError: null,
-  lastSavedAt: null,
-  loadedPath: null,
-  history: [],
-  future: [],
-});
+/**
+ * Facade over `documentStore.tabs[active].annotations` so the rest of the app
+ * keeps a single import surface. Reads are getters (reactive), writes target
+ * the active tab.
+ */
+export const annotationStore = {
+  get items(): Annotation[] {
+    return activeTab()?.annotations.items ?? [];
+  },
+  get selectedIds(): string[] {
+    return activeTab()?.annotations.selectedIds ?? [];
+  },
+  get editingId(): string | null {
+    return activeTab()?.annotations.editingId ?? null;
+  },
+  get dirty(): boolean {
+    return activeTab()?.annotations.dirty ?? false;
+  },
+  get saveStatus(): SaveStatus {
+    return activeTab()?.annotations.saveStatus ?? "idle";
+  },
+  get saveError(): string | null {
+    return activeTab()?.annotations.saveError ?? null;
+  },
+  get lastSavedAt(): string | null {
+    return activeTab()?.annotations.lastSavedAt ?? null;
+  },
+  get history(): Annotation[][] {
+    return activeTab()?.annotations.history ?? [];
+  },
+  get future(): Annotation[][] {
+    return activeTab()?.annotations.future ?? [];
+  },
+  get tool(): AnnotationTool {
+    return documentStore.annotationUi.tool;
+  },
+  get color(): string {
+    return documentStore.annotationUi.color;
+  },
+  get strokeWidth(): number {
+    return documentStore.annotationUi.strokeWidth;
+  },
+  get fontSize(): number {
+    return documentStore.annotationUi.fontSize;
+  },
+};
 
 export const createAnnotationId = () => {
   if ("randomUUID" in crypto) {
@@ -55,146 +76,138 @@ export const createAnnotationId = () => {
   return `annotation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
-export const recordAnnotationHistory = () => {
-  setAnnotationStore(
-    produce((state) => {
-      state.history.push(cloneAnnotations(state.items));
-      if (state.history.length > HISTORY_LIMIT) {
-        state.history.shift();
-      }
-      state.future = [];
-    }),
-  );
-};
-
-const markDirty = () => {
-  setAnnotationStore({
-    dirty: true,
-    saveStatus: "idle",
-    saveError: null,
+const mutateActiveAnnotations = (mutator: (state: AnnotationTabState) => void) => {
+  updateActiveTab((tab) => {
+    mutator(tab.annotations);
   });
 };
 
-export const replaceAnnotations = (items: Annotation[], path: string | null) => {
-  setAnnotationStore({
-    items: cloneAnnotations(items),
-    selectedIds: [],
-    editingId: null,
-    dirty: false,
-    saveStatus: "idle",
-    saveError: null,
-    lastSavedAt: null,
-    loadedPath: path,
-    history: [],
-    future: [],
+export const recordAnnotationHistory = () => {
+  mutateActiveAnnotations((state) => {
+    state.history.push(cloneAnnotations(state.items));
+    if (state.history.length > HISTORY_LIMIT) {
+      state.history.shift();
+    }
+    state.future = [];
+  });
+};
+
+const markDirty = () => {
+  mutateActiveAnnotations((state) => {
+    state.dirty = true;
+    state.saveStatus = "idle";
+    state.saveError = null;
+  });
+};
+
+/**
+ * Reset annotations for a specific tab — used on initial load and on doc
+ * reload. Pass `tabId` because the active tab may already have changed by the
+ * time async loads resolve.
+ */
+export const replaceAnnotationsForTab = (tabId: string, items: Annotation[]) => {
+  if (findTabIndex(tabId) < 0) return;
+  updateTabById(tabId, (tab) => {
+    tab.annotations = emptyAnnotationTabState();
+    tab.annotations.items = cloneAnnotations(items);
   });
 };
 
 export const startEditingAnnotation = (id: string) => {
-  setAnnotationStore({ editingId: id });
+  mutateActiveAnnotations((state) => {
+    state.editingId = id;
+  });
 };
 
 export const stopEditingAnnotation = () => {
-  if (annotationStore.editingId) {
-    setAnnotationStore({ editingId: null });
-  }
+  if (!annotationStore.editingId) return;
+  mutateActiveAnnotations((state) => {
+    state.editingId = null;
+  });
 };
 
-/**
- * Remove a single annotation. Used when an in-progress text edit is committed
- * empty (treated as a cancel). Records history so the action is undoable.
- */
-export const removeAnnotation = (id: string, { record = true }: { record?: boolean } = {}) => {
+export const removeAnnotation = (
+  id: string,
+  { record = true }: { record?: boolean } = {},
+) => {
   if (record) {
     recordAnnotationHistory();
   }
-  setAnnotationStore(
-    produce((state) => {
-      state.items = state.items.filter((annotation) => annotation.id !== id);
-      state.selectedIds = state.selectedIds.filter((selectedId) => selectedId !== id);
-      if (state.editingId === id) {
-        state.editingId = null;
-      }
-    }),
-  );
+  mutateActiveAnnotations((state) => {
+    state.items = state.items.filter((a) => a.id !== id);
+    state.selectedIds = state.selectedIds.filter((sid) => sid !== id);
+    if (state.editingId === id) state.editingId = null;
+  });
   if (record) {
     markDirty();
   }
 };
 
 export const setAnnotationTool = (tool: AnnotationTool) => {
-  setAnnotationStore({ tool });
+  setDocumentStore("annotationUi", "tool", tool);
 };
 
 const applyStyleToSelected = (patch: Partial<Annotation["style"]>) => {
-  if (annotationStore.selectedIds.length === 0) {
-    return;
-  }
-  const selected = new Set(annotationStore.selectedIds);
+  const tab = activeTab();
+  if (!tab) return;
+  if (tab.annotations.selectedIds.length === 0) return;
+  const selected = new Set(tab.annotations.selectedIds);
   recordAnnotationHistory();
-  setAnnotationStore(
-    produce((state) => {
-      state.items = state.items.map((annotation) => {
-        if (!selected.has(annotation.id)) {
-          return annotation;
-        }
-        const nextStyle = { ...annotation.style, ...patch };
-        if (annotation.type === "highlight") {
-          if (patch.color !== undefined) {
-            nextStyle.fill = patch.color;
-          }
-          nextStyle.width = 0;
-        }
-        return { ...annotation, style: nextStyle };
-      });
-    }),
-  );
+  mutateActiveAnnotations((state) => {
+    state.items = state.items.map((annotation) => {
+      if (!selected.has(annotation.id)) return annotation;
+      const nextStyle = { ...annotation.style, ...patch };
+      if (annotation.type === "highlight") {
+        if (patch.color !== undefined) nextStyle.fill = patch.color;
+        nextStyle.width = 0;
+      }
+      return { ...annotation, style: nextStyle };
+    });
+  });
   markDirty();
 };
 
 export const setAnnotationColor = (color: string) => {
-  setAnnotationStore({ color });
+  setDocumentStore("annotationUi", "color", color);
   applyStyleToSelected({ color });
 };
 
 export const setAnnotationStrokeWidth = (strokeWidth: number) => {
-  setAnnotationStore({ strokeWidth });
+  setDocumentStore("annotationUi", "strokeWidth", strokeWidth);
   applyStyleToSelected({ width: strokeWidth });
 };
 
 export const setAnnotationFontSize = (fontSize: number) => {
-  setAnnotationStore({ fontSize });
+  setDocumentStore("annotationUi", "fontSize", fontSize);
   applyStyleToSelected({ fontSize });
 };
 
 export const selectAnnotation = (id: string, append = false) => {
-  setAnnotationStore(
-    produce((state) => {
-      if (append) {
-        if (state.selectedIds.includes(id)) {
-          state.selectedIds = state.selectedIds.filter((selectedId) => selectedId !== id);
-        } else {
-          state.selectedIds.push(id);
-        }
+  mutateActiveAnnotations((state) => {
+    if (append) {
+      if (state.selectedIds.includes(id)) {
+        state.selectedIds = state.selectedIds.filter((sid) => sid !== id);
       } else {
-        state.selectedIds = [id];
+        state.selectedIds.push(id);
       }
-    }),
-  );
+    } else {
+      state.selectedIds = [id];
+    }
+  });
 };
 
 export const clearAnnotationSelection = () => {
-  setAnnotationStore({ selectedIds: [] });
+  mutateActiveAnnotations((state) => {
+    state.selectedIds = [];
+  });
 };
 
 export const addAnnotation = (annotation: Annotation) => {
   recordAnnotationHistory();
-  setAnnotationStore(
-    produce((state) => {
-      state.items.push(annotation);
-      state.selectedIds = [annotation.id];
-    }),
-  );
+  mutateActiveAnnotations((state) => {
+    state.items.push(annotation);
+    state.selectedIds = [annotation.id];
+  });
   markDirty();
 };
 
@@ -210,14 +223,10 @@ export const updateAnnotationLive = (
   id: string,
   updater: (annotation: Annotation) => Annotation,
 ) => {
-  setAnnotationStore(
-    produce((state) => {
-      const index = state.items.findIndex((annotation) => annotation.id === id);
-      if (index >= 0) {
-        state.items[index] = updater(state.items[index]);
-      }
-    }),
-  );
+  mutateActiveAnnotations((state) => {
+    const idx = state.items.findIndex((a) => a.id === id);
+    if (idx >= 0) state.items[idx] = updater(state.items[idx]);
+  });
   markDirty();
 };
 
@@ -225,88 +234,102 @@ export const updateAnnotationsLive = (
   ids: string[],
   updater: (annotation: Annotation) => Annotation,
 ) => {
-  setAnnotationStore(
-    produce((state) => {
-      const selected = new Set(ids);
-      state.items = state.items.map((annotation) =>
-        selected.has(annotation.id) ? updater(annotation) : annotation,
-      );
-    }),
-  );
+  mutateActiveAnnotations((state) => {
+    const selected = new Set(ids);
+    state.items = state.items.map((a) => (selected.has(a.id) ? updater(a) : a));
+  });
   markDirty();
 };
 
 export const deleteSelectedAnnotations = () => {
-  if (annotationStore.selectedIds.length === 0) {
-    return;
-  }
-  const selected = new Set(annotationStore.selectedIds);
+  const tab = activeTab();
+  if (!tab || tab.annotations.selectedIds.length === 0) return;
+  const selected = new Set(tab.annotations.selectedIds);
   recordAnnotationHistory();
-  setAnnotationStore(
-    produce((state) => {
-      state.items = state.items.filter((annotation) => !selected.has(annotation.id));
-      state.selectedIds = [];
-    }),
-  );
+  mutateActiveAnnotations((state) => {
+    state.items = state.items.filter((a) => !selected.has(a.id));
+    state.selectedIds = [];
+  });
   markDirty();
 };
 
 export const undoAnnotations = () => {
-  if (annotationStore.history.length === 0) {
-    return;
-  }
-  setAnnotationStore(
-    produce((state) => {
-      const previous = state.history.pop();
-      if (!previous) {
-        return;
-      }
-      state.future.push(cloneAnnotations(state.items));
-      state.items = previous;
-      state.selectedIds = [];
-      state.dirty = true;
-      state.saveStatus = "idle";
-      state.saveError = null;
-    }),
-  );
-};
-
-export const redoAnnotations = () => {
-  if (annotationStore.future.length === 0) {
-    return;
-  }
-  setAnnotationStore(
-    produce((state) => {
-      const next = state.future.pop();
-      if (!next) {
-        return;
-      }
-      state.history.push(cloneAnnotations(state.items));
-      state.items = next;
-      state.selectedIds = [];
-      state.dirty = true;
-      state.saveStatus = "idle";
-      state.saveError = null;
-    }),
-  );
-};
-
-export const setAnnotationSaveStatus = (saveStatus: SaveStatus) => {
-  setAnnotationStore({ saveStatus });
-};
-
-export const markAnnotationsSaved = () => {
-  setAnnotationStore({
-    dirty: false,
-    saveStatus: "saved",
-    saveError: null,
-    lastSavedAt: new Date().toISOString(),
+  const tab = activeTab();
+  if (!tab || tab.annotations.history.length === 0) return;
+  mutateActiveAnnotations((state) => {
+    const previous = state.history.pop();
+    if (!previous) return;
+    state.future.push(cloneAnnotations(state.items));
+    state.items = previous;
+    state.selectedIds = [];
+    state.dirty = true;
+    state.saveStatus = "idle";
+    state.saveError = null;
   });
 };
 
-export const markAnnotationSaveError = (message: string) => {
-  setAnnotationStore({
-    saveStatus: "error",
-    saveError: message,
+export const redoAnnotations = () => {
+  const tab = activeTab();
+  if (!tab || tab.annotations.future.length === 0) return;
+  mutateActiveAnnotations((state) => {
+    const next = state.future.pop();
+    if (!next) return;
+    state.history.push(cloneAnnotations(state.items));
+    state.items = next;
+    state.selectedIds = [];
+    state.dirty = true;
+    state.saveStatus = "idle";
+    state.saveError = null;
+  });
+};
+
+export const setAnnotationSaveStatusForTab = (
+  tabId: string,
+  saveStatus: SaveStatus,
+) => {
+  updateTabById(tabId, (tab) => {
+    tab.annotations.saveStatus = saveStatus;
+  });
+};
+
+export const markAnnotationsSavedForTab = (tabId: string) => {
+  updateTabById(tabId, (tab) => {
+    tab.annotations.dirty = false;
+    tab.annotations.saveStatus = "saved";
+    tab.annotations.saveError = null;
+    tab.annotations.lastSavedAt = new Date().toISOString();
+  });
+};
+
+export const markAnnotationSaveErrorForTab = (tabId: string, message: string) => {
+  updateTabById(tabId, (tab) => {
+    tab.annotations.saveStatus = "error";
+    tab.annotations.saveError = message;
+  });
+};
+
+/**
+ * Remap annotation page indices after page-level edits. `mapping[oldPage]`
+ * gives the new page index, or `null` if the page was removed. Annotations on
+ * removed pages are dropped; surviving annotations are shifted accordingly.
+ * Clears history because positions no longer line up with prior snapshots.
+ */
+export const remapAnnotationsForTab = (
+  tabId: string,
+  mapping: Array<number | null>,
+) => {
+  updateTabById(tabId, (tab) => {
+    const remapped: Annotation[] = [];
+    for (const annotation of tab.annotations.items) {
+      const target = mapping[annotation.page];
+      if (target == null) continue;
+      remapped.push({ ...annotation, page: target });
+    }
+    tab.annotations.items = remapped;
+    tab.annotations.history = [];
+    tab.annotations.future = [];
+    tab.annotations.selectedIds = [];
+    tab.annotations.editingId = null;
+    tab.annotations.dirty = true;
   });
 };

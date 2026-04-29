@@ -2,6 +2,7 @@ import { createEffect, createSignal, onCleanup } from "solid-js";
 import type { PageMeta } from "../state/document";
 import { renderPage } from "../ipc/pdf";
 import { AnnotationLayer } from "../annotations/AnnotationLayer";
+import { TextLayer } from "../ocr/TextLayer";
 
 interface Props {
   page: PageMeta;
@@ -95,12 +96,18 @@ export function PageCanvas(props: Props) {
   return (
     <div
       class="page-frame"
+      data-page-index={props.index}
       style={{ width: `${props.width}px`, height: `${props.height}px` }}
     >
       <canvas
         ref={canvas}
         class="page-canvas"
         style={{ width: "100%", height: "100%" }}
+      />
+      <TextLayer
+        pageIndex={props.index}
+        width={props.width}
+        height={props.height}
       />
       <AnnotationLayer
         page={props.page}

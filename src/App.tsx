@@ -1,38 +1,42 @@
-import { Show } from "solid-js";
+import { Show, onMount } from "solid-js";
 import { Toolbar } from "./toolbar/Toolbar";
+import { TabStrip } from "./tabs/TabStrip";
 import { PdfViewer } from "./viewer/PdfViewer";
 import { SearchPanel } from "./search/SearchPanel";
-import { documentStore } from "./state/document";
-import { requestOpenPdfDialog } from "./ipc/pdf";
+import { Welcome } from "./welcome/Welcome";
+import { ToastHost } from "./capture/Toast";
+import { activeTab, documentStore } from "./state/document";
 import { installKeyboardShortcuts } from "./keyboard";
 import { installAnnotationAutosave } from "./annotations/persistence";
-import { installFileOpenHandlers } from "./ipc/opening";
+import { installFileOpenHandlers, setImageDropHandler } from "./ipc/opening";
 import { installCloseGuard } from "./ipc/closeGuard";
+import { installPageClipboardShortcuts } from "./viewer/pageClipboard";
+import { installRecentFilesTracking } from "./welcome/recentFiles";
+import { handleImageDrop } from "./viewer/imageDrop";
 
 export default function App() {
   installKeyboardShortcuts();
   installAnnotationAutosave();
   installFileOpenHandlers();
   installCloseGuard();
+  installPageClipboardShortcuts();
+  installRecentFilesTracking();
+  onMount(() => {
+    setImageDropHandler(handleImageDrop);
+  });
   return (
     <div class="app">
       <Toolbar />
+      <Show when={documentStore.tabs.length > 0}>
+        <TabStrip />
+      </Show>
       <main class="app-main">
-        <Show
-          when={documentStore.doc}
-          fallback={
-            <div class="empty">
-              <h1>rustpdf</h1>
-              <p>가벼운 PDF 뷰어. PDF를 열어 시작하세요.</p>
-              <button onClick={requestOpenPdfDialog}>PDF 열기</button>
-              <p class="hint">또는 창에 PDF 파일을 끌어다 놓으세요.</p>
-            </div>
-          }
-        >
+        <Show when={activeTab()} fallback={<Welcome />}>
           <PdfViewer />
         </Show>
         <SearchPanel />
       </main>
+      <ToastHost />
     </div>
   );
 }

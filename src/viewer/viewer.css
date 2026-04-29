@@ -167,8 +167,83 @@ body.resizing-sidebar * {
   color: var(--text);
 }
 
+.thumbnail-item.selected {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.thumbnail-item.selected.active {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .thumbnail-canvas {
   display: block;
   background: #fff;
   box-shadow: var(--shadow);
+}
+
+.thumbnail-context-menu {
+  position: fixed;
+  z-index: 100;
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  min-width: 200px;
+  font-size: 13px;
+}
+
+.thumbnail-context-menu li {
+  padding: 0;
+}
+
+.thumbnail-context-menu li.separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 6px;
+}
+
+.thumbnail-context-menu button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text);
+  text-align: left;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.thumbnail-context-menu button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.thumbnail-context-menu button:disabled {
+  color: var(--text-dim);
+  opacity: 0.6;
+  cursor: default;
+}
+
+.thumbnail-context-menu button.danger {
+  color: #dc2626;
+}
+
+.thumbnail-context-menu button.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, #dc2626 12%, transparent);
+}
+
+.thumbnail-context-menu .kbd {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.02em;
 }

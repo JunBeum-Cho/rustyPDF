@@ -34,12 +34,23 @@
   min-width: 100%;
   min-height: 100%;
   padding: 4px 6px;
-  border: 1px solid currentColor;
-  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  border: 1px dashed transparent;
+  background: transparent;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.25;
   user-select: none;
+}
+
+.annotation-text[data-empty]::before {
+  content: "텍스트";
+  opacity: 0.45;
+  font-style: italic;
+}
+
+.annotation-text-object.selected .annotation-text {
+  border-color: currentColor;
+  border-style: solid;
 }
 
 .annotation-text-edit {
@@ -49,12 +60,11 @@
   margin: 0;
   padding: 4px 6px;
   border: 1px solid currentColor;
-  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  background: transparent;
   font-family: inherit;
   font-weight: inherit;
   letter-spacing: inherit;
   line-height: 1.25;
-  resize: none;
   outline: none;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -62,11 +72,13 @@
   user-select: text;
   -webkit-user-select: text;
   caret-color: currentColor;
-  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 35%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 25%, transparent);
 }
 
-.annotation-text-edit::placeholder {
-  color: color-mix(in srgb, currentColor 50%, transparent);
+.annotation-text-edit:empty::before {
+  content: "텍스트";
+  opacity: 0.45;
+  pointer-events: none;
 }
 
 .annotation-text-object.editing {
@@ -197,4 +209,61 @@
 .annotation-save-status.error {
   color: var(--text);
   font-weight: 600;
+}
+
+.text-format-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.text-format-select {
+  height: 32px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  max-width: 140px;
+}
+
+.text-format-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.text-format-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.text-format-group button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.text-format-group button:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: transparent;
+}
+
+.text-format-group button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }

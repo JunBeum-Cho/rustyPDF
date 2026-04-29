@@ -5,9 +5,10 @@ export type AnnotationKind =
   | "line"
   | "arrow"
   | "pen"
-  | "highlight";
+  | "highlight"
+  | "image";
 
-export type AnnotationTool = "select" | AnnotationKind;
+export type AnnotationTool = "select" | AnnotationKind | "capture";
 
 export interface Point {
   x: number;
@@ -37,7 +38,15 @@ export interface Annotation {
   points?: Point[];
   style: AnnotationStyle;
   payload?: {
+    /** Plain text (legacy / fallback when html absent). */
     text?: string;
+    /** Rich-text HTML for text annotations. Sanitized on commit. */
+    html?: string;
+    /** Data URL (or asset URL) for image annotations. */
+    imageSrc?: string;
+    /** Original pixel dimensions, used for default aspect ratio on insert. */
+    imageNaturalWidth?: number;
+    imageNaturalHeight?: number;
   };
 }
 

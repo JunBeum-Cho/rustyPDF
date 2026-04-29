@@ -23,9 +23,20 @@ import {
   setAnnotationTool,
   startEditingAnnotation,
   stopEditingAnnotation,
+  updateAnnotation,
   updateAnnotationLive,
   updateAnnotationsLive,
 } from "./store";
+import {
+  registerEditor,
+  unregisterEditor,
+} from "./textFormat";
+import {
+  captureRegion,
+  copyDeferredPngToClipboard,
+  emitToast,
+  saveCaptureAs,
+} from "../capture/capture";
 import type { Annotation, AnnotationKind, Point, Rect } from "./types";
 import "./annotations.css";
 
@@ -37,9 +48,11 @@ interface AnnotationLayerProps {
   rotation: Rotation;
 }
 
+type DraftKind = Exclude<AnnotationKind, "text"> | "capture";
+
 type Draft =
   | {
-      type: Exclude<AnnotationKind, "text">;
+      type: DraftKind;
       start: Point;
       current: Point;
       points: Point[];
@@ -52,6 +65,7 @@ type DragState =
       start: Point;
       ids: string[];
       originals: Annotation[];
+      moved: boolean;
     }
   | {
       mode: "resize";
@@ -59,6 +73,7 @@ type DragState =
       id: string;
       original: Rect;
       handle: "nw" | "ne" | "sw" | "se";
+      moved: boolean;
     }
   | {
       mode: "endpoint";
@@ -66,8 +81,16 @@ type DragState =
       id: string;
       originalPoints: Point[];
       pointIndex: number;
+      moved: boolean;
     }
   | null;
+
+// Pointer movement threshold (in PDF points) before a click promotes to a
+// drag. Without this, a plain click ends up calling the move/resize updaters
+// with a near-zero delta — that still produces a fresh annotation object
+// reference, which forces <For> to remount the row and breaks both dblclick
+// (target lost between the two clicks) and re-entry into edit mode.
+const DRAG_THRESHOLD = 2;
 
 const MIN_SIZE = 4;
 
@@ -109,7 +132,24 @@ const displayPath = (
     .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
     .join(" ");
 
-const annotationText = (annotation: Annotation) => annotation.payload?.text ?? "";
+const annotationHtml = (annotation: Annotation) => {
+  const html = annotation.payload?.html;
+  if (html != null) return html;
+  // Legacy fallback: plain text → escape and use as innerHTML.
+  const text = annotation.payload?.text ?? "";
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>");
+};
+
+const htmlIsEmpty = (html: string) => {
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  return tmp.textContent?.trim() === "";
+};
 
 export function AnnotationLayer(props: AnnotationLayerProps) {
   const [draft, setDraft] = createSignal<Draft>(null);
@@ -141,6 +181,11 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
 
   const buildAnnotation = (currentDraft: NonNullable<Draft>): Annotation | null => {
     const type = currentDraft.type;
+    if (type === "capture") {
+      // Capture is handled separately in pointerup — never produces an
+      // annotation in the document.
+      return null;
+    }
     if (type === "pen") {
       if (currentDraft.points.length < 2) {
         return null;
@@ -213,7 +258,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       return;
     }
     setDraft({
-      type: tool,
+      type: tool as DraftKind,
       start: point,
       current: point,
       points: [point],
@@ -246,6 +291,19 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       x: point.x - currentDrag.start.x,
       y: point.y - currentDrag.start.y,
     };
+    // Promote to a real drag only after threshold — see DRAG_THRESHOLD comment.
+    if (
+      !currentDrag.moved &&
+      Math.hypot(delta.x, delta.y) < DRAG_THRESHOLD
+    ) {
+      return;
+    }
+    if (!currentDrag.moved) {
+      // Record a single history entry at the moment the drag actually
+      // starts — not on every initial click.
+      recordAnnotationHistory();
+      setDragState({ ...currentDrag, moved: true });
+    }
     if (currentDrag.mode === "move") {
       updateAnnotationsLive(currentDrag.ids, (annotation) => {
         const original = currentDrag.originals.find((item) => item.id === annotation.id);
@@ -276,6 +334,62 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   const onLayerPointerUp: JSX.EventHandlerUnion<SVGSVGElement, PointerEvent> = (event) => {
     const currentDraft = draft();
     if (currentDraft) {
+      if (currentDraft.type === "capture") {
+        const rect = normalizeRect(currentDraft.start, currentDraft.current);
+        if (rect.w >= MIN_SIZE && rect.h >= MIN_SIZE) {
+          // CRITICAL: WebKit (Tauri's macOS webview) requires
+          // `navigator.clipboard.write` to be invoked synchronously inside
+          // the user gesture. If we `await captureRegion(...)` first, the
+          // gesture has expired and the write is rejected. So we kick off
+          // the backend render to get a Promise, then immediately call the
+          // deferred-clipboard helper which constructs a `ClipboardItem`
+          // around the still-pending Blob — Safari/WebKit treat that as
+          // belonging to the live gesture and accept it.
+          const pngPromise = captureRegion({
+            pageIndex: props.page.index,
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+          });
+
+          // Surface render errors via toast independently of the clipboard
+          // path — otherwise a failed capture is silent.
+          pngPromise.catch((error) => {
+            console.error("capture failed", error);
+            emitToast(
+              `캡처 실패: ${error instanceof Error ? error.message : String(error)}`,
+              "error",
+            );
+          });
+
+          // Synchronously initiate the clipboard write within the gesture.
+          copyDeferredPngToClipboard(pngPromise).then(
+            () => emitToast("스크린샷이 클립보드에 복사됐습니다"),
+            async (clipErr) => {
+              console.warn("clipboard write failed", clipErr);
+              emitToast(
+                "클립보드 복사 실패 — 저장 다이얼로그가 열립니다",
+                "error",
+              );
+              try {
+                const buf = await pngPromise;
+                await saveCaptureAs(buf);
+              } catch (e) {
+                console.error("save fallback failed", e);
+              }
+            },
+          );
+        }
+        setDraft(null);
+        // Auto-revert to the select tool after a single capture so the user
+        // doesn't accidentally re-enter capture mode on their next click.
+        setAnnotationTool("select");
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
+        return;
+      }
       const annotation = buildAnnotation(currentDraft);
       if (annotation) {
         addAnnotation(annotation);
@@ -307,12 +421,15 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       selectAnnotation(annotation.id, append);
     }
     const ids = selectedIds().has(annotation.id) && !append ? annotationStore.selectedIds : [annotation.id];
-    recordAnnotationHistory();
+    // Don't push history for a plain click — only when the move actually
+    // happens (in pointermove once threshold is exceeded). Otherwise every
+    // click pollutes the undo stack with a noop.
     setDragState({
       mode: "move",
       start: eventToPagePoint(event),
       ids,
       originals: annotationStore.items.filter((item) => ids.includes(item.id)),
+      moved: false,
     });
     layerRef?.setPointerCapture(event.pointerId);
   };
@@ -327,13 +444,13 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     event.stopPropagation();
     selectAnnotation(annotation.id);
-    recordAnnotationHistory();
     setDragState({
       mode: "resize",
       start: eventToPagePoint(event),
       id: annotation.id,
       original: { ...annotation.rect },
       handle,
+      moved: false,
     });
     layerRef?.setPointerCapture(event.pointerId);
   };
@@ -348,13 +465,13 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     event.stopPropagation();
     selectAnnotation(annotation.id);
-    recordAnnotationHistory();
     setDragState({
       mode: "endpoint",
       start: eventToPagePoint(event),
       id: annotation.id,
       originalPoints: annotation.points.map((p) => ({ ...p })),
       pointIndex,
+      moved: false,
     });
     layerRef?.setPointerCapture(event.pointerId);
   };
@@ -368,15 +485,24 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     startEditingAnnotation(annotation.id);
   };
 
-  const finishTextEdit = (annotation: Annotation) => {
+  const commitTextEdit = (annotation: Annotation, html: string) => {
     if (annotationStore.editingId !== annotation.id) {
       return;
     }
-    const text = annotationText(annotation);
-    if (text.trim() === "") {
-      // Empty text == implicit cancel: drop the annotation entirely. We pop
-      // the history entry that addAnnotation pushed so it's not noise in undo.
+    if (htmlIsEmpty(html)) {
+      // Empty content == implicit cancel: drop the annotation entirely. We
+      // skip history because addAnnotation already pushed an entry — leaving
+      // both would mean the user has to undo twice for an aborted text.
       removeAnnotation(annotation.id, { record: false });
+    } else if (html !== annotationHtml(annotation)) {
+      // Derive a plain-text mirror so search and legacy consumers still work.
+      const tmp = document.createElement("div");
+      tmp.innerHTML = html;
+      const text = tmp.textContent ?? "";
+      updateAnnotation(annotation.id, (item) => ({
+        ...item,
+        payload: { ...item.payload, html, text },
+      }));
     }
     stopEditingAnnotation();
   };
@@ -436,6 +562,20 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         />
       );
     }
+    if (currentDraft.type === "capture") {
+      return (
+        <rect
+          class="annotation-shape annotation-draft annotation-capture-draft"
+          x={box.x}
+          y={box.y}
+          width={box.w}
+          height={box.h}
+          fill="rgba(56, 132, 255, 0.12)"
+          stroke="#3884ff"
+          stroke-width={Math.max(1, props.zoom)}
+        />
+      );
+    }
     return (
       <rect
         class="annotation-shape annotation-draft"
@@ -452,12 +592,21 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   };
 
   const renderAnnotation = (annotation: Annotation) => {
-    const selected = selectedIds().has(annotation.id);
-    const strokeWidth = Math.max(1, annotation.style.width * props.zoom);
+    // These need to stay reactive across the row's lifetime — capturing as
+    // bare consts here would freeze them at first render, since Solid's <For>
+    // only re-runs the callback when the item reference changes. So:
+    // dbl-click-to-edit, click-to-select, and zoom-driven font size all
+    // depend on these reading the latest store/prop values at access time.
+    const selected = () => selectedIds().has(annotation.id);
+    const isEditing = () => annotationStore.editingId === annotation.id;
+    const fontSize = () => (annotation.style.fontSize ?? 16) * props.zoom;
+    const strokeWidth = () => Math.max(1, annotation.style.width * props.zoom);
     const shapeProps = {
       class: "annotation-shape",
       stroke: annotation.style.color,
-      "stroke-width": strokeWidth,
+      get "stroke-width"() {
+        return strokeWidth();
+      },
       onPointerDown: (event: PointerEvent) => startMove(event, annotation),
       onDblClick: (event: MouseEvent) => editText(event, annotation),
     };
@@ -466,7 +615,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       return (
         <path
           {...shapeProps}
-          classList={{ selected }}
+          classList={{ selected: selected() }}
           d={displayPath(annotation.points, props.page, props.zoom, props.rotation)}
           fill="none"
         />
@@ -475,16 +624,18 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
 
     if (annotation.type === "line" || annotation.type === "arrow") {
       const points = annotation.points ?? [];
-      const start = pagePointToDisplay(points[0] ?? { x: 0, y: 0 }, props.page, props.zoom, props.rotation);
-      const end = pagePointToDisplay(points[1] ?? { x: 0, y: 0 }, props.page, props.zoom, props.rotation);
+      const start = () =>
+        pagePointToDisplay(points[0] ?? { x: 0, y: 0 }, props.page, props.zoom, props.rotation);
+      const end = () =>
+        pagePointToDisplay(points[1] ?? { x: 0, y: 0 }, props.page, props.zoom, props.rotation);
       return (
         <line
           {...shapeProps}
-          classList={{ selected }}
-          x1={start.x}
-          y1={start.y}
-          x2={end.x}
-          y2={end.y}
+          classList={{ selected: selected() }}
+          x1={start().x}
+          y1={start().y}
+          x2={end().x}
+          y2={end().y}
           marker-end={annotation.type === "arrow" ? "url(#annotation-arrow)" : undefined}
         />
       );
@@ -493,34 +644,48 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     if (!annotation.rect) {
       return null;
     }
-    const box = rectToDisplayBox(annotation.rect, props.page, props.zoom, props.rotation);
+    const box = () =>
+      rectToDisplayBox(annotation.rect!, props.page, props.zoom, props.rotation);
+    if (annotation.type === "image") {
+      return (
+        <image
+          class="annotation-shape annotation-image"
+          classList={{ selected: selected() }}
+          x={box().x}
+          y={box().y}
+          width={box().w}
+          height={box().h}
+          href={annotation.payload?.imageSrc ?? ""}
+          preserveAspectRatio="none"
+          onPointerDown={(event) => startMove(event, annotation)}
+        />
+      );
+    }
     if (annotation.type === "ellipse") {
       return (
         <ellipse
           {...shapeProps}
-          classList={{ selected }}
-          cx={box.x + box.w / 2}
-          cy={box.y + box.h / 2}
-          rx={box.w / 2}
-          ry={box.h / 2}
+          classList={{ selected: selected() }}
+          cx={box().x + box().w / 2}
+          cy={box().y + box().h / 2}
+          rx={box().w / 2}
+          ry={box().h / 2}
           fill={annotation.style.fill ?? "none"}
           opacity={annotation.style.opacity ?? 1}
         />
       );
     }
     if (annotation.type === "text") {
-      const isEditing = annotationStore.editingId === annotation.id;
-      const fontSize = (annotation.style.fontSize ?? 16) * props.zoom;
       return (
         <foreignObject
           class="annotation-text-object"
-          classList={{ selected, editing: isEditing }}
-          x={box.x}
-          y={box.y}
-          width={Math.max(24, box.w)}
-          height={Math.max(20, box.h)}
+          classList={{ selected: selected(), editing: isEditing() }}
+          x={box().x}
+          y={box().y}
+          width={Math.max(24, box().w)}
+          height={Math.max(20, box().h)}
           onPointerDown={(event) => {
-            if (isEditing) {
+            if (isEditing()) {
               // Allow normal text-selection / caret placement inside the
               // textarea — don't kick into a move drag.
               event.stopPropagation();
@@ -531,48 +696,65 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           onDblClick={(event) => editText(event, annotation)}
         >
           <Show
-            when={isEditing}
+            when={isEditing()}
             fallback={
               <div
                 class="annotation-text"
                 style={{
                   color: annotation.style.color,
-                  "font-size": `${fontSize}px`,
+                  "font-size": `${fontSize()}px`,
                 }}
-              >
-                {annotationText(annotation) || "텍스트"}
-              </div>
+                // innerHTML so existing rich-text styling round-trips. The
+                // empty-state placeholder is rendered via CSS ::before when
+                // the annotation has no content yet.
+                innerHTML={annotationHtml(annotation) || ""}
+                attr:data-empty={annotationHtml(annotation) ? null : ""}
+              />
             }
           >
-            <textarea
+            <div
               class="annotation-text-edit"
               style={{
                 color: annotation.style.color,
-                "font-size": `${fontSize}px`,
+                "font-size": `${fontSize()}px`,
               }}
               ref={(el) => {
                 if (!el) return;
+                // Uncontrolled by design — we seed innerHTML once and let
+                // execCommand / Selection drive subsequent edits. Re-binding
+                // innerHTML on every keystroke would blow away the caret.
+                el.innerHTML = annotationHtml(annotation);
+                registerEditor(el);
                 requestAnimationFrame(() => {
                   el.focus();
-                  el.select();
+                  // Drop a caret at the end so additive typing is natural.
+                  const sel = window.getSelection();
+                  if (sel) {
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                  }
                 });
               }}
-              value={annotationText(annotation)}
-              placeholder="텍스트"
-              onInput={(event) => {
-                const text = event.currentTarget.value;
-                updateAnnotationLive(annotation.id, (item) => ({
-                  ...item,
-                  payload: { ...item.payload, text },
-                }));
-              }}
+              contenteditable
+              spellcheck={false}
               onPointerDown={(event) => event.stopPropagation()}
-              onBlur={() => finishTextEdit(annotation)}
+              onFocus={(event) => registerEditor(event.currentTarget)}
+              onBlur={(event) => {
+                const html = event.currentTarget.innerHTML;
+                unregisterEditor(event.currentTarget);
+                commitTextEdit(annotation, html);
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
                   event.preventDefault();
                   event.currentTarget.blur();
-                } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                } else if (
+                  event.key === "Enter" &&
+                  (event.metaKey || event.ctrlKey)
+                ) {
                   event.preventDefault();
                   event.currentTarget.blur();
                 }
@@ -585,11 +767,11 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     return (
       <rect
         {...shapeProps}
-        classList={{ selected }}
-        x={box.x}
-        y={box.y}
-        width={box.w}
-        height={box.h}
+        classList={{ selected: selected() }}
+        x={box().x}
+        y={box().y}
+        width={box().w}
+        height={box().h}
         fill={annotation.style.fill ?? "none"}
         opacity={annotation.style.opacity ?? 1}
       />

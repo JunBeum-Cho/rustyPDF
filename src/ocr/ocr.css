@@ -1,0 +1,32 @@
+.ocr-btn {
+  height: 32px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.ocr-btn .ocr-progress-label {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.ocr-btn.busy {
+  cursor: progress;
+}
+
+.ocr-btn.busy .ocr-progress-label {
+  color: var(--text);
+}
+
+@keyframes ocr-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.ocr-btn.busy svg {
+  animation: ocr-pulse 1.2s ease-in-out infinite;
+}

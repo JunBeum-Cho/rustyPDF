@@ -61,6 +61,15 @@ impl DocRegistry {
     pub fn remove(&self, id: &str) -> bool {
         self.inner.write().remove(id).is_some()
     }
+
+    pub fn replace(&self, id: &str, handle: DocHandle) -> Result<(), PdfError> {
+        let mut map = self.inner.write();
+        if !map.contains_key(id) {
+            return Err(PdfError::InvalidHandle);
+        }
+        map.insert(id.to_string(), Arc::new(handle));
+        Ok(())
+    }
 }
 
 pub fn open_document(registry: &DocRegistry, path: String) -> Result<OpenedDocument, PdfError> {

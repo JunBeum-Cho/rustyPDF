@@ -16,6 +16,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+
+# To enforce single-instance behaviour on Windows / Linux (so opening a PDF
+# from Explorer routes through the running app instead of spawning a new
+# process), uncomment the next stanza and run `cargo build` once with network
+# access. macOS already gets multi-file opening through `RunEvent::Opened`.
+# [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+# tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
@@ -24,7 +31,7 @@ once_cell = "1"
 uuid = { version = "1", features = ["v4"] }
 lru = "0.12"
 pdfium-render = { version = "0.8", features = ["thread_safe", "image"] }
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 
 [profile.release]

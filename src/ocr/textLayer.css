@@ -1,0 +1,46 @@
+/*
+ * Invisible text layer for OCR-derived selection. Sits between the page
+ * bitmap (z-index 1) and the annotation layer (z-index 2). Pointer events
+ * pass through to the layer for click-to-select, but annotation interaction
+ * still wins because the annotation SVG is on top.
+ */
+.ocr-text-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  user-select: text;
+  -webkit-user-select: text;
+  overflow: hidden;
+}
+
+.ocr-text-line {
+  position: absolute;
+  white-space: pre;
+  /* The text itself is invisible but the selection highlight is real. */
+  color: transparent;
+  background: transparent;
+  /* Re-enable pointer events on each line so the user can click + drag to
+     highlight. The container above turns them off so areas without lines
+     don't eat clicks meant for the annotation/page. */
+  pointer-events: auto;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+  /* Stretch the glyphs to fill the bounding box so the selection rect
+     tracks the OCR ink rather than the natural text width. */
+  transform-origin: top left;
+  font-family: -apple-system, system-ui, sans-serif;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.ocr-text-line::selection {
+  background: rgba(56, 132, 255, 0.32);
+  color: transparent;
+}
+
+.ocr-text-line::-moz-selection {
+  background: rgba(56, 132, 255, 0.32);
+  color: transparent;
+}

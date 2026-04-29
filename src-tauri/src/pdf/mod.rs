@@ -1,6 +1,8 @@
 pub mod annotations;
 pub mod cache;
 pub mod document;
+pub mod edit;
+pub mod ocr;
 pub mod render;
 pub mod text;
 

@@ -1,12 +1,12 @@
 import { For, Show, createEffect, createMemo, on, onCleanup, onMount } from "solid-js";
-import { documentStore, setDocumentStore } from "../state/document";
+import { activeTab, updateActiveTab } from "../state/document";
 import { uiStore } from "../state/ui";
 import { renderPage } from "../ipc/pdf";
 import { PageCanvas } from "./PageCanvas";
 import { Thumbnails } from "./Thumbnails";
 import "./viewer.css";
 
-const PAGE_GAP = 16; // px between pages
+const PAGE_GAP = 16;
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 
 function nextZoom(cur: number): number | null {
@@ -20,19 +20,19 @@ function prevZoom(cur: number): number | null {
 export function PdfViewer() {
   let scrollEl!: HTMLDivElement;
 
-  const doc = createMemo(() => documentStore.doc!);
+  const tab = createMemo(() => activeTab()!);
 
   const renderedDims = createMemo(() => {
-    const z = documentStore.zoom;
-    const rot = documentStore.rotation;
+    const t = tab();
+    const z = t.zoom;
+    const rot = t.rotation;
     const swap = rot === 90 || rot === 270;
-    return doc().pages.map((p) => ({
+    return t.pages.map((p) => ({
       width: (swap ? p.height : p.width) * z,
       height: (swap ? p.width : p.height) * z,
     }));
   });
 
-  // Estimate visible page from scroll position
   function onScroll() {
     const dims = renderedDims();
     let acc = 0;
@@ -40,8 +40,8 @@ export function PdfViewer() {
     for (let i = 0; i < dims.length; i++) {
       const next = acc + dims[i].height + PAGE_GAP;
       if (center < next) {
-        if (documentStore.currentPage !== i) {
-          setDocumentStore("currentPage", i);
+        if (tab().currentPage !== i) {
+          updateActiveTab((t) => { t.currentPage = i; });
         }
         return;
       }
@@ -49,7 +49,6 @@ export function PdfViewer() {
     }
   }
 
-  // Sync external currentPage changes (toolbar prev/next) to scroll position
   let suppressNextScroll = false;
   function scrollToPage(i: number) {
     const dims = renderedDims();
@@ -58,6 +57,20 @@ export function PdfViewer() {
     suppressNextScroll = true;
     scrollEl.scrollTo({ top, behavior: "auto" });
   }
+
+  // Reset scroll when active tab changes
+  createEffect(
+    on(
+      () => tab().tabId,
+      () => {
+        queueMicrotask(() => {
+          suppressNextScroll = true;
+          scrollEl.scrollTo({ top: 0, behavior: "auto" });
+        });
+      },
+      { defer: true },
+    ),
+  );
 
   onMount(() => {
     const handler = () => {
@@ -71,15 +84,13 @@ export function PdfViewer() {
     onCleanup(() => scrollEl.removeEventListener("scroll", handler));
 
     const onWheel = (e: WheelEvent) => {
-      // Cmd/Ctrl + wheel → zoom (also catches trackpad pinch which sets ctrlKey)
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
-        const cur = documentStore.zoom;
+        const t = tab();
+        const cur = t.zoom;
         const target = e.deltaY < 0 ? nextZoom(cur) : prevZoom(cur);
         if (target == null) return;
 
-        // Zoom around the cursor: keep the document point under the cursor in
-        // place after the size change.
         const rect = scrollEl.getBoundingClientRect();
         const cx = e.clientX - rect.left;
         const cy = e.clientY - rect.top;
@@ -87,8 +98,7 @@ export function PdfViewer() {
         const docY = scrollEl.scrollTop + cy;
         const ratio = target / cur;
 
-        setDocumentStore("zoom", target);
-        // Layout updates after the next frame.
+        updateActiveTab((tt) => { tt.zoom = target; });
         requestAnimationFrame(() => {
           scrollEl.scrollLeft = docX * ratio - cx;
           scrollEl.scrollTop = docY * ratio - cy;
@@ -96,7 +106,6 @@ export function PdfViewer() {
         return;
       }
 
-      // Alt + vertical wheel → horizontal pan
       if (e.altKey && e.deltaY !== 0 && e.deltaX === 0) {
         e.preventDefault();
         scrollEl.scrollLeft += e.deltaY;
@@ -106,22 +115,18 @@ export function PdfViewer() {
     onCleanup(() => scrollEl.removeEventListener("wheel", onWheel));
   });
 
-  // Background prefetch for small docs: warm the LRU cache with every page
-  // so the user never sees a blank/blur frame regardless of scroll speed.
-  // For larger docs we rely on the viewport-margin prefetch in PageCanvas.
   createEffect(
     on(
-      () => [doc().id, documentStore.zoom, documentStore.rotation] as const,
+      () => [tab().docId, tab().zoom, tab().rotation] as const,
       ([docId, zoom, rotation]) => {
-        if (doc().prefetchPolicy !== "all") return;
+        if (tab().prefetchPolicy !== "all") return;
 
         let aborted = false;
         const bucket = Math.round(zoom * 4) / 4;
         const concurrency = 3;
 
-        // Order: pages near the current page first, then outwards.
-        const total = doc().pageCount;
-        const start = documentStore.currentPage;
+        const total = tab().pageCount;
+        const start = tab().currentPage;
         const order: number[] = [];
         const seen = new Set<number>();
         for (let r = 0; r < total; r++) {
@@ -141,33 +146,35 @@ export function PdfViewer() {
             try {
               await renderPage(docId, idx, bucket, rotation);
             } catch {
-              /* ignored: visible page render will surface real errors */
+              /* ignored */
             }
-            // Yield so we don't starve high-priority visible-page renders.
             await new Promise((r) => setTimeout(r, 0));
           }
         }
 
         const workers = Array.from({ length: concurrency }, worker);
-        Promise.allSettled(workers).then(() => {
-          /* done */
-        });
+        Promise.allSettled(workers).then(() => { /* done */ });
 
         onCleanup(() => {
           aborted = true;
           order.length = 0;
         });
-      }
-    )
+      },
+    ),
   );
 
-  // Reactive: when currentPage changes from outside (toolbar), scroll
   let lastPage = -1;
+  let lastTabId: string | null = null;
   const _ = createMemo(() => {
-    const p = documentStore.currentPage;
+    const t = tab();
+    const p = t.currentPage;
+    if (t.tabId !== lastTabId) {
+      lastTabId = t.tabId;
+      lastPage = p;
+      return;
+    }
     if (p !== lastPage) {
       lastPage = p;
-      // wait for layout
       queueMicrotask(() => scrollToPage(p));
     }
   });
@@ -180,16 +187,16 @@ export function PdfViewer() {
       </Show>
       <div class="viewer-scroll" ref={scrollEl}>
         <div class="viewer-stack">
-          <For each={doc().pages}>
+          <For each={tab().pages}>
             {(page, i) => (
               <PageCanvas
                 page={page}
                 index={i()}
                 width={renderedDims()[i()].width}
                 height={renderedDims()[i()].height}
-                docId={doc().id}
-                zoom={documentStore.zoom}
-                rotation={documentStore.rotation}
+                docId={tab().docId}
+                zoom={tab().zoom}
+                rotation={tab().rotation}
               />
             )}
           </For>

@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createSignal, on } from "solid-js";
-import { documentStore, setDocumentStore } from "../state/document";
+import { activeTab, updateActiveTab } from "../state/document";
 import { setUiStore, uiStore } from "../state/ui";
 import { searchPdf, type SearchHit } from "../ipc/pdf";
 import "./search.css";
@@ -15,32 +15,44 @@ export function SearchPanel() {
 
   let inputEl: HTMLInputElement | undefined;
 
-  // Auto-focus when panel opens
   createEffect(
     on(
       () => uiStore.searchOpen,
       (open) => {
         if (open) queueMicrotask(() => inputEl?.focus());
-      }
-    )
+      },
+    ),
   );
 
-  // Debounced search on query/doc change
+  // Reset when active tab changes
+  createEffect(
+    on(
+      () => activeTab()?.tabId,
+      () => {
+        setQuery("");
+        setHits([]);
+        setError(null);
+        setActiveIndex(0);
+      },
+    ),
+  );
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   createEffect(() => {
     const q = query().trim();
-    const doc = documentStore.doc;
+    const tab = activeTab();
     if (timer) clearTimeout(timer);
-    if (!doc || q.length === 0) {
+    if (!tab || q.length === 0) {
       setHits([]);
       setError(null);
       setLoading(false);
       return;
     }
     setLoading(true);
+    const docId = tab.docId;
     timer = setTimeout(async () => {
       try {
-        const result = await searchPdf(doc.id, q);
+        const result = await searchPdf(docId, q);
         setHits(result);
         setActiveIndex(0);
         setError(null);
@@ -58,7 +70,7 @@ export function SearchPanel() {
     if (list.length === 0) return;
     const idx = ((i % list.length) + list.length) % list.length;
     setActiveIndex(idx);
-    setDocumentStore("currentPage", list[idx].page);
+    updateActiveTab((t) => { t.currentPage = list[idx].page; });
   }
 
   function onKey(e: KeyboardEvent) {

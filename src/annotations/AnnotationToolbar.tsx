@@ -1,6 +1,7 @@
 import { createMemo } from "solid-js";
 import {
   ArrowUpRight,
+  Camera,
   Circle,
   Download,
   Highlighter,
@@ -14,16 +15,17 @@ import {
 } from "lucide-solid";
 import type { JSX } from "solid-js";
 import { exportAnnotatedPdfFile } from "../ipc/pdf";
-import { documentStore } from "../state/document";
+import { activeTab } from "../state/document";
 import {
   annotationStore,
   redoAnnotations,
   setAnnotationColor,
-  setAnnotationFontSize,
   setAnnotationStrokeWidth,
   setAnnotationTool,
   undoAnnotations,
 } from "./store";
+import { TextFormatToolbar } from "./TextFormatToolbar";
+import { setFontColor } from "./textFormat";
 import type { AnnotationTool } from "./types";
 
 const ICON_SIZE = 16;
@@ -37,10 +39,11 @@ const tools: Array<{ tool: AnnotationTool; label: string; icon: () => JSX.Elemen
   { tool: "line", label: "선", icon: () => <Minus size={ICON_SIZE} /> },
   { tool: "arrow", label: "화살표", icon: () => <ArrowUpRight size={ICON_SIZE} /> },
   { tool: "pen", label: "펜", icon: () => <PenLine size={ICON_SIZE} /> },
+  { tool: "capture", label: "영역 캡처 (드래그 후 클립보드 복사)", icon: () => <Camera size={ICON_SIZE} /> },
 ];
 
 export function AnnotationToolbar() {
-  const canExport = createMemo(() => Boolean(documentStore.doc));
+  const canExport = createMemo(() => Boolean(activeTab()));
 
   return (
     <div class="annotation-toolbar" aria-label="annotation tools">
@@ -60,7 +63,27 @@ export function AnnotationToolbar() {
         <input
           type="color"
           value={annotationStore.color}
-          onInput={(event) => setAnnotationColor(event.currentTarget.value)}
+          onInput={(event) => {
+            const color = event.currentTarget.value;
+            setAnnotationColor(color);
+            // For text annotations, the canonical "color" lives inside the
+            // rich-text spans. Push the change into the editor so highlighted
+            // text actually picks it up — otherwise the color picker only
+            // affects the annotation's outer style.
+            const tab = activeTab();
+            const editingTextAnnotation =
+              tab?.annotations.items.find(
+                (a) => a.id === tab.annotations.editingId && a.type === "text",
+              ) ??
+              tab?.annotations.items.find(
+                (a) =>
+                  a.type === "text" &&
+                  tab.annotations.selectedIds.includes(a.id),
+              );
+            if (editingTextAnnotation) {
+              setFontColor(color);
+            }
+          }}
         />
       </label>
       <label class="annotation-number" title="선 두께">
@@ -73,16 +96,7 @@ export function AnnotationToolbar() {
           onInput={(event) => setAnnotationStrokeWidth(Number(event.currentTarget.value))}
         />
       </label>
-      <label class="annotation-number" title="글자 크기">
-        <span>글자</span>
-        <input
-          type="number"
-          min="8"
-          max="72"
-          value={annotationStore.fontSize}
-          onInput={(event) => setAnnotationFontSize(Number(event.currentTarget.value))}
-        />
-      </label>
+      <TextFormatToolbar />
       <button
         type="button"
         class="toolbar-btn icon-only"
