@@ -50,6 +50,14 @@ pub fn create_pdfium() -> Result<Pdfium, PdfError> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             candidates.push(parent.join(&lib_name));
+            // Tauri 2 on Windows (NSIS + WiX) bundles `resources: ["lib/*"]`
+            // into <install>/lib/pdfium.dll — i.e. preserved at the same
+            // relative path as in src-tauri/. This is the path the
+            // installed app actually uses; without it, a built/installed
+            // RustyPDF.exe sees error 126 because the loader skips right
+            // past the bundled DLL.
+            candidates.push(parent.join("lib").join(&lib_name));
+            candidates.push(parent.join("../lib").join(&lib_name));
             candidates.push(parent.join("../Frameworks").join(&lib_name));
             candidates.push(parent.join("../Resources/lib").join(&lib_name));
             candidates.push(parent.join("../Resources").join(&lib_name));
