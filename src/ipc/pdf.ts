@@ -316,11 +316,18 @@ export async function exportAnnotatedPdfFile(): Promise<void> {
     updatedAt: new Date().toISOString(),
     annotations: tab.annotations.items,
   };
-  await invoke("export_annotated_pdf", {
-    sourcePath: tab.path,
-    targetPath: target,
-    data,
-  });
+  try {
+    await invoke("export_annotated_pdf", {
+      sourcePath: tab.path,
+      targetPath: target,
+      data,
+    });
+    emitToast("주석을 포함한 PDF로 내보냈습니다", "info");
+  } catch (error) {
+    const message = errorMessage(error);
+    console.error("export annotated pdf failed", error);
+    emitToast(`내보내기 실패: ${message}`, "error");
+  }
 }
 
 export interface PdfPageEditPayload {

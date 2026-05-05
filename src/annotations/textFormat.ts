@@ -39,6 +39,19 @@ export const unregisterEditor = (el: HTMLElement) => {
   if (lastFocusedEditor === el) lastFocusedEditor = null;
 };
 
+/**
+ * Returns the most recently focused editor if it's still attached. Lets
+ * callers outside this module (e.g. the layer's "click empty space" path)
+ * find the live editor when the user soft-blurred to a toolbar control and
+ * then dismissed editing without ever refocusing the contenteditable.
+ */
+export const peekLastFocusedEditor = (): HTMLElement | null => {
+  if (lastFocusedEditor && !lastFocusedEditor.isConnected) {
+    lastFocusedEditor = null;
+  }
+  return lastFocusedEditor;
+};
+
 let selectionTrackerInstalled = false;
 function ensureSelectionTracker() {
   if (selectionTrackerInstalled) return;
@@ -69,6 +82,13 @@ export const getActiveEditor = (): HTMLElement | null => {
   const active = document.activeElement as HTMLElement | null;
   if (active && active.isContentEditable && active.classList.contains("annotation-text-edit")) {
     return active;
+  }
+  // Drop a detached cached ref. Edit mode can end without an explicit blur
+  // (tab switch, programmatic stopEditingAnnotation, doc reload), and
+  // returning a node that's no longer in the document would mislead callers
+  // into the in-editor styling path with no observable effect.
+  if (lastFocusedEditor && !lastFocusedEditor.isConnected) {
+    lastFocusedEditor = null;
   }
   return lastFocusedEditor;
 };

@@ -28,6 +28,7 @@ import {
   updateAnnotationsLive,
 } from "./store";
 import {
+  peekLastFocusedEditor,
   readEditorStylePatch,
   registerEditor,
   unregisterEditor,
@@ -99,6 +100,51 @@ const TEXT_DOUBLE_CLICK_DISTANCE_PX = 8;
 
 const MIN_SIZE = 4;
 
+// Padding (PDF points) added around the visible bounds when computing the
+// invisible click target. Lines drawn perfectly horizontal / vertical have
+// zero width or zero height; without padding the hit rect collapses and
+// stays just as hard to click as the painted stroke.
+const HIT_PAD = 6;
+
+/**
+ * Bounding box of a non-text annotation in PDF-page coordinates. Returns
+ * null for shapes we already give a generous click target (text, image,
+ * filled highlight) or shapes without geometry.
+ */
+const annotationBboxPage = (annotation: Annotation): Rect | null => {
+  if (
+    annotation.type === "text" ||
+    annotation.type === "image" ||
+    annotation.type === "highlight"
+  ) {
+    return null;
+  }
+  if (annotation.rect) {
+    return annotation.rect;
+  }
+  if (annotation.points && annotation.points.length > 0) {
+    const xs = annotation.points.map((p) => p.x);
+    const ys = annotation.points.map((p) => p.y);
+    const x = Math.min(...xs);
+    const y = Math.min(...ys);
+    return { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+  }
+  return null;
+};
+
+/**
+ * Editor blurs whose new focus target is a control inside the annotation
+ * toolbar (the font <select>, size <input type="number">, color picker,
+ * etc.) must NOT exit edit mode — otherwise the saved range collapses and
+ * "style only the highlighted run" reduces to "style the whole annotation."
+ * We keep the editor mounted, leave editingId set, and rely on the
+ * subsequent toolbar action to refocus the contenteditable via
+ * runCommandOnEditor → restoreSelectionInto.
+ */
+const isToolbarFocus = (target: EventTarget | null) =>
+  target instanceof HTMLElement &&
+  target.closest(".annotation-toolbar") != null;
+
 const styleForTool = (type: AnnotationKind) => {
   const common = {
     color: annotationStore.color,
@@ -155,6 +201,45 @@ const htmlIsEmpty = (html: string) => {
   const tmp = document.createElement("div");
   tmp.innerHTML = html;
   return tmp.textContent?.trim() === "";
+};
+
+/**
+ * Walks the editor's DOM and emits a plain-text version that preserves
+ * <br> / <div> / <p> as real `\n` line breaks. Used for the `payload.text`
+ * mirror that downstream consumers (search, export-to-PDF) read — plain
+ * `textContent` strips block boundaries and collapses everything into a
+ * single line.
+ */
+const htmlToPlainText = (html: string): string => {
+  const root = document.createElement("div");
+  root.innerHTML = html;
+  let out = "";
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      out += node.textContent ?? "";
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    const tag = node.tagName.toLowerCase();
+    if (tag === "br") {
+      out += "\n";
+      return;
+    }
+    const isBlock = tag === "div" || tag === "p";
+    if (isBlock && out.length > 0 && !out.endsWith("\n")) {
+      out += "\n";
+    }
+    for (const child of Array.from(node.childNodes)) {
+      walk(child);
+    }
+    if (isBlock && !out.endsWith("\n")) {
+      out += "\n";
+    }
+  };
+  for (const child of Array.from(root.childNodes)) {
+    walk(child);
+  }
+  return out.replace(/\n+$/, "");
 };
 
 const clearNativeTextSelection = () => {
@@ -263,9 +348,27 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     lastTextClick = null;
     if (annotationStore.editingId) {
-      const editor = activeTextEditor();
+      const editor = activeTextEditor() ?? peekLastFocusedEditor();
       if (editor) {
-        editor.blur();
+        // If the editor is currently focused, blur() flushes the edit
+        // through onBlur normally. If it was soft-blurred earlier (focus
+        // is on a toolbar control), .blur() is a no-op, so commit
+        // synchronously from the live DOM here — otherwise typed content
+        // since the soft-blur would be discarded when the editor unmounts.
+        if (document.activeElement === editor) {
+          editor.blur();
+        } else {
+          const editingId = annotationStore.editingId;
+          const annotation = annotationStore.items.find((a) => a.id === editingId);
+          if (annotation) {
+            const html = editor.innerHTML;
+            const stylePatch = readEditorStylePatch(editor);
+            unregisterEditor(editor);
+            commitTextEdit(annotation, html, stylePatch);
+          } else {
+            stopEditingAnnotation();
+          }
+        }
       } else {
         stopEditingAnnotation();
       }
@@ -608,10 +711,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       // both would mean the user has to undo twice for an aborted text.
       removeAnnotation(annotation.id, { record: false });
     } else if (html !== annotationHtml(annotation) || textStyleChanged(annotation, stylePatch)) {
-      // Derive a plain-text mirror so search and legacy consumers still work.
-      const tmp = document.createElement("div");
-      tmp.innerHTML = html;
-      const text = tmp.textContent ?? "";
+      // Derive a plain-text mirror — block-aware so PDF export and search
+      // both see one line per visual line, not a giant concatenation.
+      const text = htmlToPlainText(html);
       updateAnnotation(annotation.id, (item) => ({
         ...item,
         style: { ...item.style, ...stylePatch },
@@ -701,6 +803,35 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         opacity={currentDraft.type === "highlight" ? 0.32 : 1}
         stroke={currentDraft.type === "highlight" ? "none" : stroke}
         stroke-width={width}
+      />
+    );
+  };
+
+  /**
+   * Invisible click target sized to the shape's bounding box. Behaves
+   * identically to clicking the visible stroke — always selects/moves
+   * the shape on pointerdown — so a thin or zero-width stroke (axis-
+   * aligned line) is just as easy to grab as a fat one.
+   */
+  const renderHitArea = (annotation: Annotation) => {
+    const bboxPage = annotationBboxPage(annotation);
+    if (!bboxPage) return null;
+    const display = rectToDisplayBox(
+      bboxPage,
+      props.page,
+      props.zoom,
+      props.rotation,
+    );
+    const padPx = HIT_PAD * props.zoom;
+    return (
+      <rect
+        class="annotation-hit-area"
+        x={display.x - padPx}
+        y={display.y - padPx}
+        width={Math.max(1, display.w + padPx * 2)}
+        height={Math.max(1, display.h + padPx * 2)}
+        onPointerDown={(event) => startMove(event, annotation)}
+        onDblClick={(event) => editText(event, annotation)}
       />
     );
   };
@@ -875,6 +1006,15 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               onPointerDown={(event) => event.stopPropagation()}
               onFocus={(event) => registerEditor(event.currentTarget)}
               onBlur={(event) => {
+                // Soft blur: focus heading into the formatting toolbar
+                // (font <select>, size input, color picker, B/I/U buttons)
+                // must NOT commit & exit edit mode. We leave editingId,
+                // lastFocusedEditor and savedRange untouched so the next
+                // execCommand-driven action lands on the same range. The
+                // toolbar action refocuses the contenteditable for us.
+                if (isToolbarFocus(event.relatedTarget)) {
+                  return;
+                }
                 const html = event.currentTarget.innerHTML;
                 const stylePatch = readEditorStylePatch(event.currentTarget);
                 unregisterEditor(event.currentTarget);
@@ -989,12 +1129,18 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       // catch pointer events on empty areas, so we toggle a class instead
       // of always intercepting. Annotation shapes themselves always keep
       // pointer-events on so click-to-select still works in select mode.
+      //
+      // Exception: if anything is currently selected, we keep the layer
+      // intercepting so the next empty-area click clears the selection.
+      // Without this the click leaks straight to the underlying text layer
+      // and the annotation stays selected forever.
       classList={{
         "passes-through":
           annotationStore.tool === "select" &&
           annotationStore.editingId === null &&
           dragState() === null &&
-          draft() === null,
+          draft() === null &&
+          annotationStore.selectedIds.length === 0,
       }}
       width={props.width}
       height={props.height}
@@ -1017,6 +1163,13 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           <path d="M0,0 L0,6 L9,3 z" fill={annotationStore.color} />
         </marker>
       </defs>
+      {/*
+        Hit areas render BEFORE visible shapes so painted strokes still
+        sit on top — clicks that land on the stroke target the visible
+        element, clicks that land in the empty interior of the bbox fall
+        through to the hit area underneath. Both call the same handler.
+      */}
+      <For each={pageAnnotations()}>{(annotation) => renderHitArea(annotation)}</For>
       <For each={pageAnnotations()}>{(annotation) => renderAnnotation(annotation)}</For>
       <For each={pageAnnotations()}>{(annotation) => <Show when={selectedIds().has(annotation.id)}>{renderHandles(annotation)}</Show>}</For>
       {renderDraft()}

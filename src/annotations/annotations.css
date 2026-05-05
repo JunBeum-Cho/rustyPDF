@@ -25,17 +25,30 @@
 .annotation-layer.passes-through .annotation-shape,
 .annotation-layer.passes-through .annotation-handle,
 .annotation-layer.passes-through .annotation-text-object,
-.annotation-layer.passes-through .annotation-image {
+.annotation-layer.passes-through .annotation-image,
+.annotation-layer.passes-through .annotation-hit-area {
   pointer-events: auto;
+}
+
+/*
+ * Bounding-box click target laid behind each shape. We use a near-zero
+ * alpha (rather than fill: transparent) so every browser treats the
+ * interior as paintable for hit-testing — Chromium has historically
+ * been finicky with truly transparent SVG fills even when
+ * `pointer-events: all` is set. The handler matches the visible
+ * stroke's: clicking anywhere in the bbox selects/moves the shape,
+ * regardless of which tool is active.
+ */
+.annotation-hit-area {
+  fill: rgba(0, 0, 0, 0);
+  stroke: none;
+  cursor: grab;
+  pointer-events: all;
 }
 
 .annotation-shape.selected,
 .annotation-text-object.selected {
   outline: none;
-}
-
-.annotation-shape.selected {
-  filter: drop-shadow(0 0 1.5px var(--accent));
 }
 
 .annotation-draft {
