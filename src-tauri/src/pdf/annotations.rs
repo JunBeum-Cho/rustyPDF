@@ -1,3 +1,4 @@
+use super::rich_text::{parse_html, RunStyle, TextLine, TextRun};
 use super::{create_pdfium, PdfError};
 use pdfium_render::prelude::*;
 use serde::Deserialize;
@@ -269,6 +270,10 @@ impl Default for AnnotationStyle {
 struct AnnotationPayload {
     #[serde(default)]
     text: String,
+    /// Editor's rich-text HTML. Optional — annotations without per-range
+    /// styling (or written by an older client) just pass `text`.
+    #[serde(default)]
+    html: Option<String>,
 }
 
 fn default_color() -> String {
@@ -397,13 +402,13 @@ fn align_kind(style: &AnnotationStyle) -> &'static str {
     }
 }
 
-/// Render a text annotation as flattened page objects. We split on `\n`
-/// so the user's visible line breaks survive into the PDF (this is why
-/// the frontend now derives `payload.text` with a block-aware walker —
-/// `textContent` would have collapsed everything into one line). Each
-/// line becomes its own text object so we can place it independently
-/// with the requested alignment; underline is a stroked path drawn
-/// just below the baseline.
+/// Render a text annotation as flattened page objects. When `payload.html`
+/// is present we walk it via `rich_text::parse_html` so per-range bold /
+/// italic / underline / font-family / font-size / color carry into the
+/// PDF as separate text objects within each line. Falling back to
+/// `payload.text` (newline-split, single annotation-level style) keeps
+/// older sidecars and any annotation that never picked up rich-text
+/// editing working.
 fn draw_text(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
@@ -413,85 +418,157 @@ fn draw_text(
     let Some(rect) = annotation.rect else {
         return Ok(());
     };
-    let raw = annotation.payload.text.as_str();
-    if raw.trim().is_empty() {
+    let style = &annotation.style;
+    let base_font_size = style.font_size.max(1.0);
+
+    let base = RunStyle {
+        color: style.color.clone(),
+        opacity: style.opacity,
+        font_size: base_font_size,
+        font_family: style.font_family.clone(),
+        bold: is_bold_style(style),
+        italic: is_italic_style(style),
+        underline: is_underline_style(style),
+    };
+
+    let lines = match annotation.payload.html.as_deref() {
+        Some(html) if !html.trim().is_empty() => parse_html(html, base.clone()),
+        _ => fallback_lines_from_text(&annotation.payload.text, &base),
+    };
+
+    if lines.is_empty() || lines.iter().all(|l| l.runs.is_empty()) {
         return Ok(());
     }
 
-    let style = &annotation.style;
-    let font_size = style.font_size.max(1.0);
-    // Match the frontend's CSS line-height: 1.25 so what the user sees in
-    // the editor is what they get in the exported PDF.
-    let line_height = font_size * 1.25;
-    let color = color_from_hex(&style.color, style.opacity);
-    let bold = is_bold_style(style);
-    let italic = is_italic_style(style);
-    let underline = is_underline_style(style);
+    // CJK font selection is annotation-wide so visually adjacent runs
+    // share metrics — mixing built-in Helvetica with Malgun Gothic in
+    // the same line would jitter heights even when both have Latin
+    // glyphs available.
+    let annotation_has_cjk = lines
+        .iter()
+        .flat_map(|l| l.runs.iter())
+        .any(|r| r.text.chars().any(|c| (c as u32) > 127));
+
     let align = align_kind(style);
 
-    let has_cjk = raw.chars().any(|c| (c as u32) > 127);
-    let font_token = fonts.pick(style.font_family.as_deref(), bold, italic, has_cjk);
+    // Walk each visual line, place runs left-to-right, advance baseline by
+    // (line's tallest run's font_size * 1.25).
+    let mut current_y = page_height - rect.y - base_font_size;
 
-    for (line_index, line) in raw.split('\n').enumerate() {
-        if line.is_empty() {
+    for line in lines {
+        let runs: Vec<TextRun> = line.runs.into_iter().filter(|r| !r.text.is_empty()).collect();
+        if runs.is_empty() {
+            // Visible blank line — still advance so the rhythm matches
+            // what the user typed.
+            current_y -= base_font_size * 1.25;
             continue;
         }
 
-        // PDF y-axis is bottom-up. The first line's baseline sits one
-        // font-size below the top of the annotation rect; subsequent
-        // lines step down by line_height.
-        let baseline_y = page_height - rect.y - font_size - (line_index as f32) * line_height;
+        let line_max_size = runs
+            .iter()
+            .map(|r| r.style.font_size)
+            .fold(0f32, f32::max)
+            .max(base_font_size);
 
-        let mut object = page
-            .objects_mut()
-            .create_text_object(
-                PdfPoints::ZERO,
-                PdfPoints::ZERO,
-                line,
-                font_token,
-                PdfPoints::new(font_size),
-            )
-            .map_err(|e| PdfError::Pdfium(e.to_string()))?;
-        object
-            .set_fill_color(color)
-            .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+        // Stage 1 — create each run at the origin so we can ask pdfium for
+        // its width. The objects are owned by the page from this point;
+        // dropping the Rust handle does NOT remove them (see the Drop impl
+        // for PdfPageObject), it just releases the local reference.
+        let mut placed: Vec<(PdfPageObject<'_>, f32, RunStyle)> = Vec::with_capacity(runs.len());
+        let mut total_width = 0.0;
+        for run in runs {
+            let token = fonts.pick(
+                run.style.font_family.as_deref(),
+                run.style.bold,
+                run.style.italic,
+                annotation_has_cjk,
+            );
+            let mut object = page
+                .objects_mut()
+                .create_text_object(
+                    PdfPoints::ZERO,
+                    PdfPoints::ZERO,
+                    &run.text,
+                    token,
+                    PdfPoints::new(run.style.font_size.max(1.0)),
+                )
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+            object
+                .set_fill_color(color_from_hex(&run.style.color, run.style.opacity))
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+            let width = object
+                .width()
+                .map(|w| w.value)
+                .unwrap_or_else(|_| {
+                    run.style.font_size * 0.55 * run.text.chars().count() as f32
+                });
+            total_width += width;
+            placed.push((object, width, run.style));
+        }
 
-        // Measured width in object-local coords. CJK width measurements
-        // can be off when the loaded TTF lacks a HMTX entry for a glyph,
-        // but the fallback-to-rect-width keeps alignment from blowing up.
-        let measured_width = object
-            .width()
-            .map(|w| w.value)
-            .unwrap_or(font_size * 0.55 * line.chars().count() as f32);
+        // Stage 2 — alignment offset within the rect.
         let line_x = match align {
-            "center" => rect.x + (rect.w - measured_width) / 2.0,
-            "right" => rect.x + rect.w - measured_width,
+            "center" => rect.x + (rect.w - total_width) / 2.0,
+            "right" => rect.x + rect.w - total_width,
             _ => rect.x,
         };
+        let baseline_y = current_y;
 
-        object
-            .translate(PdfPoints::new(line_x), PdfPoints::new(baseline_y))
-            .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+        // Stage 3 — translate each run to its final position and draw any
+        // per-run underline. Underlines are stroked paths added AFTER the
+        // last text translate so the page.objects_mut() borrow is fresh.
+        let mut cursor = 0.0_f32;
+        let mut underline_specs: Vec<(f32, f32, f32, f32, PdfColor)> = Vec::new();
+        for (mut object, width, run_style) in placed {
+            let x = line_x + cursor;
+            object
+                .translate(PdfPoints::new(x), PdfPoints::new(baseline_y))
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
 
-        if underline {
-            // Underline: a thin stroked line just below the baseline.
-            // 0.08 of font-size is the rough thickness most fonts use.
-            let underline_y = baseline_y - font_size * 0.12;
-            let underline_thickness = (font_size * 0.06).max(0.5);
+            if run_style.underline {
+                let underline_y = baseline_y - run_style.font_size * 0.12;
+                let thickness = (run_style.font_size * 0.06).max(0.5);
+                underline_specs.push((
+                    x,
+                    x + width,
+                    underline_y,
+                    thickness,
+                    color_from_hex(&run_style.color, run_style.opacity),
+                ));
+            }
+            cursor += width;
+            // Drop `object` here — the actual PDF text object stays on
+            // the page; only the local reference goes away.
+        }
+
+        for (x1, x2, y, thickness, color) in underline_specs {
             page.objects_mut()
                 .create_path_object_line(
-                    PdfPoints::new(line_x),
-                    PdfPoints::new(underline_y),
-                    PdfPoints::new(line_x + measured_width),
-                    PdfPoints::new(underline_y),
+                    PdfPoints::new(x1),
+                    PdfPoints::new(y),
+                    PdfPoints::new(x2),
+                    PdfPoints::new(y),
                     color,
-                    PdfPoints::new(underline_thickness),
+                    PdfPoints::new(thickness),
                 )
                 .map_err(|e| PdfError::Pdfium(e.to_string()))?;
         }
+
+        current_y -= line_max_size * 1.25;
     }
 
     Ok(())
+}
+
+fn fallback_lines_from_text(text: &str, base: &RunStyle) -> Vec<TextLine> {
+    text.split('\n')
+        .map(|line| TextLine {
+            runs: vec![TextRun {
+                text: line.to_string(),
+                style: base.clone(),
+            }],
+        })
+        .collect()
 }
 
 fn draw_rect(

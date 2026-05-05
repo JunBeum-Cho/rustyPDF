@@ -1,5 +1,5 @@
 {
-  "name": "rustpdf",
+  "name": "rustypdf",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "setup-pdfium": "node scripts/setup-pdfium.mjs",
+    "icon": "tsx icon.ts",
     "build:mac": "tauri build --target universal-apple-darwin",
     "build:mac:intel": "tauri build --target x86_64-apple-darwin",
     "build:mac:arm": "tauri build --target aarch64-apple-darwin",
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
+    "tsx": "^4.21.0",
     "typescript": "~5.6.3",
     "vite": "^6.0.3",
     "vite-plugin-solid": "^2.11.0"

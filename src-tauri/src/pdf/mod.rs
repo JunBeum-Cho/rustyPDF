@@ -4,6 +4,7 @@ pub mod document;
 pub mod edit;
 pub mod ocr;
 pub mod render;
+pub mod rich_text;
 pub mod text;
 
 use pdfium_render::prelude::Pdfium;

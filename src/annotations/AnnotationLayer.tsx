@@ -507,7 +507,10 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           pngPromise.then(
             (buf) => {
               emitToast("스크린샷이 준비됐습니다", "info", {
-                timeoutMs: null,
+                // Auto-dismiss after 5s. The user can still hit either
+                // action button before then; once it fades away the
+                // capture is gone (we don't keep the buffer around).
+                timeoutMs: 5000,
                 actions: [
                   {
                     label: "내 컴퓨터로 저장하기",

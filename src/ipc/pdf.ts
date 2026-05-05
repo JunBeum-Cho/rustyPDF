@@ -71,7 +71,7 @@ export async function promptUnsavedChanges(
   }
   try {
     const result = await ask(message, {
-      title: "rustpdf",
+      title: "RustyPDF",
       kind: "warning",
       okLabel: "저장",
       cancelLabel: "저장 안 함",
@@ -203,7 +203,7 @@ export async function closeTab(tabId: string): Promise<void> {
       shouldSave = await ask(
         `${fileNameFromPath(tab.path)}에 저장되지 않은 변경사항이 있습니다. 저장하시겠습니까?`,
         {
-          title: "rustpdf",
+          title: "RustyPDF",
           kind: "warning",
           okLabel: "저장 후 닫기",
           cancelLabel: "저장 안 함",

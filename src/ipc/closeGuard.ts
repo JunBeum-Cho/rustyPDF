@@ -25,7 +25,7 @@ export function installCloseGuard() {
           try {
             save = await ask(
               `저장되지 않은 변경사항이 있습니다:\n${dirtyNames.join("\n")}\n\n저장하시겠습니까?`,
-              { title: "rustpdf", kind: "warning", okLabel: "저장 후 닫기", cancelLabel: "저장 안 함" },
+              { title: "RustyPDF", kind: "warning", okLabel: "저장 후 닫기", cancelLabel: "저장 안 함" },
             );
           } catch {
             save = window.confirm("저장되지 않은 변경사항이 있습니다. 저장 후 닫으시겠습니까?");

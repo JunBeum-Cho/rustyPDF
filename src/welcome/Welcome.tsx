@@ -1,7 +1,11 @@
 import { For, Show } from "solid-js";
-import { FileText, FolderOpen, X } from "lucide-solid";
+import { FolderOpen, X } from "lucide-solid";
 import { requestOpenPdfDialog, openPdf } from "../ipc/pdf";
 import { recentFiles, removeRecentFile } from "./recentFiles";
+// The welcome logo points at the same PNG that `npm run icon` regenerates
+// for the OS-level app icon, so the in-app branding stays in sync with
+// the taskbar / Dock icon without needing a separate asset.
+import logoUrl from "../../src-tauri/icons/128x128.png";
 import "./welcome.css";
 
 const formatRelative = (iso: string): string => {
@@ -33,9 +37,9 @@ export function Welcome() {
       <div class="welcome-inner">
         <div class="welcome-brand">
           <div class="welcome-logo">
-            <FileText size={36} strokeWidth={1.4} />
+            <img src={logoUrl} alt="RustyPDF" />
           </div>
-          <h1>rustpdf</h1>
+          <h1>RustyPDF</h1>
           <p class="welcome-tagline">가벼운 PDF 뷰어</p>
         </div>
 
