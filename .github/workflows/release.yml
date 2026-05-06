@@ -47,7 +47,7 @@ jobs:
           key: ${{ matrix.rust_target }}
 
       - name: Install npm dependencies
-        run: npm ci
+        run: npm install
 
       - name: Download pdfium binary
         run: node scripts/setup-pdfium.mjs
