@@ -3,7 +3,7 @@ use super::{create_pdfium, PdfError};
 use pdfium_render::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::PI;
 use std::path::Path;
 
@@ -37,7 +37,11 @@ enum FontFamilyClass {
 }
 
 impl ExportFonts {
-    fn load(document: &mut PdfDocument) -> Self {
+    /// Load only the 14 built-in PDF fonts. CJK is deferred to
+    /// [`ensure_cjk`], which subsets a system font on demand based on the
+    /// chars actually used in annotations — embedding the full 30 MB
+    /// AppleSDGothicNeo.ttc unconditionally was the cause of 60 MB exports.
+    fn load_builtin(document: &mut PdfDocument) -> Self {
         let helvetica = document.fonts_mut().helvetica();
         let helvetica_bold = document.fonts_mut().helvetica_bold();
         let helvetica_italic = document.fonts_mut().helvetica_oblique();
@@ -50,28 +54,6 @@ impl ExportFonts {
         let courier_bold = document.fonts_mut().courier_bold();
         let courier_italic = document.fonts_mut().courier_oblique();
         let courier_bold_italic = document.fonts_mut().courier_bold_oblique();
-
-        // System CJK fonts: probe a short list of canonical install paths.
-        // We only need ONE that loads — malgun.ttf on Windows, AppleSDGothicNeo
-        // on macOS, Noto CJK on common Linux distros. Anything else falls
-        // through to built-in Helvetica (which then mangles Korean).
-        const CJK_REGULAR_CANDIDATES: &[&str] = &[
-            r"C:\Windows\Fonts\malgun.ttf",
-            r"C:\Windows\Fonts\NanumGothic.ttf",
-            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-            "/Library/Fonts/AppleSDGothicNeo.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        ];
-        const CJK_BOLD_CANDIDATES: &[&str] = &[
-            r"C:\Windows\Fonts\malgunbd.ttf",
-            r"C:\Windows\Fonts\NanumGothicBold.ttf",
-            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
-        ];
-        let cjk = load_first_existing_ttf(document, CJK_REGULAR_CANDIDATES);
-        let cjk_bold = load_first_existing_ttf(document, CJK_BOLD_CANDIDATES).or(cjk);
 
         Self {
             helvetica,
@@ -86,8 +68,40 @@ impl ExportFonts {
             courier_bold,
             courier_italic,
             courier_bold_italic,
-            cjk,
-            cjk_bold,
+            cjk: None,
+            cjk_bold: None,
+        }
+    }
+
+    /// Subset + embed a system CJK font covering `used_chars`. No-op if the
+    /// set is empty (export contains no non-ASCII text) or if no candidate
+    /// system font is installed. We embed exactly one face and reuse it
+    /// for the bold slot too — the prior code listed AppleSDGothicNeo.ttc
+    /// for both regular and bold and pdfium picked the same internal face
+    /// either way, so visually nothing changes.
+    fn ensure_cjk(&mut self, document: &mut PdfDocument, used_chars: &BTreeSet<char>) {
+        if used_chars.is_empty() {
+            return;
+        }
+        // Order: Korean-specific first (smaller subsets, better hinting),
+        // then pan-CJK Noto. We only need ONE that loads.
+        const CJK_CANDIDATES: &[&str] = &[
+            r"C:\Windows\Fonts\malgun.ttf",
+            r"C:\Windows\Fonts\NanumGothic.ttf",
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        ];
+        for path in CJK_CANDIDATES {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            if let Some(token) = subset_and_load(document, &bytes, used_chars) {
+                self.cjk = Some(token);
+                self.cjk_bold = Some(token);
+                return;
+            }
         }
     }
 
@@ -131,19 +145,39 @@ impl ExportFonts {
     }
 }
 
-fn load_first_existing_ttf(
+/// Subset `font_bytes` to cover only `used_chars`, then embed the trimmed
+/// TrueType into `document`. Returns `None` if the font fails to parse,
+/// none of the requested chars resolve to glyphs, or pdfium rejects the
+/// resulting bytes — callers fall through to the next candidate font.
+///
+/// Face index is hard-coded to 0; for `.ttc` collections this picks the
+/// first face, which matches what pdfium's previous direct-load path did
+/// anyway. `GlyphRemapper` rewrites glyph IDs into a contiguous range and
+/// rebuilds the cmap accordingly, so pdfium's Unicode → glyph lookup
+/// resolves to the new IDs.
+fn subset_and_load(
     document: &mut PdfDocument,
-    candidates: &[&str],
+    font_bytes: &[u8],
+    used_chars: &BTreeSet<char>,
 ) -> Option<PdfFontToken> {
-    for path in candidates {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        if let Ok(token) = document.fonts_mut().load_true_type_from_bytes(&bytes, true) {
-            return Some(token);
+    const FACE_INDEX: u32 = 0;
+    let face = ttf_parser::Face::parse(font_bytes, FACE_INDEX).ok()?;
+    let mut remapper = subsetter::GlyphRemapper::new();
+    let mut found = false;
+    for &c in used_chars {
+        if let Some(gid) = face.glyph_index(c) {
+            remapper.remap(gid.0);
+            found = true;
         }
     }
-    None
+    if !found {
+        return None;
+    }
+    let subset = subsetter::subset(font_bytes, FACE_INDEX, &remapper).ok()?;
+    document
+        .fonts_mut()
+        .load_true_type_from_bytes(&subset, true)
+        .ok()
 }
 
 fn classify_font_family(family: Option<&str>) -> FontFamilyClass {
@@ -302,7 +336,7 @@ pub fn export_flattened_pdf(
     let mut document = pdfium
         .load_pdf_from_file(Path::new(source_path), None)
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
-    let fonts = ExportFonts::load(&mut document);
+    let mut fonts = ExportFonts::load_builtin(&mut document);
     let page_count = document.pages().len() as usize;
     let mut annotations_by_page: BTreeMap<usize, Vec<AnnotationData>> = BTreeMap::new();
 
@@ -314,6 +348,24 @@ pub fn export_flattened_pdf(
                 .push(annotation);
         }
     }
+
+    // Pre-scan all text annotations for non-ASCII chars so we know which
+    // glyphs the CJK subset needs. Text content lives in either the
+    // editor's HTML (rich text) or the legacy plain-text fallback; we
+    // sweep both fields raw — non-ASCII HTML tag chars don't exist, so
+    // the resulting set is exactly the displayed characters.
+    let cjk_chars: BTreeSet<char> = annotations_by_page
+        .values()
+        .flatten()
+        .filter(|a| matches!(a.kind, AnnotationKind::Text))
+        .flat_map(|a| {
+            let html_chars = a.payload.html.as_deref().unwrap_or("").chars();
+            let text_chars = a.payload.text.chars();
+            html_chars.chain(text_chars)
+        })
+        .filter(|c| (*c as u32) > 127)
+        .collect();
+    fonts.ensure_cjk(&mut document, &cjk_chars);
 
     for (page_index, annotations) in annotations_by_page {
         let mut page = document

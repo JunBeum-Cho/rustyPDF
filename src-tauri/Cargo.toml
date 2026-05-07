@@ -33,6 +33,11 @@ lru = "0.12"
 pdfium-render = { version = "0.8", features = ["thread_safe", "image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+# Subsetting CJK fonts before embedding keeps "export annotated PDF" output
+# small (a 30 MB system .ttc would otherwise be embedded whole). ttf-parser
+# resolves char → glyph id; subsetter strips everything else from the font.
+ttf-parser = "0.21"
+subsetter = "0.2"
 
 [profile.release]
 opt-level = 3

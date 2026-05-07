@@ -738,9 +738,7 @@ async fn export_annotated_pdf(
     target_path: String,
     data: Value,
 ) -> Result<(), PdfError> {
-    export_flattened_pdf(&source_path, &target_path, data.clone())?;
-    let sidecar = sidecar_path(&target_path);
-    std::fs::write(sidecar, serde_json::to_vec_pretty(&data)?)?;
+    export_flattened_pdf(&source_path, &target_path, data)?;
     Ok(())
 }
 
