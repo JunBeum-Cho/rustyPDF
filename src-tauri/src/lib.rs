@@ -293,6 +293,11 @@ async fn set_dock_recents(
     Ok(())
 }
 
+#[tauri::command]
+fn request_app_exit(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg(target_os = "macos")]
 fn note_recent_document_native(path: &str) {
     // We invoke `NSDocumentController` through Apple's `objc_msgSend` ABI.
@@ -799,10 +804,22 @@ pub fn run() {
             export_annotated_pdf,
             note_recent_document,
             set_dock_recents,
+            request_app_exit,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // macOS 26/WebKit can crash during the normal WebView teardown
+            // path after a window is destroyed (seen in
+            // WebPageProxy::dispatchSetObscuredContentInsets). Once the
+            // frontend close guard has flushed pending saves, exit the
+            // process directly instead of letting WebKit process another
+            // run-loop tick during teardown.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::ExitRequested { code, .. } = &event {
+                std::process::exit(code.unwrap_or(0));
+            }
+
             // macOS: when the app is already running and the OS asks it to
             // open files (Finder double-click, drag onto Dock icon),
             // tauri-runtime delivers them via `RunEvent::Opened`. Convert

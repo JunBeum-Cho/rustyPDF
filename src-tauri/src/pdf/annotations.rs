@@ -1,10 +1,15 @@
 use super::rich_text::{parse_html, RunStyle, TextLine, TextRun};
 use super::{create_pdfium, PdfError};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use pdfium_render::prelude::*;
+use resvg::{tiny_skia, usvg};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::PI;
+use std::io::Cursor;
 use std::path::Path;
 
 /// Bundled fonts available for text annotation flattening. The 12 built-in
@@ -242,6 +247,7 @@ enum AnnotationKind {
     Arrow,
     Pen,
     Highlight,
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -301,6 +307,7 @@ impl Default for AnnotationStyle {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AnnotationPayload {
     #[serde(default)]
     text: String,
@@ -308,6 +315,8 @@ struct AnnotationPayload {
     /// styling (or written by an older client) just pass `text`.
     #[serde(default)]
     html: Option<String>,
+    #[serde(default)]
+    image_src: Option<String>,
 }
 
 fn default_color() -> String {
@@ -406,6 +415,7 @@ fn draw_annotation(
             draw_polyline(page, &annotation.points, &annotation.style, page_height)
         }
         AnnotationKind::Highlight => draw_highlight(page, annotation, page_height),
+        AnnotationKind::Image => draw_image(page, annotation, page_height),
     }
 }
 
@@ -693,6 +703,34 @@ fn draw_highlight(
     Ok(())
 }
 
+fn draw_image(
+    page: &mut PdfPage<'_>,
+    annotation: &AnnotationData,
+    page_height: f32,
+) -> Result<(), PdfError> {
+    let Some(rect) = annotation.rect else {
+        return Ok(());
+    };
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return Ok(());
+    }
+    let Some(src) = annotation.payload.image_src.as_deref() else {
+        return Ok(());
+    };
+
+    let image = apply_image_opacity(decode_annotation_image(src)?, annotation.style.opacity);
+    page.objects_mut()
+        .create_image_object(
+            PdfPoints::new(rect.x),
+            PdfPoints::new(page_height - rect.y - rect.h),
+            &image,
+            Some(PdfPoints::new(rect.w)),
+            Some(PdfPoints::new(rect.h)),
+        )
+        .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+    Ok(())
+}
+
 fn draw_line_annotation(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
@@ -812,6 +850,123 @@ fn annotation_fill_color(style: &AnnotationStyle) -> Option<PdfColor> {
         .map(|value| color_from_hex(value, style.opacity))
 }
 
+fn decode_annotation_image(src: &str) -> Result<DynamicImage, PdfError> {
+    let (mime, bytes) = decode_image_data_url(src)?;
+    if is_svg_payload(mime.as_deref(), &bytes) {
+        return rasterize_svg(&bytes);
+    }
+
+    decode_raster_image(&bytes)
+}
+
+fn decode_raster_image(bytes: &[u8]) -> Result<DynamicImage, PdfError> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| PdfError::Image(e.to_string()))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| PdfError::Image(e.to_string()))?;
+    let orientation = decoder
+        .orientation()
+        .map_err(|e| PdfError::Image(e.to_string()))?;
+    let mut image =
+        DynamicImage::from_decoder(decoder).map_err(|e| PdfError::Image(e.to_string()))?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
+fn decode_image_data_url(src: &str) -> Result<(Option<String>, Vec<u8>), PdfError> {
+    let src = src.trim();
+    let Some(rest) = src.strip_prefix("data:") else {
+        return Err(PdfError::Image(
+            "image annotations must be embedded as data URLs".into(),
+        ));
+    };
+    let Some((metadata, encoded)) = rest.split_once(',') else {
+        return Err(PdfError::Image("invalid image data URL".into()));
+    };
+
+    let mut parts = metadata.split(';');
+    let mime = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_ascii_lowercase());
+    let is_base64 = parts.any(|part| part.trim().eq_ignore_ascii_case("base64"));
+    if !is_base64 {
+        return Err(PdfError::Image(
+            "image data URLs must be base64 encoded".into(),
+        ));
+    }
+
+    let bytes = BASE64_STANDARD
+        .decode(encoded.trim())
+        .map_err(|e| PdfError::Image(format!("invalid image data URL base64: {e}")))?;
+    Ok((mime, bytes))
+}
+
+fn is_svg_payload(mime: Option<&str>, bytes: &[u8]) -> bool {
+    if matches!(mime, Some("image/svg+xml") | Some("image/svg")) {
+        return true;
+    }
+
+    let prefix_len = bytes.len().min(4096);
+    let Ok(prefix) = std::str::from_utf8(&bytes[..prefix_len]) else {
+        return false;
+    };
+    let prefix = prefix
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .to_ascii_lowercase();
+    prefix.contains("<svg")
+}
+
+fn rasterize_svg(bytes: &[u8]) -> Result<DynamicImage, PdfError> {
+    let mut options = usvg::Options::default();
+    options.fontdb_mut().load_system_fonts();
+
+    let tree = usvg::Tree::from_data(bytes, &options)
+        .map_err(|e| PdfError::Image(format!("invalid svg image: {e}")))?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())
+        .ok_or_else(|| PdfError::Image("invalid svg image size".into()))?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+
+    let mut rgba = pixmap.data().to_vec();
+    for pixel in rgba.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u16;
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+        } else if alpha < 255 {
+            pixel[0] = ((pixel[0] as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+            pixel[1] = ((pixel[1] as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+            pixel[2] = ((pixel[2] as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+
+    let image = RgbaImage::from_raw(pixmap.width(), pixmap.height(), rgba)
+        .ok_or_else(|| PdfError::Image("svg raster buffer size mismatch".into()))?;
+    Ok(DynamicImage::ImageRgba8(image))
+}
+
+fn apply_image_opacity(image: DynamicImage, opacity: f32) -> DynamicImage {
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if opacity >= 0.999 {
+        return image;
+    }
+
+    let mut rgba = image.to_rgba8();
+    for pixel in rgba.pixels_mut() {
+        pixel.0[3] = (pixel.0[3] as f32 * opacity).round().clamp(0.0, 255.0) as u8;
+    }
+    DynamicImage::ImageRgba8(rgba)
+}
+
 fn color_from_hex(value: &str, opacity: f32) -> PdfColor {
     let raw = value.strip_prefix('#').unwrap_or(value);
     let opacity = if opacity.is_finite() {
@@ -833,4 +988,77 @@ fn color_from_hex(value: &str, opacity: f32) -> PdfColor {
     }
 
     PdfColor::new(225, 29, 72, alpha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgba;
+    use serde_json::json;
+
+    #[test]
+    fn deserializes_image_annotation_sidecar() {
+        let data = json!({
+            "annotations": [{
+                "page": 0,
+                "type": "image",
+                "rect": { "x": 10.0, "y": 20.0, "w": 30.0, "h": 40.0 },
+                "payload": {
+                    "imageSrc": "data:image/png;base64,AA==",
+                    "imageNaturalWidth": 1,
+                    "imageNaturalHeight": 1
+                }
+            }]
+        });
+
+        let sidecar: AnnotationSidecar = serde_json::from_value(data).unwrap();
+        assert_eq!(sidecar.annotations.len(), 1);
+        assert!(matches!(sidecar.annotations[0].kind, AnnotationKind::Image));
+        assert_eq!(
+            sidecar.annotations[0].payload.image_src.as_deref(),
+            Some("data:image/png;base64,AA==")
+        );
+    }
+
+    #[test]
+    fn decodes_png_data_url() {
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            1,
+            1,
+            Rgba([10, 20, 30, 255]),
+        ));
+        let mut bytes = Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let src = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(bytes.into_inner())
+        );
+
+        let decoded = decode_annotation_image(&src).unwrap();
+        assert_eq!(decoded.width(), 1);
+        assert_eq!(decoded.height(), 1);
+        assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn rasterizes_svg_data_url() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="2" height="1" fill="#ff0000"/></svg>"##;
+        let src = format!("data:image/svg+xml;base64,{}", BASE64_STANDARD.encode(svg));
+
+        let decoded = decode_annotation_image(&src).unwrap();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 1);
+        assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn applies_image_opacity_to_alpha() {
+        let source =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 200])));
+        let output = apply_image_opacity(source, 0.5).to_rgba8();
+
+        assert_eq!(output.get_pixel(0, 0).0, [1, 2, 3, 100]);
+    }
 }
