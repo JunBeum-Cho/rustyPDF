@@ -61,6 +61,9 @@ export const annotationStore = {
   get color(): string {
     return documentStore.annotationUi.color;
   },
+  get fill(): string {
+    return documentStore.annotationUi.fill;
+  },
   get strokeWidth(): number {
     return documentStore.annotationUi.strokeWidth;
   },
@@ -263,6 +266,15 @@ export const setAnnotationColor = (color: string) => {
 
 export const setAnnotationUiColor = (color: string) => {
   setDocumentStore("annotationUi", "color", color);
+};
+
+export const setAnnotationFillColor = (fill: string) => {
+  setDocumentStore("annotationUi", "fill", fill);
+  applyStyleToSelected({ fill: fill === "transparent" ? undefined : fill });
+};
+
+export const setAnnotationUiFillColor = (fill: string) => {
+  setDocumentStore("annotationUi", "fill", fill);
 };
 
 export const setAnnotationStrokeWidth = (strokeWidth: number) => {
@@ -488,4 +500,90 @@ export const remapAnnotationsForTab = (
     tab.annotations.editingId = null;
     tab.annotations.dirty = true;
   });
+};
+
+const moveInPage = (
+  items: Annotation[],
+  id: string,
+  moveFn: (pageItems: Annotation[], targetIdx: number) => Annotation[],
+): Annotation[] => {
+  const target = items.find((a) => a.id === id);
+  if (!target) return items;
+  const page = target.page;
+
+  const pageItems = items.filter((a) => a.page === page);
+  const targetIdx = pageItems.findIndex((a) => a.id === id);
+  if (targetIdx < 0) return items;
+
+  const newPageItems = moveFn(pageItems, targetIdx);
+
+  let pageItemIdx = 0;
+  return items.map((a) => {
+    if (a.page === page) {
+      return newPageItems[pageItemIdx++];
+    }
+    return a;
+  });
+};
+
+export const bringToFront = (id: string) => {
+  const tab = activeTab();
+  if (!tab) return;
+  recordAnnotationHistory();
+  mutateActiveAnnotations((state) => {
+    state.items = moveInPage(state.items, id, (pageItems, idx) => {
+      const item = pageItems[idx];
+      const rest = pageItems.filter((_, i) => i !== idx);
+      return [...rest, item];
+    });
+  });
+  markDirty();
+};
+
+export const sendToBack = (id: string) => {
+  const tab = activeTab();
+  if (!tab) return;
+  recordAnnotationHistory();
+  mutateActiveAnnotations((state) => {
+    state.items = moveInPage(state.items, id, (pageItems, idx) => {
+      const item = pageItems[idx];
+      const rest = pageItems.filter((_, i) => i !== idx);
+      return [item, ...rest];
+    });
+  });
+  markDirty();
+};
+
+export const bringForward = (id: string) => {
+  const tab = activeTab();
+  if (!tab) return;
+  recordAnnotationHistory();
+  mutateActiveAnnotations((state) => {
+    state.items = moveInPage(state.items, id, (pageItems, idx) => {
+      if (idx === pageItems.length - 1) return pageItems;
+      const copy = [...pageItems];
+      const temp = copy[idx];
+      copy[idx] = copy[idx + 1];
+      copy[idx + 1] = temp;
+      return copy;
+    });
+  });
+  markDirty();
+};
+
+export const sendBackward = (id: string) => {
+  const tab = activeTab();
+  if (!tab) return;
+  recordAnnotationHistory();
+  mutateActiveAnnotations((state) => {
+    state.items = moveInPage(state.items, id, (pageItems, idx) => {
+      if (idx === 0) return pageItems;
+      const copy = [...pageItems];
+      const temp = copy[idx];
+      copy[idx] = copy[idx - 1];
+      copy[idx - 1] = temp;
+      return copy;
+    });
+  });
+  markDirty();
 };

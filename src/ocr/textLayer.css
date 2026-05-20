@@ -6,12 +6,14 @@
  */
 .ocr-text-layer {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
   z-index: 1;
   pointer-events: none;
   user-select: text;
   -webkit-user-select: text;
   overflow: hidden;
+  transform-origin: top left;
 }
 
 .ocr-text-line {

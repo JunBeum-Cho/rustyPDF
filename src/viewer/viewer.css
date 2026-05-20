@@ -48,7 +48,10 @@
   flex-direction: column;
   align-items: center;
   gap: 16px;
-  padding: 16px 0 80px;
+  width: max-content;
+  min-width: 100%;
+  margin-inline: auto;
+  padding: 16px 16px 80px;
 }
 
 .page-frame {

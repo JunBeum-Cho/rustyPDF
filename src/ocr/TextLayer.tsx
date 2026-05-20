@@ -1,14 +1,16 @@
 import { For, createEffect, createSignal, on, onMount } from "solid-js";
 import { ocrPdfLines, pdfNativeTextLines, type OcrLine } from "../ipc/pdf";
 import { activeTab } from "../state/document";
+import type { PageMeta } from "../state/document";
+import type { Rotation } from "../annotations/coords";
 import { ocrState } from "./ocr";
 import "./textLayer.css";
 
 interface Props {
   pageIndex: number;
-  /** Display width of the page in CSS pixels (after zoom). */
-  width: number;
-  height: number;
+  page: PageMeta;
+  zoom: number;
+  rotation: Rotation;
 }
 
 /**
@@ -22,6 +24,21 @@ interface Props {
  */
 export function TextLayer(props: Props) {
   const [lines, setLines] = createSignal<OcrLine[]>([]);
+  const pageWidth = () => props.page.width * props.zoom;
+  const pageHeight = () => props.page.height * props.zoom;
+
+  const rotationTransform = () => {
+    switch (props.rotation) {
+      case 90:
+        return `translateX(${pageHeight()}px) rotate(90deg)`;
+      case 180:
+        return `translate(${pageWidth()}px, ${pageHeight()}px) rotate(180deg)`;
+      case 270:
+        return `translateY(${pageWidth()}px) rotate(270deg)`;
+      default:
+        return "none";
+    }
+  };
 
   createEffect(
     on(
@@ -54,12 +71,13 @@ export function TextLayer(props: Props) {
     <div
       class="ocr-text-layer"
       style={{
-        width: `${props.width}px`,
-        height: `${props.height}px`,
+        width: `${pageWidth()}px`,
+        height: `${pageHeight()}px`,
+        transform: rotationTransform(),
       }}
     >
       <For each={lines()}>
-        {(line) => <Line line={line} pageWidth={() => props.width} pageHeight={() => props.height} />}
+        {(line) => <Line line={line} pageWidth={pageWidth} pageHeight={pageHeight} />}
       </For>
     </div>
   );

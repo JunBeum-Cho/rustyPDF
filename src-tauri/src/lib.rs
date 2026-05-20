@@ -294,8 +294,19 @@ async fn set_dock_recents(
 }
 
 #[tauri::command]
-fn request_app_exit(app: tauri::AppHandle) {
-    app.exit(0);
+fn request_app_exit(_app: tauri::AppHandle) {
+    // macOS 26 WebKit can still queue an obscured-content-insets dispatch
+    // while the WKWebView is tearing down. Calling `app.exit()` first leaves
+    // one more native run-loop turn before our `ExitRequested` fallback below,
+    // which is enough for the pending WebKit callback to fire on a dead page.
+    // By the time this command runs the frontend close guard has already
+    // finished all save prompts, so exiting immediately is the narrowest way
+    // to avoid that teardown path on macOS.
+    #[cfg(target_os = "macos")]
+    std::process::exit(0);
+
+    #[cfg(not(target_os = "macos"))]
+    _app.exit(0);
 }
 
 #[cfg(target_os = "macos")]
@@ -806,6 +817,19 @@ pub fn run() {
             set_dock_recents,
             request_app_exit,
         ])
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::Destroyed = event {
+                // macOS 26/WebKit can crash during the normal WebView teardown
+                // path after a window is destroyed (seen in
+                // WebPageProxy::dispatchSetObscuredContentInsets). Once the
+                // main window is destroyed, exit the process immediately
+                // to prevent the pending WebKit KVO/inset callbacks from crashing the app.
+                if window.label() == "main" {
+                    std::process::exit(0);
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {

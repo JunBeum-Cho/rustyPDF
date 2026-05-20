@@ -1,4 +1,4 @@
-import { createMemo } from "solid-js";
+import { Show, createMemo } from "solid-js";
 import {
   ArrowUpRight,
   Camera,
@@ -12,6 +12,10 @@ import {
   Square,
   Type,
   Undo2,
+  BringToFront,
+  SendToBack,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-solid";
 import type { JSX } from "solid-js";
 import { exportAnnotatedPdfFile } from "../ipc/pdf";
@@ -24,6 +28,11 @@ import {
   setAnnotationStrokeWidth,
   setAnnotationTool,
   undoAnnotations,
+  bringToFront,
+  sendToBack,
+  bringForward,
+  sendBackward,
+  setAnnotationFillColor,
 } from "./store";
 import { TextFormatToolbar } from "./TextFormatToolbar";
 import { getActiveEditor, setFontColor } from "./textFormat";
@@ -75,6 +84,28 @@ export function AnnotationToolbar() {
           }}
         />
       </label>
+      <label class="annotation-checkbox" title="배경색 채우기" style={{ display: "inline-flex", "align-items": "center", gap: "4px", "font-size": "13px", "margin-left": "4px", cursor: "pointer", color: "var(--text-dim)" }}>
+        <input
+          type="checkbox"
+          checked={annotationStore.fill !== "transparent"}
+          onChange={(event) => {
+            const checked = event.currentTarget.checked;
+            setAnnotationFillColor(checked ? annotationStore.color : "transparent");
+          }}
+        />
+        <span>배경 채우기</span>
+      </label>
+      <Show when={annotationStore.fill !== "transparent"}>
+        <label class="annotation-color" title="배경색" style={{ "margin-left": "4px" }}>
+          <input
+            type="color"
+            value={annotationStore.fill === "transparent" ? "#ffffff" : annotationStore.fill}
+            onInput={(event) => {
+              setAnnotationFillColor(event.currentTarget.value);
+            }}
+          />
+        </label>
+      </Show>
       <label class="annotation-number" title="선 두께">
         <span>두께</span>
         <input
@@ -86,6 +117,38 @@ export function AnnotationToolbar() {
         />
       </label>
       <TextFormatToolbar />
+      <Show when={annotationStore.selectedIds.length === 1}>
+        <div class="annotation-tool-group" title="정렬 (레이어 순서)">
+          <button
+            type="button"
+            onClick={() => bringToFront(annotationStore.selectedIds[0])}
+            title="맨 앞으로 가져오기"
+          >
+            <BringToFront size={ICON_SIZE} />
+          </button>
+          <button
+            type="button"
+            onClick={() => bringForward(annotationStore.selectedIds[0])}
+            title="앞으로 가져오기"
+          >
+            <ChevronUp size={ICON_SIZE} />
+          </button>
+          <button
+            type="button"
+            onClick={() => sendBackward(annotationStore.selectedIds[0])}
+            title="뒤로 보내기"
+          >
+            <ChevronDown size={ICON_SIZE} />
+          </button>
+          <button
+            type="button"
+            onClick={() => sendToBack(annotationStore.selectedIds[0])}
+            title="맨 뒤로 보내기"
+          >
+            <SendToBack size={ICON_SIZE} />
+          </button>
+        </div>
+      </Show>
       <button
         type="button"
         class="toolbar-btn icon-only"

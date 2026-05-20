@@ -956,6 +956,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                   "font-style": annotation.style.fontStyle ?? "normal",
                   "text-decoration": annotation.style.textDecoration ?? "none",
                   "text-align": annotation.style.textAlign ?? "left",
+                  "background-color": annotation.style.fill ?? "transparent",
                 }}
                 // innerHTML so existing rich-text styling round-trips. The
                 // empty-state placeholder is rendered via CSS ::before when
@@ -975,6 +976,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                 "font-style": annotation.style.fontStyle ?? "normal",
                 "text-decoration": annotation.style.textDecoration ?? "none",
                 "text-align": annotation.style.textAlign ?? "left",
+                "background-color": annotation.style.fill ?? "transparent",
               }}
               attr:data-annotation-zoom={props.zoom}
               ref={(el) => {

@@ -54,6 +54,7 @@ export interface Tab {
 export interface AnnotationUiState {
   tool: AnnotationTool;
   color: string;
+  fill: string;
   strokeWidth: number;
   fontSize: number;
   fontFamily: string;
@@ -75,6 +76,7 @@ const [documentStore, setDocumentStore] = createStore<DocumentState>({
   annotationUi: {
     tool: "select",
     color: "#e11d48",
+    fill: "transparent",
     strokeWidth: 2,
     fontSize: 16,
     fontFamily: "Pretendard Variable",

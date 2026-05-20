@@ -88,10 +88,10 @@ export function Toolbar() {
             </button>
             <button
               class="toolbar-btn icon-only"
-              classList={{ "save-dirty": tab().pageDirty }}
+              classList={{ "save-dirty": tab().pageDirty || tab().annotations.dirty }}
               onClick={(event) => void saveActivePdf(event.shiftKey)}
               title={
-                tab().pageDirty
+                (tab().pageDirty || tab().annotations.dirty)
                   ? "변경사항 저장 (Cmd+S, Shift+클릭=다른 이름)"
                   : "다른 이름으로 저장 (Cmd+Shift+S)"
               }

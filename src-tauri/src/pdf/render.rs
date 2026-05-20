@@ -15,6 +15,14 @@ fn rotation_from_degrees(deg: i32) -> PdfPageRenderRotation {
     }
 }
 
+fn rotated_page_size(width: f32, height: f32, rotation_deg: i32) -> (f32, f32) {
+    if matches!(rotation_deg.rem_euclid(360), 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 /// Render a page to PNG bytes. `scale` is CSS-px-per-PDF-point divided by 1.333.
 /// Result is cached keyed by (doc_id, page, scale_bucket, rotation).
 pub fn render_page(
@@ -54,8 +62,10 @@ pub fn render_page(
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
 
     let pixel_scale = scale * PT_TO_PX;
-    let target_w = (page.width().value * pixel_scale).max(1.0) as i32;
-    let target_h = (page.height().value * pixel_scale).max(1.0) as i32;
+    let (display_w, display_h) =
+        rotated_page_size(page.width().value, page.height().value, rotation_deg);
+    let target_w = (display_w * pixel_scale).max(1.0) as i32;
+    let target_h = (display_h * pixel_scale).max(1.0) as i32;
 
     let render_config = PdfRenderConfig::new()
         .set_target_width(target_w)
@@ -83,4 +93,18 @@ pub fn render_page(
     let arc = Arc::new(buf.clone());
     cache.put(key, arc, buf.len());
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rotated_page_size;
+
+    #[test]
+    fn swaps_render_axes_only_for_quarter_turns() {
+        assert_eq!(rotated_page_size(612.0, 792.0, 0), (612.0, 792.0));
+        assert_eq!(rotated_page_size(612.0, 792.0, 90), (792.0, 612.0));
+        assert_eq!(rotated_page_size(612.0, 792.0, 180), (612.0, 792.0));
+        assert_eq!(rotated_page_size(612.0, 792.0, 270), (792.0, 612.0));
+        assert_eq!(rotated_page_size(612.0, 792.0, -90), (792.0, 612.0));
+    }
 }

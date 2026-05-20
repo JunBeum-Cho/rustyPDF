@@ -10,7 +10,6 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::PI;
 use std::io::Cursor;
-use std::path::Path;
 
 /// Bundled fonts available for text annotation flattening. The 12 built-in
 /// PDF Type-1 fonts are always available; the CJK pair is best-effort —
@@ -315,7 +314,7 @@ struct AnnotationPayload {
     /// styling (or written by an older client) just pass `text`.
     #[serde(default)]
     html: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "imageSrc")]
     image_src: Option<String>,
 }
 
@@ -342,8 +341,14 @@ pub fn export_flattened_pdf(
 ) -> Result<(), PdfError> {
     let sidecar: AnnotationSidecar = serde_json::from_value(data)?;
     let pdfium = create_pdfium()?;
+    // Read source bytes upfront so we don't hold an OS file handle on the
+    // source. Required when source_path == target_path (the in-place save
+    // flow): `std::fs::write` below truncates the file, and a still-open
+    // pdfium file handle would race with that — `load_pdf_from_byte_slice`
+    // detaches us from the inode entirely.
+    let source_bytes = std::fs::read(source_path)?;
     let mut document = pdfium
-        .load_pdf_from_file(Path::new(source_path), None)
+        .load_pdf_from_byte_slice(&source_bytes, None)
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
     let mut fonts = ExportFonts::load_builtin(&mut document);
     let page_count = document.pages().len() as usize;
@@ -395,6 +400,12 @@ pub fn export_flattened_pdf(
     let bytes = document
         .save_to_bytes()
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+    // Drop the document (and its borrow of source_bytes) before writing.
+    // Otherwise on Windows the file lock from the load above can still be
+    // held by pdfium when we attempt the overwrite below.
+    drop(document);
+    drop(source_bytes);
+    drop(pdfium);
     std::fs::write(target_path, bytes)?;
     Ok(())
 }
@@ -482,6 +493,18 @@ fn draw_text(
     };
     let style = &annotation.style;
     let base_font_size = style.font_size.max(1.0);
+
+    // Draw background/fill if present
+    if let Some(fill) = annotation_fill_color(style) {
+        page.objects_mut()
+            .create_path_object_rect(
+                rect_to_pdf(rect, page_height),
+                None,
+                None,
+                Some(fill),
+            )
+            .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+    }
 
     let base = RunStyle {
         color: style.color.clone(),

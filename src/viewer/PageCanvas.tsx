@@ -106,8 +106,9 @@ export function PageCanvas(props: Props) {
       />
       <TextLayer
         pageIndex={props.index}
-        width={props.width}
-        height={props.height}
+        page={props.page}
+        zoom={props.zoom}
+        rotation={props.rotation}
       />
       <AnnotationLayer
         page={props.page}

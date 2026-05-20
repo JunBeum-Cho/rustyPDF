@@ -444,7 +444,23 @@ export async function saveActivePdf(asNew = false): Promise<boolean> {
     target = chosen;
   }
   try {
+    // 1. Save base PDF (with page-level edits)
     await savePdfToPath(tab.docId, target);
+
+    // 2. Flatten/Merge annotations/images into the PDF if any exist
+    if (tab.annotations.items.length > 0) {
+      const data = makeSidecar(target, tab.annotations.items);
+      await invoke("export_annotated_pdf", {
+        sourcePath: target,
+        targetPath: target,
+        data,
+      });
+    }
+
+    // 3. Save sidecar JSON for backward compatibility and reset dirty status
+    const sidecar = makeSidecar(target, tab.annotations.items);
+    await saveAnnotationSidecar(target, sidecar);
+    markAnnotationsSavedForTab(tab.tabId);
   } catch (error) {
     console.error("save pdf failed", error);
     window.alert(
