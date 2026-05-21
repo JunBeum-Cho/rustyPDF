@@ -459,43 +459,55 @@ async function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
   try {
     const tab = documentStore.tabs[idx];
     if (!tab) return false;
-    const hadAnnotations = tab.annotations.items.length > 0;
+    const hasAnnotations = tab.annotations.items.length > 0;
     const savedAt = new Date().toISOString();
-    const flattenedData =
-      hadAnnotations
-        ? makeSidecar(target, tab.annotations.items)
-        : null;
+    const annotationItems = tab.annotations.items;
+    const bytesChanged = tab.pageDirty || asNew;
 
-    if (hadAnnotations) {
+    if (hasAnnotations) {
       setAnnotationSaveStatusForTab(tab.tabId, "saving");
     }
 
-    const saved = await savePdfDocument(tab.docId, target, flattenedData);
+    // Save the PDF bytes only — annotations stay in the sidecar so the user
+    // can keep moving/removing them. Flattening into the PDF only happens at
+    // export time.
+    const saved = await savePdfDocument(tab.docId, target, null);
 
-    // Once annotations are flattened into the PDF, keep the sidecar empty so
-    // re-opening the file doesn't paint the same objects a second time.
-    const emptyTargetSidecar = makeSidecar(target, []);
-    await saveAnnotationSidecar(target, emptyTargetSidecar);
-    if (currentTab.path !== target) {
-      await saveAnnotationSidecar(currentTab.path, makeSidecar(currentTab.path, []));
-    }
+    // Persist the sidecar at the (possibly new) target path so annotations
+    // re-appear as editable objects when this file is reopened.
+    await saveAnnotationSidecar(target, makeSidecar(target, annotationItems));
 
     setDocumentStore(
       produce((state) => {
         const saveIdx = state.tabs.findIndex((t) => t.tabId === tabId);
         if (saveIdx < 0) return;
-        state.tabs[saveIdx].docId = saved.id;
-        state.tabs[saveIdx].path = saved.path;
-        state.tabs[saveIdx].pageCount = saved.pageCount;
-        state.tabs[saveIdx].pages = saved.pages;
-        state.tabs[saveIdx].fileSize = saved.fileSize;
-        state.tabs[saveIdx].contentVersion += 1;
-        state.tabs[saveIdx].prefetchPolicy =
+        const target = state.tabs[saveIdx];
+        // Only swap the `pages` array if the page layout actually changed —
+        // otherwise the new objects break Solid's <For> identity and force
+        // every PageCanvas to remount, which shows up as a viewer flash.
+        const layoutChanged =
+          target.pages.length !== saved.pages.length ||
+          target.pages.some(
+            (p, i) =>
+              p.width !== saved.pages[i].width ||
+              p.height !== saved.pages[i].height,
+          );
+        target.docId = saved.id;
+        target.path = saved.path;
+        target.pageCount = saved.pageCount;
+        if (layoutChanged) target.pages = saved.pages;
+        target.fileSize = saved.fileSize;
+        // Only bump contentVersion when bytes actually changed; bumping on
+        // every save would refire the per-page render effect and produce a
+        // brief flash, even though the bitmap content is unchanged.
+        if (bytesChanged) target.contentVersion += 1;
+        target.prefetchPolicy =
           saved.fileSize <= EAGER_PREFETCH_LIMIT_BYTES ? "all" : "lazy";
-        state.tabs[saveIdx].pageDirty = false;
-        state.tabs[saveIdx].annotations = emptyAnnotationTabState();
-        state.tabs[saveIdx].annotations.saveStatus = "saved";
-        state.tabs[saveIdx].annotations.lastSavedAt = savedAt;
+        target.pageDirty = false;
+        target.annotations.dirty = false;
+        target.annotations.saveStatus = "saved";
+        target.annotations.saveError = null;
+        target.annotations.lastSavedAt = savedAt;
       }),
     );
   } catch (error) {

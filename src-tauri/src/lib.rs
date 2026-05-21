@@ -192,14 +192,22 @@ async fn pdf_save_document(
     target_path: String,
     data: Option<Value>,
 ) -> Result<OpenedDocument, PdfError> {
+    // `save_doc_with_annotations` already swaps the registry handle in place
+    // (same doc_id, new bytes/path). Reopening with a fresh doc_id used to
+    // cause the page list to remount on every save — visible as a viewer
+    // flash — so keep the existing handle and just invalidate caches.
     let saved = save_doc_with_annotations(&state.registry, &doc_id, &target_path, data)?;
-    let reopened = open_document(&state.registry, saved.path.clone())?;
-    let _ = load_sidecar_into_cache(&state.ocr, &reopened.id, &saved.path);
     state.cache.purge_doc(&doc_id);
     state.text.invalidate(&doc_id);
     state.ocr.invalidate(&doc_id);
-    let _ = close_document(&state.registry, &doc_id);
-    Ok(reopened)
+    let _ = load_sidecar_into_cache(&state.ocr, &doc_id, &saved.path);
+    Ok(OpenedDocument {
+        id: doc_id,
+        path: saved.path,
+        page_count: saved.page_count,
+        pages: saved.pages,
+        file_size: saved.file_size,
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -217,25 +225,75 @@ async fn pdf_capture_region(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-fn sidecar_path(path: &str) -> PathBuf {
+/// Legacy sidecar location: `<pdf_path>.notes.json`. Older installs of the app
+/// wrote here; we still read it as a one-shot fallback so existing notes
+/// migrate forward the next time the user saves.
+fn legacy_sidecar_path(path: &str) -> PathBuf {
     PathBuf::from(format!("{path}.notes.json"))
 }
 
-#[tauri::command(rename_all = "camelCase")]
-async fn annotations_load(path: String) -> Result<Option<Value>, PdfError> {
-    let path = sidecar_path(&path);
-    if !path.exists() {
-        return Ok(None);
+/// Stable 64-bit hash of an absolute PDF path used as the sidecar filename.
+/// FNV-1a — small, deterministic across runs/platforms, no extra dep.
+fn fnv1a_64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
-    let text = std::fs::read_to_string(path)?;
-    Ok(Some(serde_json::from_str(&text)?))
+    h
+}
+
+/// `<app_local_data>/annotations/<hash>.notes.json` — keeps annotations inside
+/// the app instead of cluttering the user's PDF folder. The hash is derived
+/// from the absolute PDF path; moving/renaming the PDF orphans the sidecar
+/// (acceptable trade-off vs. content-hashing every file open).
+fn sidecar_path(app: &tauri::AppHandle, pdf_path: &str) -> Result<PathBuf, PdfError> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| PdfError::Io(std::io::Error::other(e.to_string())))?;
+    let hash = format!("{:016x}", fnv1a_64(pdf_path));
+    Ok(base.join("annotations").join(format!("{hash}.notes.json")))
 }
 
 #[tauri::command(rename_all = "camelCase")]
-async fn annotations_save(path: String, data: Value) -> Result<(), PdfError> {
-    let path = sidecar_path(&path);
+async fn annotations_load(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Option<Value>, PdfError> {
+    let target = sidecar_path(&app, &path)?;
+    if target.exists() {
+        let text = std::fs::read_to_string(target)?;
+        return Ok(Some(serde_json::from_str(&text)?));
+    }
+    let legacy = legacy_sidecar_path(&path);
+    if legacy.exists() {
+        let text = std::fs::read_to_string(legacy)?;
+        return Ok(Some(serde_json::from_str(&text)?));
+    }
+    Ok(None)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn annotations_save(
+    app: tauri::AppHandle,
+    path: String,
+    data: Value,
+) -> Result<(), PdfError> {
+    let target = sidecar_path(&app, &path)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let bytes = serde_json::to_vec_pretty(&data)?;
-    std::fs::write(path, bytes)?;
+    std::fs::write(&target, bytes)?;
+
+    // Once we've successfully written the new-location sidecar, clean up the
+    // legacy `<pdf>.notes.json` next to the PDF so it doesn't keep shadowing
+    // future loads (and so the user actually sees their PDF folder cleaned).
+    let legacy = legacy_sidecar_path(&path);
+    if legacy.exists() {
+        let _ = std::fs::remove_file(legacy);
+    }
     Ok(())
 }
 
