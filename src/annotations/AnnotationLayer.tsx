@@ -168,6 +168,15 @@ const styleForTool = (type: AnnotationKind) => {
       fill: "transparent",
     };
   }
+  if (type === "rect" || type === "ellipse") {
+    return {
+      ...common,
+      fill:
+        annotationStore.fill === "transparent"
+          ? undefined
+          : annotationStore.fill,
+    };
+  }
   return common;
 };
 
@@ -800,6 +809,8 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       props.zoom,
       props.rotation,
     );
+    const draftFill =
+      annotationStore.fill === "transparent" ? "none" : annotationStore.fill;
     if (currentDraft.type === "ellipse") {
       return (
         <ellipse
@@ -808,7 +819,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           cy={box.y + box.h / 2}
           rx={box.w / 2}
           ry={box.h / 2}
-          fill="none"
+          fill={draftFill}
           stroke={stroke}
           stroke-width={width}
         />
@@ -835,7 +846,13 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         y={box.y}
         width={box.w}
         height={box.h}
-        fill={currentDraft.type === "highlight" ? stroke : "none"}
+        fill={
+          currentDraft.type === "highlight"
+            ? stroke
+            : currentDraft.type === "rect"
+              ? draftFill
+              : "none"
+        }
         opacity={currentDraft.type === "highlight" ? 0.32 : 1}
         stroke={currentDraft.type === "highlight" ? "none" : stroke}
         stroke-width={width}

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { documentStore, fileNameFromPath } from "../state/document";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { flushAnnotationSaveForTab, savePdfToPath } from "./pdf";
+import { saveTabPdf } from "./pdf";
 
 const hasUnsavedTabs = () =>
   documentStore.tabs.some((t) => t.annotations.dirty || t.pageDirty);
@@ -51,12 +51,7 @@ export function installCloseGuard() {
             if (save) {
               for (const tab of documentStore.tabs) {
                 try {
-                  if (tab.annotations.dirty) {
-                    await flushAnnotationSaveForTab(tab.tabId);
-                  }
-                  if (tab.pageDirty) {
-                    await savePdfToPath(tab.docId, tab.path);
-                  }
+                  await saveTabPdf(tab.tabId);
                 } catch (error) {
                   console.error("close-guard save failed", tab.path, error);
                   const force = window.confirm(

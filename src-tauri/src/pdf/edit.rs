@@ -388,6 +388,15 @@ pub fn duplicate_pages(
 pub fn save_doc_as(registry: &DocRegistry, doc_id: &str, target_path: &str) -> Result<(), PdfError> {
     let handle = registry.get(doc_id)?;
     std::fs::write(target_path, handle.bytes.as_ref())?;
+    if handle.path != target_path {
+        let new_handle = DocHandle {
+            path: target_path.to_string(),
+            bytes: Arc::clone(&handle.bytes),
+            page_count: handle.page_count,
+            pages: handle.pages.clone(),
+        };
+        registry.replace(doc_id, new_handle)?;
+    }
     Ok(())
 }
 

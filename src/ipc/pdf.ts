@@ -24,12 +24,16 @@ import { produce } from "solid-js/store";
 const makeSidecar = (
   sourcePath: string,
   annotations: Annotation[],
-): AnnotationSidecar => ({
-  version: 1,
-  sourcePath,
-  updatedAt: new Date().toISOString(),
-  annotations,
-});
+): AnnotationSidecar => {
+  // Deep-copy/unwrap Solid.js Store proxies before crossing the Tauri bridge
+  const cleanAnnotations = JSON.parse(JSON.stringify(annotations));
+  return {
+    version: 1,
+    sourcePath,
+    updatedAt: new Date().toISOString(),
+    annotations: cleanAnnotations,
+  };
+};
 
 interface OpenedDocPayload {
   id: string;
@@ -91,7 +95,7 @@ export async function guardActiveTabUnsaved(): Promise<boolean> {
   if (choice === "cancel") return false;
   if (choice === "save") {
     try {
-      await flushActiveAnnotationSave();
+      await saveActivePdf();
     } catch (error) {
       console.error("save before action failed", error);
       return window.confirm("저장에 실패했습니다. 그래도 계속하시겠습니까?");
@@ -216,12 +220,7 @@ export async function closeTab(tabId: string): Promise<void> {
     }
     if (shouldSave) {
       try {
-        if (tab.annotations.dirty) {
-          await flushAnnotationSaveForTab(tab.tabId);
-        }
-        if (tab.pageDirty) {
-          await savePdfToPath(tab.docId, tab.path);
-        }
+        await saveTabPdf(tab.tabId);
       } catch (error) {
         console.error("close-tab save failed", error);
         const force = window.confirm("저장에 실패했습니다. 그래도 닫으시겠습니까?");
@@ -310,11 +309,12 @@ export async function exportAnnotatedPdfFile(): Promise<void> {
   });
   if (!target) return;
 
+  const cleanAnnotations = JSON.parse(JSON.stringify(tab.annotations.items));
   const data: AnnotationSidecar = {
     version: 1,
     sourcePath: tab.path,
     updatedAt: new Date().toISOString(),
-    annotations: tab.annotations.items,
+    annotations: cleanAnnotations,
   };
   try {
     await invoke("export_annotated_pdf", {
@@ -427,23 +427,25 @@ export async function ocrPdfStatus(docId: string): Promise<number[]> {
   return await invoke<number[]>("pdf_ocr_status", { docId });
 }
 
-/**
- * Save the active tab's modified PDF. If `asNew` is true, prompts for a target
- * path; otherwise overwrites the original file.
- */
-export async function saveActivePdf(asNew = false): Promise<boolean> {
-  const tab = activeTab();
-  if (!tab) return false;
-  let target = tab.path;
+async function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
+  const idx = findTabIndex(tabId);
+  if (idx < 0) return false;
+
+  const currentTab = documentStore.tabs[idx];
+  let target = currentTab.path;
   if (asNew) {
     const chosen = await save({
       filters: [{ name: "PDF", extensions: ["pdf"] }],
-      defaultPath: tab.path,
+      defaultPath: currentTab.path,
     });
     if (!chosen) return false;
     target = chosen;
   }
+
   try {
+    const tab = documentStore.tabs[idx];
+    if (!tab) return false;
+
     // 1. Save base PDF (with page-level edits)
     await savePdfToPath(tab.docId, target);
 
@@ -468,16 +470,29 @@ export async function saveActivePdf(asNew = false): Promise<boolean> {
     );
     return false;
   }
+
   // After save: clear pageDirty flag, update path if changed
   setDocumentStore(
     produce((state) => {
-      const idx = state.tabs.findIndex((t) => t.tabId === tab.tabId);
-      if (idx < 0) return;
-      state.tabs[idx].pageDirty = false;
-      if (state.tabs[idx].path !== target) {
-        state.tabs[idx].path = target;
+      const saveIdx = state.tabs.findIndex((t) => t.tabId === tabId);
+      if (saveIdx < 0) return;
+      state.tabs[saveIdx].pageDirty = false;
+      if (state.tabs[saveIdx].path !== target) {
+        state.tabs[saveIdx].path = target;
       }
     }),
   );
   return true;
 }
+
+/**
+ * Save the active tab's modified PDF. If `asNew` is true, prompts for a target
+ * path; otherwise overwrites the original file.
+ */
+export async function saveActivePdf(asNew = false): Promise<boolean> {
+  const tab = activeTab();
+  if (!tab) return false;
+  return await saveTabPdf(tab.tabId, asNew);
+}
+
+export { saveTabPdf };
