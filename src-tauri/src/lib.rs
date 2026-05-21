@@ -17,6 +17,7 @@ use pdf::PdfError;
 use serde_json::Value;
 use std::path::PathBuf;
 use tauri::ipc::Response;
+use tauri::Manager;
 use tauri::State;
 
 #[tauri::command(rename_all = "camelCase")]
@@ -819,15 +820,23 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::WindowEvent::Destroyed = event {
-                // macOS 26/WebKit can crash during the normal WebView teardown
-                // path after a window is destroyed (seen in
-                // WebPageProxy::dispatchSetObscuredContentInsets). Once the
-                // main window is destroyed, exit the process immediately
-                // to prevent the pending WebKit KVO/inset callbacks from crashing the app.
-                if window.label() == "main" {
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+                    // macOS 26/WebKit can crash while the native close button
+                    // tears down the WKWebView before the JS close guard has a
+                    // chance to respond. Always stop the native close first,
+                    // then ask the frontend to run its save/discard flow.
+                    api.prevent_close();
+                    use tauri::Emitter;
+                    let _ = window.emit("app-close-requested", ());
+                }
+                tauri::WindowEvent::Destroyed if window.label() == "main" => {
+                    // If the main window does get destroyed, exit immediately
+                    // before WebKit can deliver one more obscured-insets
+                    // callback to a dead page.
                     std::process::exit(0);
                 }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())
@@ -836,11 +845,18 @@ pub fn run() {
             // macOS 26/WebKit can crash during the normal WebView teardown
             // path after a window is destroyed (seen in
             // WebPageProxy::dispatchSetObscuredContentInsets). Once the
-            // frontend close guard has flushed pending saves, exit the
-            // process directly instead of letting WebKit process another
-            // run-loop tick during teardown.
+            // OS asks the app to quit, prevent the native exit first and let
+            // the frontend close guard finish its save/discard flow. The
+            // frontend then calls `request_app_exit`, which terminates the
+            // process directly before WebKit can process another teardown tick.
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::ExitRequested { code, .. } = &event {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                if let Some(window) = app.get_webview_window("main") {
+                    api.prevent_exit();
+                    use tauri::Emitter;
+                    let _ = window.emit("app-close-requested", ());
+                    return;
+                }
                 std::process::exit(code.unwrap_or(0));
             }
 
