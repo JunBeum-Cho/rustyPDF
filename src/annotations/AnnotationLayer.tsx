@@ -611,6 +611,36 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     return isDoubleClick;
   };
 
+  // When the user is editing a text annotation and clicks a *different*
+  // annotation, our own event.preventDefault() below blocks the browser's
+  // built-in focus-shift — so the contenteditable stays focused. That makes
+  // the global keyboard handler treat subsequent Del/Backspace as "typing in
+  // an editable target" and silently skip annotation deletion. Commit the
+  // editor explicitly here so focus moves to <body> before the new selection
+  // takes effect.
+  const flushEditingIfOther = (annotationId: string) => {
+    const editingId = annotationStore.editingId;
+    if (!editingId || editingId === annotationId) return;
+    const editor = activeTextEditor() ?? peekLastFocusedEditor();
+    if (editor) {
+      if (document.activeElement === editor) {
+        editor.blur();
+      } else {
+        const annotation = annotationStore.items.find((a) => a.id === editingId);
+        if (annotation) {
+          const html = editor.innerHTML;
+          const stylePatch = readEditorStylePatch(editor);
+          unregisterEditor(editor);
+          commitTextEdit(annotation, html, stylePatch);
+        } else {
+          stopEditingAnnotation();
+        }
+      }
+    } else {
+      stopEditingAnnotation();
+    }
+  };
+
   const startMove = (event: PointerEvent, annotation: Annotation) => {
     if (event.button !== 0) {
       return;
@@ -620,6 +650,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     // layer and starts a new draft on top of the annotation we just clicked.
     event.stopPropagation();
     event.preventDefault();
+    flushEditingIfOther(annotation.id);
     clearNativeTextSelection();
     if (shouldEditTextFromPointerDown(event, annotation)) {
       selectAnnotation(annotation.id);
@@ -655,6 +686,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     event.stopPropagation();
     event.preventDefault();
+    flushEditingIfOther(annotation.id);
     clearNativeTextSelection();
     selectAnnotation(annotation.id);
     setDragState({
@@ -678,6 +710,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     event.stopPropagation();
     event.preventDefault();
+    flushEditingIfOther(annotation.id);
     clearNativeTextSelection();
     selectAnnotation(annotation.id);
     setDragState({
