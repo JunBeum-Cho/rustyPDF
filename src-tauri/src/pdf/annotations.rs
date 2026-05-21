@@ -334,21 +334,11 @@ fn default_font_size() -> f32 {
     16.0
 }
 
-pub fn export_flattened_pdf(
-    source_path: &str,
-    target_path: &str,
-    data: Value,
-) -> Result<(), PdfError> {
+pub fn flatten_pdf_bytes(source_bytes: &[u8], data: Value) -> Result<Vec<u8>, PdfError> {
     let sidecar: AnnotationSidecar = serde_json::from_value(data)?;
     let pdfium = create_pdfium()?;
-    // Read source bytes upfront so we don't hold an OS file handle on the
-    // source. Required when source_path == target_path (the in-place save
-    // flow): `std::fs::write` below truncates the file, and a still-open
-    // pdfium file handle would race with that — `load_pdf_from_byte_slice`
-    // detaches us from the inode entirely.
-    let source_bytes = std::fs::read(source_path)?;
     let mut document = pdfium
-        .load_pdf_from_byte_slice(&source_bytes, None)
+        .load_pdf_from_byte_slice(source_bytes, None)
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
     let mut fonts = ExportFonts::load_builtin(&mut document);
     let page_count = document.pages().len() as usize;
@@ -400,12 +390,21 @@ pub fn export_flattened_pdf(
     let bytes = document
         .save_to_bytes()
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
-    // Drop the document (and its borrow of source_bytes) before writing.
-    // Otherwise on Windows the file lock from the load above can still be
-    // held by pdfium when we attempt the overwrite below.
-    drop(document);
-    drop(source_bytes);
-    drop(pdfium);
+    Ok(bytes)
+}
+
+pub fn export_flattened_pdf(
+    source_path: &str,
+    target_path: &str,
+    data: Value,
+) -> Result<(), PdfError> {
+    // Read source bytes upfront so we don't hold an OS file handle on the
+    // source. Required when source_path == target_path (the in-place save
+    // flow): `std::fs::write` below truncates the file, and a still-open
+    // pdfium file handle would race with that — `load_pdf_from_byte_slice`
+    // detaches us from the inode entirely.
+    let source_bytes = std::fs::read(source_path)?;
+    let bytes = flatten_pdf_bytes(&source_bytes, data)?;
     std::fs::write(target_path, bytes)?;
     Ok(())
 }
@@ -1018,6 +1017,7 @@ mod tests {
     use super::*;
     use image::Rgba;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn deserializes_image_annotation_sidecar() {
@@ -1083,5 +1083,79 @@ mod tests {
         let output = apply_image_opacity(source, 0.5).to_rgba8();
 
         assert_eq!(output.get_pixel(0, 0).0, [1, 2, 3, 100]);
+    }
+
+    #[test]
+    fn exports_image_annotation_when_overwriting_same_pdf() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("rustpdf-image-save-{stamp}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("image-overwrite.pdf");
+        {
+            let pdfium = create_pdfium().unwrap();
+            let mut document = pdfium.create_new_pdf().unwrap();
+            document
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .unwrap();
+            let source_bytes = document.save_to_bytes().unwrap();
+            std::fs::write(&path, source_bytes).unwrap();
+        }
+
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            4,
+            4,
+            Rgba([255, 0, 0, 255]),
+        ));
+        let mut bytes = Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let src = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(bytes.into_inner())
+        );
+        let data = json!({
+            "annotations": [{
+                "page": 0,
+                "type": "image",
+                "rect": { "x": 72.0, "y": 72.0, "w": 72.0, "h": 72.0 },
+                "style": { "opacity": 1.0 },
+                "payload": { "imageSrc": src }
+            }]
+        });
+
+        export_flattened_pdf(path.to_str().unwrap(), path.to_str().unwrap(), data).unwrap();
+
+        let saved_bytes = std::fs::read(&path).unwrap();
+        let pdfium = create_pdfium().unwrap();
+        let rendered = pdfium
+            .load_pdf_from_byte_slice(&saved_bytes, None)
+            .unwrap()
+            .pages()
+            .get(0)
+            .unwrap()
+            .render_with_config(&PdfRenderConfig::new().set_target_width(595))
+            .unwrap()
+            .as_image()
+            .into_rgba8();
+
+        let stamped = rendered.get_pixel(100, 100).0;
+        let background = rendered.get_pixel(220, 220).0;
+
+        assert!(
+            stamped[0] > 200 && stamped[1] < 40 && stamped[2] < 40,
+            "expected saved image pixel to be red, got {stamped:?}"
+        );
+        assert!(
+            background[0] > 200 && background[1] > 200 && background[2] > 200,
+            "expected untouched background to stay light, got {background:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }

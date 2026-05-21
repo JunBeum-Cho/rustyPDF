@@ -10,6 +10,7 @@ interface Props {
   width: number; // rendered px
   height: number;
   docId: string;
+  contentVersion: number;
   zoom: number;
   rotation: 0 | 90 | 180 | 270;
 }
@@ -73,6 +74,8 @@ export function PageCanvas(props: Props) {
   // sharper than a half-resolution placeholder.
   createEffect(() => {
     if (!visible()) return;
+    // Same docId can point at new bytes after overwrite-save.
+    props.contentVersion;
     const bucket = zoomBucket(props.zoom);
     const rot = props.rotation;
     const idx = props.index;
@@ -107,6 +110,7 @@ export function PageCanvas(props: Props) {
       <TextLayer
         pageIndex={props.index}
         page={props.page}
+        contentVersion={props.contentVersion}
         zoom={props.zoom}
         rotation={props.rotation}
       />

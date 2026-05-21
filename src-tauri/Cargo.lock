@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "rustpdf"
-version = "1.0.0"
+version = "1.0.4"
 dependencies = [
  "base64 0.22.1",
  "image",

@@ -41,6 +41,7 @@ export interface Tab {
   pageCount: number;
   pages: PageMeta[];
   fileSize: number;
+  contentVersion: number;   // bumps when saved bytes change without a new docId
   prefetchPolicy: PrefetchPolicy;
   zoom: number;
   rotation: 0 | 90 | 180 | 270;

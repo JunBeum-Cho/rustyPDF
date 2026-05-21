@@ -18,6 +18,7 @@ interface ThumbnailCanvasProps {
   page: PageMeta;
   index: number;
   docId: string;
+  contentVersion: number;
   rotation: 0 | 90 | 180 | 270;
   thumbWidth: number;
 }
@@ -76,6 +77,8 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
 
   createEffect(() => {
     if (!visible()) return;
+    // Same docId can point at new bytes after overwrite-save.
+    props.contentVersion;
     const currentScale = scale();
     const docId = props.docId;
     const idx = props.index;
@@ -214,6 +217,7 @@ export function Thumbnails() {
                 page={page}
                 index={index()}
                 docId={tab().docId}
+                contentVersion={tab().contentVersion}
                 rotation={tab().rotation}
                 thumbWidth={thumbWidth()}
               />

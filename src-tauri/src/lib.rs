@@ -6,7 +6,7 @@ use pdf::annotations::export_flattened_pdf;
 use pdf::document::{close_document, open_document, OpenedDocument};
 use pdf::edit::{
     capture_region, copy_pages_to_clipboard, delete_pages, duplicate_pages, paste_pages,
-    save_doc_as, PdfPageEditResult,
+    save_doc_as, save_doc_with_annotations, PdfPageEditResult,
 };
 use pdf::ocr::{
     load_sidecar_into_cache, ocr_page as ocr_page_impl, persist_sidecar, OcrLine, OcrPage,
@@ -183,6 +183,23 @@ async fn pdf_save_as(
     target_path: String,
 ) -> Result<(), PdfError> {
     save_doc_as(&state.registry, &doc_id, &target_path)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pdf_save_document(
+    state: State<'_, AppState>,
+    doc_id: String,
+    target_path: String,
+    data: Option<Value>,
+) -> Result<OpenedDocument, PdfError> {
+    let saved = save_doc_with_annotations(&state.registry, &doc_id, &target_path, data)?;
+    let reopened = open_document(&state.registry, saved.path.clone())?;
+    let _ = load_sidecar_into_cache(&state.ocr, &reopened.id, &saved.path);
+    state.cache.purge_doc(&doc_id);
+    state.text.invalidate(&doc_id);
+    state.ocr.invalidate(&doc_id);
+    let _ = close_document(&state.registry, &doc_id);
+    Ok(reopened)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -805,6 +822,7 @@ pub fn run() {
             pdf_paste_pages,
             pdf_duplicate_pages,
             pdf_save_as,
+            pdf_save_document,
             pdf_capture_region,
             pdf_ocr_page,
             pdf_ocr_lines,

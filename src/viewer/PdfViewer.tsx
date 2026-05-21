@@ -117,7 +117,7 @@ export function PdfViewer() {
 
   createEffect(
     on(
-      () => [tab().docId, tab().zoom, tab().rotation] as const,
+      () => [tab().docId, tab().zoom, tab().rotation, tab().contentVersion] as const,
       ([docId, zoom, rotation]) => {
         if (tab().prefetchPolicy !== "all") return;
 
@@ -195,6 +195,7 @@ export function PdfViewer() {
                 width={renderedDims()[i()].width}
                 height={renderedDims()[i()].height}
                 docId={tab().docId}
+                contentVersion={tab().contentVersion}
                 zoom={tab().zoom}
                 rotation={tab().rotation}
               />

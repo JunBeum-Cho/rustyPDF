@@ -1,8 +1,10 @@
 use super::cache::PageCache;
 use super::document::{DocHandle, DocRegistry, OpenedDocument, PageMeta};
+use super::annotations::flatten_pdf_bytes;
 use super::text::TextCache;
 use super::{create_pdfium, PdfError};
 use parking_lot::RwLock;
+use serde_json::Value;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -138,7 +140,7 @@ pub fn delete_pages(
     }
 
     let pdfium = create_pdfium()?;
-    let mut doc = pdfium
+    let doc = pdfium
         .load_pdf_from_byte_slice(&handle.bytes, None)
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
 
@@ -400,6 +402,43 @@ pub fn save_doc_as(registry: &DocRegistry, doc_id: &str, target_path: &str) -> R
     Ok(())
 }
 
+/// Save the current in-memory document to disk, optionally flattening
+/// annotations/images directly into the PDF bytes before writing. The
+/// registry handle is replaced either way so subsequent renders use the exact
+/// bytes that were just saved.
+pub fn save_doc_with_annotations(
+    registry: &DocRegistry,
+    doc_id: &str,
+    target_path: &str,
+    data: Option<Value>,
+) -> Result<OpenedDocument, PdfError> {
+    let handle = registry.get(doc_id)?;
+    let bytes = match data {
+        Some(data) => flatten_pdf_bytes(handle.bytes.as_ref(), data)?,
+        None => handle.bytes.as_ref().clone(),
+    };
+    std::fs::write(target_path, &bytes)?;
+
+    let pages = handle.pages.clone();
+    let page_count = handle.page_count;
+    let file_size = bytes.len() as u64;
+    let new_handle = DocHandle {
+        path: target_path.to_string(),
+        bytes: Arc::new(bytes),
+        page_count,
+        pages: pages.clone(),
+    };
+    registry.replace(doc_id, new_handle)?;
+
+    Ok(OpenedDocument {
+        id: doc_id.to_string(),
+        path: target_path.to_string(),
+        page_count,
+        pages,
+        file_size,
+    })
+}
+
 /// Render a rectangular region of the given page to PNG bytes. Coordinates
 /// are in PDF points (origin = top-left of the page). The caller usually
 /// derives them from the on-screen drag rectangle by inverting the current
@@ -484,4 +523,102 @@ pub fn capture_region(
         )
         .map_err(|e| PdfError::Image(e.to_string()))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdf::document::open_document;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
+    use image::{DynamicImage, Rgba, RgbaImage};
+    use pdfium_render::prelude::{PdfPagePaperSize, PdfRenderConfig};
+    use serde_json::json;
+    use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn save_doc_with_annotations_updates_registry_bytes() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("rustpdf-save-doc-{stamp}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let source_path = temp_dir.join("source.pdf");
+        let target_path = temp_dir.join("saved.pdf");
+
+        {
+            let pdfium = create_pdfium().unwrap();
+            let mut document = pdfium.create_new_pdf().unwrap();
+            document
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .unwrap();
+            let source_bytes = document.save_to_bytes().unwrap();
+            std::fs::write(&source_path, source_bytes).unwrap();
+        }
+
+        let registry = DocRegistry::new();
+        let opened = open_document(&registry, source_path.to_string_lossy().to_string()).unwrap();
+
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            4,
+            4,
+            Rgba([255, 0, 0, 255]),
+        ));
+        let mut bytes = Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let src = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(bytes.into_inner())
+        );
+        let data = json!({
+            "annotations": [{
+                "page": 0,
+                "type": "image",
+                "rect": { "x": 72.0, "y": 72.0, "w": 72.0, "h": 72.0 },
+                "style": { "opacity": 1.0 },
+                "payload": { "imageSrc": src }
+            }]
+        });
+
+        let saved = save_doc_with_annotations(
+            &registry,
+            &opened.id,
+            target_path.to_str().unwrap(),
+            Some(data),
+        )
+        .unwrap();
+
+        assert_eq!(saved.id, opened.id);
+        assert_eq!(saved.path, target_path.to_string_lossy());
+
+        let handle = registry.get(&opened.id).unwrap();
+        assert_eq!(handle.path, target_path.to_string_lossy());
+
+        let pdfium = create_pdfium().unwrap();
+        let rendered = pdfium
+            .load_pdf_from_byte_slice(handle.bytes.as_ref(), None)
+            .unwrap()
+            .pages()
+            .get(0)
+            .unwrap()
+            .render_with_config(&PdfRenderConfig::new().set_target_width(595))
+            .unwrap()
+            .as_image()
+            .into_rgba8();
+        let stamped = rendered.get_pixel(100, 100).0;
+
+        assert!(
+            stamped[0] > 200 && stamped[1] < 40 && stamped[2] < 40,
+            "expected saved image pixel to be red, got {stamped:?}"
+        );
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
 }

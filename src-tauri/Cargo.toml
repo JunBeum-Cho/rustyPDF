@@ -1,6 +1,6 @@
 [package]
 name = "rustpdf"
-version = "1.0.3"
+version = "1.0.4"
 description = "RustyPDF — lightweight cross-platform PDF viewer with annotations"
 edition = "2021"
 rust-version = "1.77"

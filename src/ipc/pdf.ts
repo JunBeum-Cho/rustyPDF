@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { emitToast } from "../capture/capture";
 import {
+  markAnnotationSaveErrorForTab,
   annotationStore,
   markAnnotationsSavedForTab,
   replaceAnnotationsForTab,
@@ -111,6 +112,7 @@ const buildTabFromPayload = (payload: OpenedDocPayload): Tab => ({
   pageCount: payload.pageCount,
   pages: payload.pages,
   fileSize: payload.fileSize,
+  contentVersion: 0,
   prefetchPolicy:
     payload.fileSize <= EAGER_PREFETCH_LIMIT_BYTES ? "all" : "lazy",
   zoom: 1,
@@ -386,6 +388,18 @@ export async function savePdfToPath(
   await invoke("pdf_save_as", { docId, targetPath });
 }
 
+export async function savePdfDocument(
+  docId: string,
+  targetPath: string,
+  data?: AnnotationSidecar | null,
+): Promise<OpenedDocPayload> {
+  return await invoke<OpenedDocPayload>("pdf_save_document", {
+    docId,
+    targetPath,
+    data: data ?? null,
+  });
+}
+
 export interface OcrLine {
   text: string;
   x: number;
@@ -445,43 +459,56 @@ async function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
   try {
     const tab = documentStore.tabs[idx];
     if (!tab) return false;
+    const hadAnnotations = tab.annotations.items.length > 0;
+    const savedAt = new Date().toISOString();
+    const flattenedData =
+      hadAnnotations
+        ? makeSidecar(target, tab.annotations.items)
+        : null;
 
-    // 1. Save base PDF (with page-level edits)
-    await savePdfToPath(tab.docId, target);
-
-    // 2. Flatten/Merge annotations/images into the PDF if any exist
-    if (tab.annotations.items.length > 0) {
-      const data = makeSidecar(target, tab.annotations.items);
-      await invoke("export_annotated_pdf", {
-        sourcePath: target,
-        targetPath: target,
-        data,
-      });
+    if (hadAnnotations) {
+      setAnnotationSaveStatusForTab(tab.tabId, "saving");
     }
 
-    // 3. Save sidecar JSON for backward compatibility and reset dirty status
-    const sidecar = makeSidecar(target, tab.annotations.items);
-    await saveAnnotationSidecar(target, sidecar);
-    markAnnotationsSavedForTab(tab.tabId);
+    const saved = await savePdfDocument(tab.docId, target, flattenedData);
+
+    // Once annotations are flattened into the PDF, keep the sidecar empty so
+    // re-opening the file doesn't paint the same objects a second time.
+    const emptyTargetSidecar = makeSidecar(target, []);
+    await saveAnnotationSidecar(target, emptyTargetSidecar);
+    if (currentTab.path !== target) {
+      await saveAnnotationSidecar(currentTab.path, makeSidecar(currentTab.path, []));
+    }
+
+    setDocumentStore(
+      produce((state) => {
+        const saveIdx = state.tabs.findIndex((t) => t.tabId === tabId);
+        if (saveIdx < 0) return;
+        state.tabs[saveIdx].docId = saved.id;
+        state.tabs[saveIdx].path = saved.path;
+        state.tabs[saveIdx].pageCount = saved.pageCount;
+        state.tabs[saveIdx].pages = saved.pages;
+        state.tabs[saveIdx].fileSize = saved.fileSize;
+        state.tabs[saveIdx].contentVersion += 1;
+        state.tabs[saveIdx].prefetchPolicy =
+          saved.fileSize <= EAGER_PREFETCH_LIMIT_BYTES ? "all" : "lazy";
+        state.tabs[saveIdx].pageDirty = false;
+        state.tabs[saveIdx].annotations = emptyAnnotationTabState();
+        state.tabs[saveIdx].annotations.saveStatus = "saved";
+        state.tabs[saveIdx].annotations.lastSavedAt = savedAt;
+      }),
+    );
   } catch (error) {
     console.error("save pdf failed", error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (documentStore.tabs[idx]?.annotations.items.length > 0) {
+      markAnnotationSaveErrorForTab(tabId, message);
+    }
     window.alert(
-      `저장 실패: ${error instanceof Error ? error.message : String(error)}`,
+      `저장 실패: ${message}`,
     );
     return false;
   }
-
-  // After save: clear pageDirty flag, update path if changed
-  setDocumentStore(
-    produce((state) => {
-      const saveIdx = state.tabs.findIndex((t) => t.tabId === tabId);
-      if (saveIdx < 0) return;
-      state.tabs[saveIdx].pageDirty = false;
-      if (state.tabs[saveIdx].path !== target) {
-        state.tabs[saveIdx].path = target;
-      }
-    }),
-  );
   return true;
 }
 

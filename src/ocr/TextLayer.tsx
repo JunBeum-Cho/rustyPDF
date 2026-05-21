@@ -9,6 +9,7 @@ import "./textLayer.css";
 interface Props {
   pageIndex: number;
   page: PageMeta;
+  contentVersion: number;
   zoom: number;
   rotation: Rotation;
 }
@@ -46,7 +47,12 @@ export function TextLayer(props: Props) {
         const tab = activeTab();
         if (!tab) return null;
         const doc = ocrState.byDoc[tab.docId];
-        return [tab.docId, props.pageIndex, doc?.done.size ?? 0] as const;
+        return [
+          tab.docId,
+          props.pageIndex,
+          doc?.done.size ?? 0,
+          props.contentVersion,
+        ] as const;
       },
       async (deps) => {
         if (!deps) return;
