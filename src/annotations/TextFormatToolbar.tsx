@@ -1,4 +1,11 @@
-import { Show, createMemo } from "solid-js";
+import {
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import {
   AlignCenter,
   AlignLeft,
@@ -26,8 +33,10 @@ import {
   alignLeft,
   alignRight,
   getActiveEditor,
+  queryTextFormatState,
   setFontFamily,
   setFontSizePx,
+  type TextFormatState,
   toggleBold,
   toggleItalic,
   toggleUnderline,
@@ -35,11 +44,31 @@ import {
 
 const ICON = 14;
 
+const sameValueOrNull = <T,>(values: T[]): T | null => {
+  if (values.length === 0) return null;
+  const first = values[0];
+  return values.every((value) => value === first) ? first : null;
+};
+
 /**
  * Visible only when a text annotation has the user's attention — either
  * selected or actively being edited.
  */
 export function TextFormatToolbar() {
+  const [editorFormatState, setEditorFormatState] =
+    createSignal<TextFormatState | null>(null);
+  let pendingFormatSync = 0;
+
+  const syncFormatState = () => {
+    pendingFormatSync = 0;
+    setEditorFormatState(queryTextFormatState());
+  };
+
+  const scheduleFormatSync = () => {
+    if (pendingFormatSync) cancelAnimationFrame(pendingFormatSync);
+    pendingFormatSync = requestAnimationFrame(syncFormatState);
+  };
+
   const isTextContext = createMemo(() => {
     const tab = activeTab();
     if (!tab) return false;
@@ -58,6 +87,68 @@ export function TextFormatToolbar() {
     return false;
   });
 
+  const selectedAnnotationFormatState = createMemo<TextFormatState | null>(() => {
+    const tab = activeTab();
+    if (!tab) return null;
+    const selected = new Set(tab.annotations.selectedIds);
+    const annotations = tab.annotations.items.filter(
+      (a) => a.type === "text" && selected.has(a.id),
+    );
+    if (annotations.length === 0) return null;
+    const aligns = annotations.map((a) => a.style.textAlign ?? "left");
+    const families = annotations.map((a) => a.style.fontFamily ?? null);
+    const sizes = annotations.map((a) => a.style.fontSize ?? null);
+    return {
+      bold: annotations.every(
+        (a) => a.style.fontWeight === "700" || a.style.fontWeight === "bold",
+      ),
+      italic: annotations.every((a) => a.style.fontStyle === "italic"),
+      underline: annotations.every(
+        (a) => a.style.textDecoration === "underline",
+      ),
+      align: sameValueOrNull(aligns),
+      fontFamily: sameValueOrNull(families),
+      fontSizePx: sameValueOrNull(sizes),
+    };
+  });
+
+  const formatState = createMemo(() => {
+    const tab = activeTab();
+    if (tab?.annotations.editingId) {
+      return editorFormatState() ?? selectedAnnotationFormatState();
+    }
+    return selectedAnnotationFormatState();
+  });
+
+  createEffect(() => {
+    const tab = activeTab();
+    const editingId = tab?.annotations.editingId;
+    const selectedIds = tab?.annotations.selectedIds.join(",");
+    if (editingId || selectedIds) {
+      scheduleFormatSync();
+      return;
+    }
+    setEditorFormatState(null);
+  });
+
+  onMount(() => {
+    scheduleFormatSync();
+    document.addEventListener("selectionchange", scheduleFormatSync);
+    document.addEventListener("focusin", scheduleFormatSync);
+    document.addEventListener("focusout", scheduleFormatSync);
+    document.addEventListener("keyup", scheduleFormatSync);
+    document.addEventListener("mouseup", scheduleFormatSync);
+  });
+
+  onCleanup(() => {
+    if (pendingFormatSync) cancelAnimationFrame(pendingFormatSync);
+    document.removeEventListener("selectionchange", scheduleFormatSync);
+    document.removeEventListener("focusin", scheduleFormatSync);
+    document.removeEventListener("focusout", scheduleFormatSync);
+    document.removeEventListener("keyup", scheduleFormatSync);
+    document.removeEventListener("mouseup", scheduleFormatSync);
+  });
+
   // Formatting buttons must NOT steal focus from the contenteditable.
   // Native controls such as <select> and <input> must keep their default
   // mousedown behavior, otherwise the dropdown/spinner never opens.
@@ -66,6 +157,7 @@ export function TextFormatToolbar() {
   const action = (fn: () => void) => (event: MouseEvent) => {
     event.preventDefault();
     fn();
+    scheduleFormatSync();
   };
 
   const applyFontFamily = (fontFamily: string) => {
@@ -130,6 +222,7 @@ export function TextFormatToolbar() {
           onChange={(event) => {
             const value = event.currentTarget.value;
             if (value) applyFontFamily(value);
+            scheduleFormatSync();
           }}
         >
           <option value="">폰트</option>
@@ -150,6 +243,7 @@ export function TextFormatToolbar() {
             onInput={(event) => {
               const px = Number(event.currentTarget.value);
               if (Number.isFinite(px) && px >= 6) applyFontSize(px);
+              scheduleFormatSync();
             }}
           />
         </label>
@@ -158,6 +252,8 @@ export function TextFormatToolbar() {
           <button
             type="button"
             title="굵게 (Cmd+B)"
+            aria-pressed={formatState()?.bold ? "true" : "false"}
+            classList={{ active: formatState()?.bold ?? false }}
             onMouseDown={guardFocus}
             onClick={action(applyBold)}
           >
@@ -166,6 +262,8 @@ export function TextFormatToolbar() {
           <button
             type="button"
             title="기울임 (Cmd+I)"
+            aria-pressed={formatState()?.italic ? "true" : "false"}
+            classList={{ active: formatState()?.italic ?? false }}
             onMouseDown={guardFocus}
             onClick={action(applyItalic)}
           >
@@ -174,6 +272,8 @@ export function TextFormatToolbar() {
           <button
             type="button"
             title="밑줄 (Cmd+U)"
+            aria-pressed={formatState()?.underline ? "true" : "false"}
+            classList={{ active: formatState()?.underline ?? false }}
             onMouseDown={guardFocus}
             onClick={action(applyUnderline)}
           >
@@ -185,6 +285,8 @@ export function TextFormatToolbar() {
           <button
             type="button"
             title="왼쪽 정렬"
+            aria-pressed={formatState()?.align === "left" ? "true" : "false"}
+            classList={{ active: formatState()?.align === "left" }}
             onMouseDown={guardFocus}
             onClick={action(() => applyAlign("left"))}
           >
@@ -193,6 +295,8 @@ export function TextFormatToolbar() {
           <button
             type="button"
             title="가운데 정렬"
+            aria-pressed={formatState()?.align === "center" ? "true" : "false"}
+            classList={{ active: formatState()?.align === "center" }}
             onMouseDown={guardFocus}
             onClick={action(() => applyAlign("center"))}
           >
@@ -201,6 +305,8 @@ export function TextFormatToolbar() {
           <button
             type="button"
             title="오른쪽 정렬"
+            aria-pressed={formatState()?.align === "right" ? "true" : "false"}
+            classList={{ active: formatState()?.align === "right" }}
             onMouseDown={guardFocus}
             onClick={action(() => applyAlign("right"))}
           >

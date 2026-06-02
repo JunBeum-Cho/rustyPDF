@@ -295,6 +295,18 @@
   border-color: transparent;
 }
 
+.text-format-group button.active {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  background: var(--accent);
+}
+
+.text-format-group button.active:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  background: var(--accent);
+}
+
 .text-format-group button:disabled {
   opacity: 0.45;
   cursor: default;

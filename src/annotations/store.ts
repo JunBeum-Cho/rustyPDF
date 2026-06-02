@@ -566,6 +566,7 @@ export const undoAnnotations = () => {
     state.future.push(cloneAnnotations(state.items));
     state.items = previous;
     state.selectedIds = [];
+    state.editingId = null;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;
@@ -581,6 +582,7 @@ export const redoAnnotations = () => {
     state.history.push(cloneAnnotations(state.items));
     state.items = next;
     state.selectedIds = [];
+    state.editingId = null;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;

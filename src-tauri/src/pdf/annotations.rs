@@ -150,15 +150,29 @@ impl ExportFonts {
 }
 
 /// Subset `font_bytes` to cover only `used_chars`, then embed the trimmed
-/// TrueType into `document`. Returns `None` if the font fails to parse,
-/// none of the requested chars resolve to glyphs, or pdfium rejects the
-/// resulting bytes — callers fall through to the next candidate font.
+/// font into `document`. Returns `None` if the font fails to parse, none of
+/// the requested chars resolve to glyphs, or pdfium rejects the resulting
+/// bytes — callers fall through to the next candidate font.
 ///
 /// Face index is hard-coded to 0; for `.ttc` collections this picks the
 /// first face, which matches what pdfium's previous direct-load path did
-/// anyway. `GlyphRemapper` rewrites glyph IDs into a contiguous range and
-/// rebuilds the cmap accordingly, so pdfium's Unicode → glyph lookup
-/// resolves to the new IDs.
+/// anyway. `GlyphRemapper` rewrites glyph IDs into a contiguous range.
+///
+/// CRITICAL: `subsetter` 0.2 *deletes* the `cmap` table on purpose (its
+/// docs: "we remove the cmap table from the font, so you must provide your
+/// own cmap table in the PDF"). It assumes the caller writes a CID font and
+/// supplies its own Unicode→CID map in the PDF dictionary. But pdfium's
+/// `FPDFText_LoadFont` path used here takes a raw `&str` and resolves each
+/// Unicode codepoint to a glyph through the *embedded font's* cmap. With no
+/// cmap, every Korean codepoint mapped to `.notdef`, rendering blank/tofu.
+///
+/// The subsetter assigns each glyph's *new* (remapped) GID as its CID with
+/// an identity CIDToGIDMap (see `cff/charset.rs::rewrite_charset`), so a
+/// `cmap` that maps codepoint → remapped GID is exactly what pdfium needs.
+/// We synthesize a format-4 (platform 3 / encoding 1, Windows BMP Unicode)
+/// subtable — Hangul syllables (U+AC00..U+D7A3) plus Latin all live in the
+/// BMP — and splice it back into the subset sfnt, rebuilding the table
+/// directory, offsets, and checksums the same way the subsetter does.
 fn subset_and_load(
     document: &mut PdfDocument,
     font_bytes: &[u8],
@@ -167,21 +181,196 @@ fn subset_and_load(
     const FACE_INDEX: u32 = 0;
     let face = ttf_parser::Face::parse(font_bytes, FACE_INDEX).ok()?;
     let mut remapper = subsetter::GlyphRemapper::new();
-    let mut found = false;
+    // codepoint → original glyph id, for codepoints that resolve in this face.
+    let mut char_to_old_gid: Vec<(u32, u16)> = Vec::new();
     for &c in used_chars {
         if let Some(gid) = face.glyph_index(c) {
             remapper.remap(gid.0);
-            found = true;
+            char_to_old_gid.push((c as u32, gid.0));
         }
     }
-    if !found {
+    if char_to_old_gid.is_empty() {
         return None;
     }
     let subset = subsetter::subset(font_bytes, FACE_INDEX, &remapper).ok()?;
+
+    // Map each codepoint to its remapped glyph id (== CID in the subset).
+    // BMP-only: codepoints above U+FFFF can't be encoded in a format-4
+    // subtable and are dropped (none of Hangul/Latin is affected).
+    let mut cmap_entries: Vec<(u16, u16)> = char_to_old_gid
+        .iter()
+        .filter(|(cp, _)| *cp <= 0xFFFF)
+        .filter_map(|(cp, old_gid)| remapper.get(*old_gid).map(|new_gid| (*cp as u16, new_gid)))
+        .collect();
+    cmap_entries.sort_unstable();
+    cmap_entries.dedup_by_key(|(cp, _)| *cp);
+
+    let with_cmap = inject_cmap(&subset, &cmap_entries)?;
     document
         .fonts_mut()
-        .load_true_type_from_bytes(&subset, true)
+        .load_true_type_from_bytes(&with_cmap, true)
         .ok()
+}
+
+/// Build a `cmap` table containing a single format-4 (platform 3 /
+/// encoding 1) subtable mapping each `(codepoint, glyph_id)` pair. Entries
+/// must be sorted ascending by codepoint and contain no duplicates. Each
+/// codepoint becomes its own one-character segment (idDelta encodes the
+/// glyph), which keeps the builder simple and is well within size limits
+/// for the handful of chars an annotation uses. Always appends the
+/// mandatory terminating segment (0xFFFF → 0xFFFF).
+fn build_cmap_format4(entries: &[(u16, u16)]) -> Vec<u8> {
+    // One trailing 0xFFFF segment is always required.
+    let seg_count = entries.len() as u16 + 1;
+    let seg_count_x2 = seg_count * 2;
+    // searchRange = 2 * 2^floor(log2(segCount)); entrySelector = log2 of that.
+    let entry_selector = (seg_count as f32).log2().floor() as u16;
+    let search_range = 2u16 * 2u16.pow(u32::from(entry_selector));
+    let range_shift = seg_count_x2 - search_range;
+
+    let mut sub = Vec::new();
+    sub.extend_from_slice(&4u16.to_be_bytes()); // format
+    // length = 14-byte fixed header + reservedPad (2) + 4 u16 arrays of
+    // seg_count entries each (endCode, startCode, idDelta, idRangeOffset).
+    let length = 16 + (seg_count as usize) * 8;
+    sub.extend_from_slice(&(length as u16).to_be_bytes());
+    sub.extend_from_slice(&0u16.to_be_bytes()); // language
+    sub.extend_from_slice(&seg_count_x2.to_be_bytes());
+    sub.extend_from_slice(&search_range.to_be_bytes());
+    sub.extend_from_slice(&entry_selector.to_be_bytes());
+    sub.extend_from_slice(&range_shift.to_be_bytes());
+
+    // endCode[]
+    for (cp, _) in entries {
+        sub.extend_from_slice(&cp.to_be_bytes());
+    }
+    sub.extend_from_slice(&0xFFFFu16.to_be_bytes());
+    // reservedPad
+    sub.extend_from_slice(&0u16.to_be_bytes());
+    // startCode[]
+    for (cp, _) in entries {
+        sub.extend_from_slice(&cp.to_be_bytes());
+    }
+    sub.extend_from_slice(&0xFFFFu16.to_be_bytes());
+    // idDelta[]: delta so that (cp + delta) mod 65536 == gid.
+    for (cp, gid) in entries {
+        let delta = gid.wrapping_sub(*cp);
+        sub.extend_from_slice(&delta.to_be_bytes());
+    }
+    sub.extend_from_slice(&1u16.to_be_bytes()); // terminating segment delta
+    // idRangeOffset[]: 0 everywhere (we use idDelta directly).
+    for _ in entries {
+        sub.extend_from_slice(&0u16.to_be_bytes());
+    }
+    sub.extend_from_slice(&0u16.to_be_bytes());
+
+    // cmap table header: version 0, one encoding record (platform 3,
+    // encoding 1) pointing at the subtable at offset 12.
+    let mut table = Vec::new();
+    table.extend_from_slice(&0u16.to_be_bytes()); // version
+    table.extend_from_slice(&1u16.to_be_bytes()); // numTables
+    table.extend_from_slice(&3u16.to_be_bytes()); // platformID = Windows
+    table.extend_from_slice(&1u16.to_be_bytes()); // encodingID = Unicode BMP
+    table.extend_from_slice(&12u32.to_be_bytes()); // offset to subtable
+    table.extend_from_slice(&sub);
+    table
+}
+
+/// Splice a synthesized `cmap` table into an existing sfnt `font` (the
+/// subsetter output), rebuilding the table directory, table offsets, and
+/// checksums. Mirrors `subsetter::construct` so the byte layout stays
+/// spec-conformant: header (12 bytes) + N×16-byte records sorted by tag +
+/// 4-byte-aligned table bodies, with the `head` checksumAdjustment patched
+/// last. Returns `None` if the input sfnt is malformed.
+fn inject_cmap(font: &[u8], cmap_entries: &[(u16, u16)]) -> Option<Vec<u8>> {
+    if cmap_entries.is_empty() {
+        return None;
+    }
+    // Parse the existing sfnt header + table directory.
+    let flavor = u32::from_be_bytes(font.get(0..4)?.try_into().ok()?);
+    let num_tables = u16::from_be_bytes(font.get(4..6)?.try_into().ok()?) as usize;
+
+    // Collect (tag, body bytes) for every existing table, skipping any
+    // pre-existing cmap (defensive — the subsetter never emits one).
+    let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(num_tables + 1);
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        let tag: [u8; 4] = font.get(rec..rec + 4)?.try_into().ok()?;
+        let offset = u32::from_be_bytes(font.get(rec + 8..rec + 12)?.try_into().ok()?) as usize;
+        let length = u32::from_be_bytes(font.get(rec + 12..rec + 16)?.try_into().ok()?) as usize;
+        let body = font.get(offset..offset + length)?.to_vec();
+        if &tag == b"cmap" {
+            continue;
+        }
+        tables.push((tag, body));
+    }
+
+    tables.push((*b"cmap", build_cmap_format4(cmap_entries)));
+    // Table directory must be sorted by tag.
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let count = tables.len() as u16;
+    let entry_selector = (count as f32).log2().floor() as u16;
+    let search_range = 2u16.pow(u32::from(entry_selector)) * 16;
+    let range_shift = count * 16 - search_range;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&flavor.to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&entry_selector.to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+
+    // Write records with provisional offsets/checksums, tracking where the
+    // head table's checksumAdjustment lives so we can patch it last.
+    let mut offset = 12 + tables.len() * 16;
+    let mut head_checksum_adjustment_offset: Option<usize> = None;
+    for (tag, body) in tables.iter_mut() {
+        if tag == b"head" {
+            // Zero the checksumAdjustment field before checksumming.
+            if let Some(slot) = body.get_mut(8..12) {
+                slot.fill(0);
+            }
+            head_checksum_adjustment_offset = Some(offset + 8);
+        }
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&sfnt_checksum(body).to_be_bytes());
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        offset += body.len();
+        while offset % 4 != 0 {
+            offset += 1;
+        }
+    }
+
+    // Write table bodies, 4-byte aligned.
+    for (_, body) in &tables {
+        out.extend_from_slice(body);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+
+    // Patch head.checksumAdjustment = 0xB1B0AFBA - checksum(whole font).
+    if let Some(i) = head_checksum_adjustment_offset {
+        let sum = sfnt_checksum(&out);
+        let val = 0xB1B0AFBA_u32.wrapping_sub(sum);
+        out.get_mut(i..i + 4)?.copy_from_slice(&val.to_be_bytes());
+    }
+
+    Some(out)
+}
+
+/// sfnt table checksum: sum of big-endian u32s, zero-padded to a 4-byte
+/// boundary, wrapping. Matches the OpenType spec and `subsetter::checksum`.
+fn sfnt_checksum(data: &[u8]) -> u32 {
+    let mut sum = 0u32;
+    for chunk in data.chunks(4) {
+        let mut bytes = [0u8; 4];
+        bytes[..chunk.len()].copy_from_slice(chunk);
+        sum = sum.wrapping_add(u32::from_be_bytes(bytes));
+    }
+    sum
 }
 
 fn classify_font_family(family: Option<&str>) -> FontFamilyClass {
@@ -1019,94 +1208,82 @@ mod tests {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // TEMPORARY PROBE — remove before finishing.
-    fn render_korean_probe(token_loader: impl FnOnce(&mut PdfDocument) -> PdfFontToken) -> (u64, usize) {
-        // Returns (count of dark pixels in rendered page, saved byte size).
-        let pdfium = create_pdfium().unwrap();
-        let mut document = pdfium.create_new_pdf().unwrap();
-        document
-            .pages_mut()
-            .create_page_at_end(PdfPagePaperSize::a4())
-            .unwrap();
-        let token = token_loader(&mut document);
-        {
-            let mut page = document.pages().get(0).unwrap();
-            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
-            let mut obj = page
-                .objects_mut()
-                .create_text_object(
-                    PdfPoints::new(50.0),
-                    PdfPoints::new(700.0),
-                    "한글ABC",
-                    token,
-                    PdfPoints::new(48.0),
-                )
-                .unwrap();
-            obj.set_fill_color(PdfColor::new(0, 0, 0, 255)).unwrap();
-            page.regenerate_content().unwrap();
-        }
-        let bytes = document.save_to_bytes().unwrap();
-        let saved_size = bytes.len();
-
-        let pdfium2 = create_pdfium().unwrap();
-        let rendered = pdfium2
-            .load_pdf_from_byte_slice(&bytes, None)
-            .unwrap()
-            .pages()
-            .get(0)
-            .unwrap()
-            .render_with_config(&PdfRenderConfig::new().set_target_width(595))
-            .unwrap()
-            .as_image()
-            .into_rgba8();
-        let mut dark = 0u64;
-        for p in rendered.pixels() {
-            if p.0[0] < 100 && p.0[1] < 100 && p.0[2] < 100 {
-                dark += 1;
+    /// A synthesized format-4 cmap must round-trip through `ttf-parser`,
+    /// resolving each codepoint to the glyph id we put in. This is the
+    /// mapping pdfium reads to turn `&str` text into glyphs, so it directly
+    /// guards the Korean-export glyph corruption fix.
+    #[test]
+    fn injected_cmap_round_trips_through_ttf_parser() {
+        // Build a minimal valid sfnt with the bare-minimum tables ttf-parser
+        // needs to parse a face, then inject a cmap and read it back. We use
+        // the smallest real subset we can produce so the test is hermetic
+        // only on a system CJK font being present; skip if none is found.
+        const CANDIDATES: &[&str] = &[
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        ];
+        let Some(font_bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+            eprintln!("skipping: no system CJK font available");
+            return;
+        };
+        let used: BTreeSet<char> = "한글ABC".chars().collect();
+        let Ok(face) = ttf_parser::Face::parse(&font_bytes, 0) else {
+            return;
+        };
+        let mut remapper = subsetter::GlyphRemapper::new();
+        let mut char_old: Vec<(char, u16)> = Vec::new();
+        for &c in &used {
+            if let Some(gid) = face.glyph_index(c) {
+                remapper.remap(gid.0);
+                char_old.push((c, gid.0));
             }
         }
-        (dark, saved_size)
+        let bare = subsetter::subset(&font_bytes, 0, &remapper).unwrap();
+
+        // The subsetter strips cmap, so the bare subset resolves nothing.
+        let bare_face = ttf_parser::Face::parse(&bare, 0).unwrap();
+        assert!(
+            bare_face.glyph_index('한').is_none(),
+            "subsetter is expected to strip the cmap table"
+        );
+
+        let mut entries: Vec<(u16, u16)> = char_old
+            .iter()
+            .map(|(c, old)| (*c as u16, remapper.get(*old).unwrap()))
+            .collect();
+        entries.sort_unstable();
+        let fixed = inject_cmap(&bare, &entries).unwrap();
+
+        let fixed_face = ttf_parser::Face::parse(&fixed, 0).unwrap();
+        for (c, old) in &char_old {
+            assert_eq!(
+                fixed_face.glyph_index(*c).map(|g| g.0),
+                Some(remapper.get(*old).unwrap()),
+                "codepoint {c:?} must map to its remapped glyph id"
+            );
+        }
     }
 
     #[test]
-    fn probe_korean_glyph_paths() {
-        let font_bytes = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc").unwrap();
-        println!("PROBE: source .ttc size = {}", font_bytes.len());
-
-        // (1) FULL face-0 embed (cmap intact).
-        let full_bytes = font_bytes.clone();
-        let (dark_full, size_full) = render_korean_probe(move |doc| {
-            doc.fonts_mut()
-                .load_true_type_from_bytes(&full_bytes, true)
-                .unwrap()
-        });
-        println!("PROBE(1) FULL embed: dark_pixels={dark_full} saved_size={size_full}");
-
-        // (2) CURRENT subset path (cmap stripped by subsetter).
-        let used: BTreeSet<char> = "한글ABC".chars().collect();
-        let subset_bytes_outer = {
-            let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
-            let mut remapper = subsetter::GlyphRemapper::new();
-            for &c in &used {
-                if let Some(gid) = face.glyph_index(c) {
-                    remapper.remap(gid.0);
-                }
-            }
-            subsetter::subset(&font_bytes, 0, &remapper).unwrap()
-        };
-        println!("PROBE(2) subset size = {}", subset_bytes_outer.len());
-        let sb = subset_bytes_outer.clone();
-        let (dark_subset, size_subset) = render_korean_probe(move |doc| {
-            doc.fonts_mut()
-                .load_true_type_from_bytes(&sb, true)
-                .unwrap()
-        });
-        println!("PROBE(2) SUBSET embed: dark_pixels={dark_subset} saved_size={size_subset}");
-
-        // (3) Extract face-0 of the .ttc as a standalone sfnt, embed full.
-        // pdfium copies the font data into the doc; measure if save trims it.
-        println!(
-            "PROBE SUMMARY: full(dark={dark_full},size={size_full}) subset(dark={dark_subset},size={size_subset})"
+    fn build_cmap_format4_lengths_are_consistent() {
+        // Two entries → segCount 3 (incl. terminator). Validate the declared
+        // subtable length matches the bytes actually written, and the header
+        // points at a format-4 subtable.
+        let table = build_cmap_format4(&[(0x41, 1), (0xAC00, 2)]);
+        assert_eq!(&table[0..2], &0u16.to_be_bytes(), "cmap version");
+        assert_eq!(&table[2..4], &1u16.to_be_bytes(), "numTables");
+        assert_eq!(&table[4..6], &3u16.to_be_bytes(), "platformID = Windows");
+        assert_eq!(&table[6..8], &1u16.to_be_bytes(), "encodingID = Unicode BMP");
+        let sub_off = u32::from_be_bytes(table[8..12].try_into().unwrap()) as usize;
+        assert_eq!(sub_off, 12);
+        assert_eq!(&table[sub_off..sub_off + 2], &4u16.to_be_bytes(), "format 4");
+        let declared = u16::from_be_bytes(table[sub_off + 2..sub_off + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            declared,
+            table.len() - sub_off,
+            "format-4 length field must equal the actual subtable byte count"
         );
     }
 

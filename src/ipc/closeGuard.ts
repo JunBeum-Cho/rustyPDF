@@ -9,6 +9,9 @@ import { saveTabPdf } from "./pdf";
 const hasUnsavedTabs = () =>
   documentStore.tabs.some((t) => t.annotations.dirty || t.pageDirty);
 
+const unsavedTabs = () =>
+  documentStore.tabs.filter((t) => t.annotations.dirty || t.pageDirty);
+
 export function installCloseGuard() {
   onMount(() => {
     let unlistenWindow: (() => void) | undefined;
@@ -29,10 +32,9 @@ export function installCloseGuard() {
       closeFlowRunning = true;
 
       try {
-        if (hasUnsavedTabs()) {
-          const dirtyNames = documentStore.tabs
-            .filter((t) => t.annotations.dirty || t.pageDirty)
-            .map((t) => fileNameFromPath(t.path));
+        const tabsToSave = unsavedTabs();
+        if (tabsToSave.length > 0) {
+          const dirtyNames = tabsToSave.map((t) => fileNameFromPath(t.path));
           let save = false;
           try {
             save = await ask(
@@ -50,18 +52,23 @@ export function installCloseGuard() {
             );
           }
           if (save) {
-            for (const tab of documentStore.tabs) {
+            const failedNames: string[] = [];
+            for (const tab of tabsToSave) {
               try {
-                await saveTabPdf(tab.tabId);
+                const saved = await saveTabPdf(tab.tabId);
+                if (!saved) failedNames.push(fileNameFromPath(tab.path));
               } catch (error) {
                 console.error("close-guard save failed", tab.path, error);
-                const force = window.confirm(
-                  `${fileNameFromPath(tab.path)} 저장에 실패했습니다. 그래도 닫으시겠습니까?`,
-                );
-                if (!force) {
-                  closeFlowRunning = false;
-                  return;
-                }
+                failedNames.push(fileNameFromPath(tab.path));
+              }
+            }
+            if (failedNames.length > 0) {
+              const force = window.confirm(
+                `다음 파일 저장에 실패했습니다:\n${failedNames.join("\n")}\n\n그래도 닫으시겠습니까?`,
+              );
+              if (!force) {
+                closeFlowRunning = false;
+                return;
               }
             }
           }

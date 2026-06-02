@@ -111,7 +111,9 @@ export async function handleImageDrop(
       // Default size: 40% of the page width, preserve aspect ratio. The user
       // can resize via the existing rect handles after drop.
       const targetWidthPt = pageMeta.width * 0.4;
-      const aspect = h > 0 ? h / w : 0.5;
+      const hasValidNaturalSize =
+        Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0;
+      const aspect = hasValidNaturalSize ? h / w : 0.5;
       const targetHeightPt = targetWidthPt * aspect;
 
       const annotation: Annotation = {
