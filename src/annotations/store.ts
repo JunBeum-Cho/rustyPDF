@@ -409,6 +409,59 @@ export const updateAnnotationsLive = (
   markDirty();
 };
 
+/**
+ * Live-mirror typed text into the store WHILE editing, without replacing the
+ * annotation object. We mutate `payload.html` / `payload.text` on the existing
+ * proxy via produce(), so Solid's <For> (keyed by item reference) does NOT
+ * dispose/remount the contenteditable row — the caret and any in-flight IME
+ * composition stay intact. Records no history (the coarse-grained undo
+ * baseline is captured once, at create time or on first edit). Keeping the
+ * store current means autosave, Cmd+S, tab switches and window close all see
+ * the text on screen instead of an empty/stale value.
+ */
+export const updateAnnotationTextLive = (
+  id: string,
+  html: string,
+  text: string,
+) => {
+  mutateActiveAnnotations((state) => {
+    const item = state.items.find((a) => a.id === id);
+    if (!item) return;
+    if (!item.payload) item.payload = {};
+    item.payload.html = html;
+    item.payload.text = text;
+    state.dirty = true;
+    state.saveStatus = "idle";
+    state.saveError = null;
+  });
+};
+
+/**
+ * Finalize a text edit on blur/commit: apply the default-style patch and the
+ * block-aware plain-text mirror in place (no history — the baseline was
+ * already recorded). Mutating nested fields keeps the row's reference stable
+ * so the about-to-be-shown read-only view picks up the new values without a
+ * remount.
+ */
+export const finalizeAnnotationText = (
+  id: string,
+  html: string,
+  text: string,
+  stylePatch: Partial<Annotation["style"]> = {},
+) => {
+  mutateActiveAnnotations((state) => {
+    const item = state.items.find((a) => a.id === id);
+    if (!item) return;
+    item.style = { ...item.style, ...stylePatch };
+    if (!item.payload) item.payload = {};
+    item.payload.html = html;
+    item.payload.text = text;
+    state.dirty = true;
+    state.saveStatus = "idle";
+    state.saveError = null;
+  });
+};
+
 export const deleteSelectedAnnotations = () => {
   const tab = activeTab();
   if (!tab || tab.annotations.selectedIds.length === 0) return;
@@ -419,6 +472,89 @@ export const deleteSelectedAnnotations = () => {
     state.selectedIds = [];
   });
   markDirty();
+};
+
+// ---- Annotation clipboard ----------------------------------------------
+// Frontend-only buffer of deep-cloned, page-agnostic annotations. Distinct
+// from the page-thumbnail clipboard in viewer/pageClipboard.ts (which round-
+// trips PDF bytes through the backend). The keydown handler in pageClipboard.ts
+// arbitrates between the two by recency (`copiedAt`).
+
+interface AnnotationClipboard {
+  items: Annotation[];
+  copiedAt: number;
+  /** Bumped per paste so successive copies cascade instead of stacking. */
+  pasteCount: number;
+}
+
+let annotationClipboard: AnnotationClipboard | null = null;
+
+/** Diagonal offset (PDF points) applied to each successive paste. */
+const PASTE_OFFSET = 16;
+
+export const hasAnnotationClipboard = () =>
+  annotationClipboard !== null && annotationClipboard.items.length > 0;
+
+/** Timestamp of the last annotation copy/cut, or -1 if the buffer is empty. */
+export const annotationClipboardCopiedAt = () =>
+  annotationClipboard?.copiedAt ?? -1;
+
+export const copySelectedAnnotations = (): boolean => {
+  const tab = activeTab();
+  if (!tab) return false;
+  const selected = new Set(tab.annotations.selectedIds);
+  if (selected.size === 0) return false;
+  const items = tab.annotations.items.filter((a) => selected.has(a.id));
+  if (items.length === 0) return false;
+  annotationClipboard = {
+    items: cloneAnnotations(items),
+    copiedAt: Date.now(),
+    pasteCount: 0,
+  };
+  return true;
+};
+
+export const cutSelectedAnnotations = (): boolean => {
+  if (!copySelectedAnnotations()) return false;
+  deleteSelectedAnnotations();
+  return true;
+};
+
+export const pasteAnnotations = (): boolean => {
+  const tab = activeTab();
+  if (!tab || !annotationClipboard || annotationClipboard.items.length === 0) {
+    return false;
+  }
+  const targetPage = tab.currentPage;
+  annotationClipboard.pasteCount += 1;
+  const shift = PASTE_OFFSET * annotationClipboard.pasteCount;
+  // Clone again so the pasted objects never share nested references with the
+  // buffer — repeated pastes (and later moves/resizes) stay independent.
+  const fresh = cloneAnnotations(annotationClipboard.items).map((item) => {
+    item.id = createAnnotationId();
+    item.page = targetPage;
+    if (item.rect) {
+      item.rect = { ...item.rect, x: item.rect.x + shift, y: item.rect.y + shift };
+    }
+    if (item.points) {
+      item.points = item.points.map((p) => ({ x: p.x + shift, y: p.y + shift }));
+    }
+    return item;
+  });
+  recordAnnotationHistory();
+  mutateActiveAnnotations((state) => {
+    // push() (not reassignment) keeps existing row proxies stable for <For>.
+    for (const item of fresh) state.items.push(item);
+    state.selectedIds = fresh.map((i) => i.id);
+    state.editingId = null;
+  });
+  markDirty();
+  return true;
+};
+
+export const duplicateSelectedAnnotations = (): boolean => {
+  if (!copySelectedAnnotations()) return false;
+  return pasteAnnotations();
 };
 
 export const undoAnnotations = () => {

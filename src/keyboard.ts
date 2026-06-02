@@ -100,12 +100,23 @@ export function installKeyboardShortcuts() {
     applyTheme(uiStore.theme);
 
     const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+
+      // Cmd/Ctrl+S must save even while a text annotation is being edited.
+      // The contenteditable editor is an "editable target", so without this
+      // the guard below would swallow the shortcut entirely. The live text
+      // mirror keeps the store current, so the save captures what's on screen.
+      if (mod && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        if (activeTab()) void saveActivePdf(e.shiftKey);
+        return;
+      }
+
       if (isEditableTarget(e.target)) {
         if (isAnnotationToolbarTarget(e.target) && handleUndoRedo(e)) return;
         return;
       }
 
-      const mod = e.metaKey || e.ctrlKey;
       const tab = activeTab();
 
       if (mod && (e.key === "+" || e.key === "=")) {
@@ -141,11 +152,6 @@ export function installKeyboardShortcuts() {
       if (mod && (e.key === "w" || e.key === "W")) {
         e.preventDefault();
         if (tab) void closeTab(tab.tabId);
-        return;
-      }
-      if (mod && (e.key === "s" || e.key === "S")) {
-        e.preventDefault();
-        if (tab) void saveActivePdf(e.shiftKey);
         return;
       }
       if (mod && e.key === "Tab") {

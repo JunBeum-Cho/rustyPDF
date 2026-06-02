@@ -1019,6 +1019,97 @@ mod tests {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // TEMPORARY PROBE — remove before finishing.
+    fn render_korean_probe(token_loader: impl FnOnce(&mut PdfDocument) -> PdfFontToken) -> (u64, usize) {
+        // Returns (count of dark pixels in rendered page, saved byte size).
+        let pdfium = create_pdfium().unwrap();
+        let mut document = pdfium.create_new_pdf().unwrap();
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::a4())
+            .unwrap();
+        let token = token_loader(&mut document);
+        {
+            let mut page = document.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+            let mut obj = page
+                .objects_mut()
+                .create_text_object(
+                    PdfPoints::new(50.0),
+                    PdfPoints::new(700.0),
+                    "한글ABC",
+                    token,
+                    PdfPoints::new(48.0),
+                )
+                .unwrap();
+            obj.set_fill_color(PdfColor::new(0, 0, 0, 255)).unwrap();
+            page.regenerate_content().unwrap();
+        }
+        let bytes = document.save_to_bytes().unwrap();
+        let saved_size = bytes.len();
+
+        let pdfium2 = create_pdfium().unwrap();
+        let rendered = pdfium2
+            .load_pdf_from_byte_slice(&bytes, None)
+            .unwrap()
+            .pages()
+            .get(0)
+            .unwrap()
+            .render_with_config(&PdfRenderConfig::new().set_target_width(595))
+            .unwrap()
+            .as_image()
+            .into_rgba8();
+        let mut dark = 0u64;
+        for p in rendered.pixels() {
+            if p.0[0] < 100 && p.0[1] < 100 && p.0[2] < 100 {
+                dark += 1;
+            }
+        }
+        (dark, saved_size)
+    }
+
+    #[test]
+    fn probe_korean_glyph_paths() {
+        let font_bytes = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc").unwrap();
+        println!("PROBE: source .ttc size = {}", font_bytes.len());
+
+        // (1) FULL face-0 embed (cmap intact).
+        let full_bytes = font_bytes.clone();
+        let (dark_full, size_full) = render_korean_probe(move |doc| {
+            doc.fonts_mut()
+                .load_true_type_from_bytes(&full_bytes, true)
+                .unwrap()
+        });
+        println!("PROBE(1) FULL embed: dark_pixels={dark_full} saved_size={size_full}");
+
+        // (2) CURRENT subset path (cmap stripped by subsetter).
+        let used: BTreeSet<char> = "한글ABC".chars().collect();
+        let subset_bytes_outer = {
+            let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+            let mut remapper = subsetter::GlyphRemapper::new();
+            for &c in &used {
+                if let Some(gid) = face.glyph_index(c) {
+                    remapper.remap(gid.0);
+                }
+            }
+            subsetter::subset(&font_bytes, 0, &remapper).unwrap()
+        };
+        println!("PROBE(2) subset size = {}", subset_bytes_outer.len());
+        let sb = subset_bytes_outer.clone();
+        let (dark_subset, size_subset) = render_korean_probe(move |doc| {
+            doc.fonts_mut()
+                .load_true_type_from_bytes(&sb, true)
+                .unwrap()
+        });
+        println!("PROBE(2) SUBSET embed: dark_pixels={dark_subset} saved_size={size_subset}");
+
+        // (3) Extract face-0 of the .ttc as a standalone sfnt, embed full.
+        // pdfium copies the font data into the doc; measure if save trims it.
+        println!(
+            "PROBE SUMMARY: full(dark={dark_full},size={size_full}) subset(dark={dark_subset},size={size_subset})"
+        );
+    }
+
     #[test]
     fn deserializes_image_annotation_sidecar() {
         let data = json!({

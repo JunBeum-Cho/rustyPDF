@@ -17,15 +17,16 @@ import {
   annotationStore,
   clearAnnotationSelection,
   createAnnotationId,
+  finalizeAnnotationText,
   recordAnnotationHistory,
   removeAnnotation,
   selectAnnotation,
   setAnnotationTool,
   startEditingAnnotation,
   stopEditingAnnotation,
-  updateAnnotation,
   updateAnnotationLive,
   updateAnnotationsLive,
+  updateAnnotationTextLive,
 } from "./store";
 import {
   peekLastFocusedEditor,
@@ -283,6 +284,33 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   let lastTextClick:
     | { id: string; time: number; clientX: number; clientY: number }
     | null = null;
+  // Tracks the in-progress text edit so we can record exactly one undo
+  // baseline per session. A freshly created annotation already has its
+  // pre-creation snapshot from addAnnotation (baselineRecorded), so we don't
+  // double-record; an existing annotation records lazily on its first edit so
+  // clearing it stays undoable and opening-without-typing leaves no entry.
+  let editEntry:
+    | { id: string; createdNew: boolean; baselineRecorded: boolean }
+    | null = null;
+
+  const beginTextEdit = (id: string, createdNew: boolean) => {
+    editEntry = { id, createdNew, baselineRecorded: createdNew };
+  };
+
+  // Persist what's in the contenteditable to the store on every input, so the
+  // store (autosave / Cmd+S / tab switch / close) always reflects the screen.
+  // Skipped mid-IME-composition (CJK) and re-run on compositionend so we never
+  // mirror half-composed glyphs. The store write mutates in place (no remount),
+  // preserving caret + composition.
+  const mirrorEditorToStore = (el: HTMLElement) => {
+    if (!editEntry) return;
+    if (!editEntry.baselineRecorded) {
+      recordAnnotationHistory();
+      editEntry.baselineRecorded = true;
+    }
+    const html = el.innerHTML;
+    updateAnnotationTextLive(editEntry.id, html, htmlToPlainText(html));
+  };
 
   const pageAnnotations = createMemo(() =>
     annotationStore.items.filter((annotation) => annotation.page === props.page.index),
@@ -412,6 +440,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       });
       setAnnotationTool("select");
       startEditingAnnotation(id);
+      beginTextEdit(id, true);
       return;
     }
     setDraft({
@@ -664,6 +693,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     if (shouldEditTextFromPointerDown(event, annotation)) {
       selectAnnotation(annotation.id);
       startEditingAnnotation(annotation.id);
+      beginTextEdit(annotation.id, false);
       setDragState(null);
       return;
     }
@@ -740,6 +770,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     event.stopPropagation();
     selectAnnotation(annotation.id);
     startEditingAnnotation(annotation.id);
+    beginTextEdit(annotation.id, false);
   };
 
   const commitTextEdit = (
@@ -750,20 +781,31 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     if (annotationStore.editingId !== annotation.id) {
       return;
     }
+    const createdNew = editEntry?.createdNew ?? false;
+    const baselineRecorded = editEntry?.baselineRecorded ?? false;
+    editEntry = null;
+    // A baseline snapshot is needed for any change to an *existing* annotation
+    // that didn't already record one via the live mirror (e.g. a default-style
+    // tweak that fired no input event). Freshly created annotations already
+    // have their pre-creation snapshot from addAnnotation.
+    const needsBaseline = !createdNew && !baselineRecorded;
     if (htmlIsEmpty(html)) {
-      // Empty content == implicit cancel: drop the annotation entirely. We
-      // skip history because addAnnotation already pushed an entry — leaving
-      // both would mean the user has to undo twice for an aborted text.
-      removeAnnotation(annotation.id, { record: false });
-    } else if (html !== annotationHtml(annotation) || textStyleChanged(annotation, stylePatch)) {
-      // Derive a plain-text mirror — block-aware so PDF export and search
-      // both see one line per visual line, not a giant concatenation.
+      // Empty content == implicit cancel: drop the annotation entirely. Make
+      // the deletion undoable for a pre-existing annotation that had no
+      // baseline yet; otherwise the snapshot already covers it.
+      removeAnnotation(annotation.id, { record: needsBaseline });
+    } else if (
+      html !== annotationHtml(annotation) ||
+      textStyleChanged(annotation, stylePatch)
+    ) {
+      // Content was live-mirrored during typing; here we finalize the
+      // block-aware plain-text mirror and any default-style patch in place
+      // (no remount). Record a baseline first only if one wasn't already.
+      if (needsBaseline) {
+        recordAnnotationHistory();
+      }
       const text = htmlToPlainText(html);
-      updateAnnotation(annotation.id, (item) => ({
-        ...item,
-        style: { ...item.style, ...stylePatch },
-        payload: { ...item.payload, html, text },
-      }));
+      finalizeAnnotationText(annotation.id, html, text, stylePatch);
     }
     stopEditingAnnotation();
   };
@@ -1060,6 +1102,17 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               spellcheck={false}
               onPointerDown={(event) => event.stopPropagation()}
               onFocus={(event) => registerEditor(event.currentTarget)}
+              onInput={(event) => {
+                // Mirror typed content into the store live so it survives
+                // save / tab switch / close without a click-outside. Skip
+                // while an IME composition is in flight (CJK) — the trailing
+                // compositionend re-mirrors the committed glyphs.
+                if ((event as unknown as InputEvent).isComposing) return;
+                mirrorEditorToStore(event.currentTarget);
+              }}
+              onCompositionEnd={(event) =>
+                mirrorEditorToStore(event.currentTarget)
+              }
               onBlur={(event) => {
                 // Soft blur: focus heading into the formatting toolbar
                 // (font <select>, size input, color picker, B/I/U buttons)

@@ -9,7 +9,16 @@ import {
   type PageMeta,
   type Tab,
 } from "../state/document";
-import { annotationStore, remapAnnotationsForTab } from "../annotations/store";
+import {
+  annotationClipboardCopiedAt,
+  annotationStore,
+  copySelectedAnnotations,
+  cutSelectedAnnotations,
+  duplicateSelectedAnnotations,
+  hasAnnotationClipboard,
+  pasteAnnotations,
+  remapAnnotationsForTab,
+} from "../annotations/store";
 import {
   copyPdfPages,
   deletePdfPages,
@@ -21,12 +30,16 @@ interface PageClipboardState {
   token: string | null;
   count: number;
   sourceTabPath: string | null;
+  /** When the page clipboard was last written, for paste arbitration against
+   * the annotation clipboard. */
+  copiedAt: number;
 }
 
 const [pageClipboard, setPageClipboard] = createStore<PageClipboardState>({
   token: null,
   count: 0,
   sourceTabPath: null,
+  copiedAt: 0,
 });
 
 export { pageClipboard };
@@ -89,6 +102,7 @@ export async function copySelectedPages(): Promise<void> {
       token,
       count: indices.length,
       sourceTabPath: tab.path,
+      copiedAt: Date.now(),
     });
   } catch (error) {
     console.error("copy pages failed", error);
@@ -238,29 +252,76 @@ export function installPageClipboardShortcuts() {
       if (!tab) return;
       const mod = e.metaKey || e.ctrlKey;
 
+      // While a text annotation is being edited — including when focus is
+      // soft-blurred into the format toolbar's <select>, which isEditableTarget
+      // above doesn't catch — clipboard keys belong to the text, not the page
+      // or annotation clipboard. Bailing here avoids tearing down the active
+      // edit (which would drop an uncommitted style patch) before it commits.
+      if (
+        mod &&
+        annotationStore.editingId !== null &&
+        /^[cxvd]$/i.test(e.key)
+      ) {
+        return;
+      }
+
       // Page-level shortcuts only fire when the user has thumbnails selected,
       // so they don't conflict with annotation undo/copy/etc.
       const hasSelection = tab.selectedPageIndices.length > 0;
+      // An annotation can be selected while a thumbnail selection lingers from
+      // earlier navigation (page selection is sticky). Annotation operations
+      // win in that case — the user is acting on the annotation they clicked.
+      const hasAnnotationSelection = annotationStore.selectedIds.length > 0;
 
       if (mod && (e.key === "c" || e.key === "C")) {
+        if (hasAnnotationSelection) {
+          e.preventDefault();
+          copySelectedAnnotations();
+          return;
+        }
         if (!hasSelection) return;
         e.preventDefault();
         void copySelectedPages();
         return;
       }
       if (mod && (e.key === "x" || e.key === "X")) {
+        if (hasAnnotationSelection) {
+          e.preventDefault();
+          cutSelectedAnnotations();
+          return;
+        }
         if (!hasSelection) return;
         e.preventDefault();
         void cutSelectedPages();
         return;
       }
       if (mod && (e.key === "v" || e.key === "V")) {
-        if (!pageClipboard.token) return;
+        // Most-recent copy wins when both clipboards hold something.
+        const annoAt = annotationClipboardCopiedAt();
+        const pageAt = pageClipboard.token ? pageClipboard.copiedAt : -1;
+        if (hasAnnotationClipboard() && annoAt >= pageAt) {
+          e.preventDefault();
+          pasteAnnotations();
+          return;
+        }
+        if (!pageClipboard.token) {
+          // Fall back to annotation paste if that's the only filled buffer.
+          if (hasAnnotationClipboard()) {
+            e.preventDefault();
+            pasteAnnotations();
+          }
+          return;
+        }
         e.preventDefault();
         void pastePagesAfter();
         return;
       }
       if (mod && (e.key === "d" || e.key === "D")) {
+        if (hasAnnotationSelection) {
+          e.preventDefault();
+          duplicateSelectedAnnotations();
+          return;
+        }
         if (!hasSelection) return;
         e.preventDefault();
         void duplicateSelectedPages();
