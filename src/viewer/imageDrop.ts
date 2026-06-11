@@ -104,6 +104,15 @@ export async function handleImageDrop(
   for (const path of paths) {
     try {
       const bytes = await readFile(path);
+      // A dropped image is base64-inflated (~1.33×) into a data URL that lives
+      // in the annotation store, the sidecar JSON, and every IPC payload. Cap
+      // the raw size so a huge file can't freeze the UI / bloat the sidecar.
+      const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+      if (bytes.length > MAX_IMAGE_BYTES) {
+        console.warn("image drop: file too large, skipping", path, bytes.length);
+        window.alert("이미지가 너무 커서 추가할 수 없습니다 (최대 20MB).");
+        continue;
+      }
       const mime = mimeFromPath(path);
       const dataUrl = `data:${mime};base64,${bytesToBase64(bytes)}`;
       const { w, h } = await measureImage(dataUrl);

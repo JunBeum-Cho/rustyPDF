@@ -461,7 +461,6 @@ async function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
     if (!tab) return false;
     const hasAnnotations = tab.annotations.items.length > 0;
     const savedAt = new Date().toISOString();
-    const annotationItems = tab.annotations.items;
     const bytesChanged = tab.pageDirty || asNew;
 
     if (hasAnnotations) {
@@ -473,9 +472,15 @@ async function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
     // export time.
     const saved = await savePdfDocument(tab.docId, target, null);
 
+    // Snapshot exactly what we persist. We clear `dirty` below only if the
+    // live items still match this snapshot — otherwise an annotation edited
+    // during the save round-trip would be marked saved without being written,
+    // and lost (the close guard would then see no unsaved changes).
+    const savedJson = JSON.stringify(tab.annotations.items);
+
     // Persist the sidecar at the (possibly new) target path so annotations
     // re-appear as editable objects when this file is reopened.
-    await saveAnnotationSidecar(target, makeSidecar(target, annotationItems));
+    await saveAnnotationSidecar(target, makeSidecar(target, JSON.parse(savedJson)));
 
     setDocumentStore(
       produce((state) => {
@@ -504,10 +509,16 @@ async function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
         target.prefetchPolicy =
           saved.fileSize <= EAGER_PREFETCH_LIMIT_BYTES ? "all" : "lazy";
         target.pageDirty = false;
-        target.annotations.dirty = false;
-        target.annotations.saveStatus = "saved";
         target.annotations.saveError = null;
         target.annotations.lastSavedAt = savedAt;
+        if (JSON.stringify(target.annotations.items) === savedJson) {
+          target.annotations.dirty = false;
+          target.annotations.saveStatus = "saved";
+        } else {
+          // Edits arrived during the save round-trip and weren't persisted —
+          // keep dirty so autosave reflushes them.
+          target.annotations.saveStatus = "idle";
+        }
       }),
     );
   } catch (error) {

@@ -9,7 +9,8 @@ use pdf::edit::{
     save_doc_as, save_doc_with_annotations, PdfPageEditResult,
 };
 use pdf::ocr::{
-    load_sidecar_into_cache, ocr_page as ocr_page_impl, persist_sidecar, OcrLine, OcrPage,
+    delete_sidecar, load_sidecar_into_cache, ocr_page as ocr_page_impl, persist_sidecar, OcrLine,
+    OcrPage,
 };
 use pdf::render::render_page;
 use pdf::text::{extract_native_text_lines, search as text_search, SearchHit};
@@ -125,13 +126,18 @@ async fn pdf_delete_pages(
     doc_id: String,
     indices: Vec<usize>,
 ) -> Result<PdfPageEditResult, PdfError> {
-    delete_pages(
+    let result = delete_pages(
         &state.registry,
         &state.cache,
         &state.text,
         &doc_id,
         &indices,
-    )
+    )?;
+    // Page indices shifted — the OCR cache and on-disk sidecar are keyed by
+    // index and would now map onto the wrong pages.
+    state.ocr.invalidate(&doc_id);
+    delete_sidecar(&result.path);
+    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -150,7 +156,7 @@ async fn pdf_paste_pages(
     after_index: i64,
     clipboard_id: String,
 ) -> Result<PdfPageEditResult, PdfError> {
-    paste_pages(
+    let result = paste_pages(
         &state.registry,
         &state.cache,
         &state.text,
@@ -158,7 +164,10 @@ async fn pdf_paste_pages(
         &doc_id,
         after_index,
         &clipboard_id,
-    )
+    )?;
+    state.ocr.invalidate(&doc_id);
+    delete_sidecar(&result.path);
+    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -167,13 +176,16 @@ async fn pdf_duplicate_pages(
     doc_id: String,
     indices: Vec<usize>,
 ) -> Result<PdfPageEditResult, PdfError> {
-    duplicate_pages(
+    let result = duplicate_pages(
         &state.registry,
         &state.cache,
         &state.text,
         &doc_id,
         &indices,
-    )
+    )?;
+    state.ocr.invalidate(&doc_id);
+    delete_sidecar(&result.path);
+    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]

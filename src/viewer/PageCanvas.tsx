@@ -40,9 +40,13 @@ function getObserver(): IntersectionObserver {
 }
 
 function paintRgba(canvas: HTMLCanvasElement, buf: ArrayBuffer) {
+  if (buf.byteLength < 8) return;
   const view = new DataView(buf);
   const w = view.getUint32(0, false);
   const h = view.getUint32(4, false);
+  // Guard against a header that disagrees with the payload length — otherwise
+  // the Uint8ClampedArray view below throws a RangeError.
+  if (w === 0 || h === 0 || buf.byteLength < 8 + w * h * 4) return;
   const pixels = new Uint8ClampedArray(buf, 8, w * h * 4);
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -56,6 +60,7 @@ function paintRgba(canvas: HTMLCanvasElement, buf: ArrayBuffer) {
 
 export function PageCanvas(props: Props) {
   let canvas!: HTMLCanvasElement;
+  let renderSeq = 0;
   const [visible, setVisible] = createSignal(false);
 
   createEffect(() => {
@@ -82,10 +87,14 @@ export function PageCanvas(props: Props) {
     const id = props.docId;
 
     let cancelled = false;
+    const seq = ++renderSeq;
     (async () => {
       try {
         const buf = await renderPage(id, idx, bucket, rot);
-        if (cancelled) return;
+        // Skip if this run was superseded — a newer render (zoom/rotation/
+        // visibility change) must not be overwritten by an older one that
+        // resolves late.
+        if (cancelled || seq !== renderSeq) return;
         paintRgba(canvas, buf);
       } catch (err) {
         if (!cancelled) console.error("render page failed", idx, err);

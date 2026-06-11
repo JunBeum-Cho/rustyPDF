@@ -261,7 +261,7 @@ pub fn paste_pages(
     let dest_index: u16 = if after_index < 0 {
         0
     } else {
-        let idx = (after_index as usize + 1).min(handle.page_count);
+        let idx = (after_index as usize).saturating_add(1).min(handle.page_count);
         idx as u16
     };
 
@@ -485,7 +485,20 @@ pub fn capture_region(
     // version-sensitive and renderConfig clipping doesn't shrink the
     // output buffer — it just ignores ink outside the rect).
     const PT_TO_PX: f32 = 96.0 / 72.0;
-    let pixel_scale = scale * PT_TO_PX;
+    let safe_scale = if scale.is_finite() && scale > 0.0 {
+        scale.min(16.0)
+    } else {
+        2.0
+    };
+    let mut pixel_scale = safe_scale * PT_TO_PX;
+    // Bound the full-page render so a pathological MediaBox can't trigger a
+    // huge allocation. Crop coordinates below use the same `pixel_scale`, so
+    // scaling it down keeps the crop rect aligned.
+    const MAX_DIM: f32 = 10_000.0;
+    let over = (page_w_pts * pixel_scale / MAX_DIM).max(page_h_pts * pixel_scale / MAX_DIM);
+    if over > 1.0 {
+        pixel_scale /= over;
+    }
     let target_w = (page_w_pts * pixel_scale).round() as i32;
     let target_h = (page_h_pts * pixel_scale).round() as i32;
 

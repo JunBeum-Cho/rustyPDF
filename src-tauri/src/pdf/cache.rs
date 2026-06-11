@@ -1,6 +1,5 @@
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
@@ -16,9 +15,11 @@ struct CacheEntry {
     size: usize,
 }
 
-/// LRU cache of rendered page PNG bytes with a soft byte budget.
+/// LRU cache of rendered page PNG bytes bounded purely by a byte budget.
 /// When inserting an entry would exceed `max_bytes`, oldest entries are evicted
-/// until the budget is satisfied (or the cache is empty).
+/// until the budget is satisfied (or the cache is empty). The underlying
+/// `LruCache` is unbounded by count — a count cap would let it silently evict
+/// entries without decrementing `used_bytes`, drifting the budget over time.
 pub struct PageCache {
     inner: Mutex<Inner>,
     max_bytes: usize,
@@ -33,7 +34,7 @@ impl PageCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                map: LruCache::new(NonZeroUsize::new(1024).expect("nonzero")),
+                map: LruCache::unbounded(),
                 used_bytes: 0,
             }),
             max_bytes,

@@ -25,6 +25,13 @@ function isAnnotationToolbarTarget(t: EventTarget | null): boolean {
   return t instanceof HTMLElement && Boolean(t.closest(".annotation-toolbar"));
 }
 
+function isInteractiveTarget(t: EventTarget | null): boolean {
+  return (
+    t instanceof HTMLElement &&
+    Boolean(t.closest("button, a, select, [role='button']"))
+  );
+}
+
 function handleUndoRedo(e: KeyboardEvent): boolean {
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return false;
@@ -175,7 +182,13 @@ export function installKeyboardShortcuts() {
             break;
           case "ArrowRight":
           case "PageDown":
+            e.preventDefault();
+            gotoPage(1);
+            break;
           case " ":
+            // Don't hijack Space when a button/link is focused — that's the
+            // native "activate" key and stealing it breaks keyboard access.
+            if (isInteractiveTarget(e.target)) break;
             e.preventDefault();
             gotoPage(1);
             break;

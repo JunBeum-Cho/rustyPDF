@@ -66,7 +66,10 @@
   min-width: 100%;
   min-height: 100%;
   padding: 4px 6px;
-  border: 1px dashed transparent;
+  /* outline (not border) for the selection frame so it never insets the text
+     content — the inset must stay padding-only to match the PDF exporter. */
+  outline: 1px dashed transparent;
+  outline-offset: -1px;
   background: transparent;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -81,8 +84,8 @@
 }
 
 .annotation-text-object.selected .annotation-text {
-  border-color: currentColor;
-  border-style: solid;
+  outline-color: currentColor;
+  outline-style: solid;
 }
 
 .annotation-text-edit {
@@ -91,7 +94,9 @@
   height: 100%;
   margin: 0;
   padding: 4px 6px;
-  border: 1px solid currentColor;
+  /* No layout border: the box-shadow ring below is the edit indicator and
+     doesn't inset the text, so the caret/text stay aligned with the display
+     view and the exported PDF (inset is padding-only). */
   background: transparent;
   font-family: inherit;
   font-weight: inherit;

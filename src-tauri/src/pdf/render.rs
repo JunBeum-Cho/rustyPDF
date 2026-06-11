@@ -33,6 +33,13 @@ pub fn render_page(
     scale: f32,
     rotation_deg: i32,
 ) -> Result<Vec<u8>, PdfError> {
+    // `scale` arrives from the frontend; guard against non-finite or absurd
+    // values so the cache bucket and the render target stay sane.
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale.min(16.0)
+    } else {
+        1.0
+    };
     let scale_bucket = (scale * 100.0).round() as u32;
     let rotation_bucket = rotation_deg.rem_euclid(360) as u16;
     let key = CacheKey {
@@ -61,9 +68,17 @@ pub fn render_page(
         .get(page_index as u16)
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
 
-    let pixel_scale = scale * PT_TO_PX;
+    let mut pixel_scale = scale * PT_TO_PX;
     let (display_w, display_h) =
         rotated_page_size(page.width().value, page.height().value, rotation_deg);
+    // A malicious PDF can declare an enormous MediaBox. Cap the output so we
+    // never ask pdfium for a multi-gigapixel bitmap (OOM/abort). Scale both
+    // axes down together to preserve aspect ratio.
+    const MAX_DIM: f32 = 10_000.0;
+    let over = (display_w * pixel_scale / MAX_DIM).max(display_h * pixel_scale / MAX_DIM);
+    if over > 1.0 {
+        pixel_scale /= over;
+    }
     let target_w = (display_w * pixel_scale).max(1.0) as i32;
     let target_h = (display_h * pixel_scale).max(1.0) as i32;
 
@@ -90,8 +105,14 @@ pub fn render_page(
     buf.extend_from_slice(&(h as u32).to_be_bytes());
     buf.extend_from_slice(pixels);
 
-    let arc = Arc::new(buf.clone());
-    cache.put(key, arc, buf.len());
+    // Only populate the cache if the document wasn't replaced (a page edit
+    // calls `registry.replace` + `cache.purge_doc`) while this render was in
+    // flight. Otherwise we'd re-insert a stale bitmap under a key the editor
+    // just purged, and the viewer would keep showing the pre-edit page.
+    if matches!(registry.get(doc_id), Ok(current) if Arc::ptr_eq(&current, &handle)) {
+        let arc = Arc::new(buf.clone());
+        cache.put(key, arc, buf.len());
+    }
     Ok(buf)
 }
 

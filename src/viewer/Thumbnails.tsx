@@ -186,7 +186,7 @@ export function Thumbnails() {
 
   const selectedSet = createMemo(() => new Set(tab().selectedPageIndices));
 
-  const runMenuAction = async (action: () => Promise<void> | void) => {
+  const runMenuAction = async (action: () => unknown) => {
     closeMenu();
     await action();
   };

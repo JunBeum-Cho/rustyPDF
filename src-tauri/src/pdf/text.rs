@@ -61,6 +61,19 @@ pub struct SearchHit {
 
 const SNIPPET_RADIUS: usize = 40;
 
+/// Largest char-boundary offset `<= i` (clamped to `s.len()`). Used to map a
+/// byte offset computed against `text.to_lowercase()` back onto the original
+/// `text`: case folding can change byte length (e.g. `İ`→`i̇`, `ẞ`→`ß`), so a
+/// lowercase offset may land mid-char in the original. Slicing there would
+/// panic — and with `panic = "abort"` that takes the whole app down.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn make_snippet(text: &str, byte_start: usize, byte_end: usize) -> String {
     // Walk char boundaries so we don't slice mid-grapheme.
     let pre_start = text[..byte_start]
@@ -200,11 +213,11 @@ pub fn search(
             let abs = search_from + rel;
             let end = abs + needle.len();
             // The lowercase haystack has the same byte boundaries as the
-            // original because to_lowercase() preserves ASCII byte indices for
-            // ASCII queries. For non-ASCII we approximate — good enough for
-            // navigation; precise highlight is a separate concern.
-            let snippet_end = end.min(text.len());
-            let snippet_start = abs.min(text.len());
+            // original for ASCII. For non-ASCII, case folding can shift byte
+            // offsets, so snap both ends to char boundaries of the *original*
+            // text before slicing — approximate highlight, but never panics.
+            let snippet_start = floor_char_boundary(text, abs);
+            let snippet_end = floor_char_boundary(text, end).max(snippet_start);
             hits.push(SearchHit {
                 page: page_index,
                 start: snippet_start,

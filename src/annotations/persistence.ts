@@ -62,7 +62,9 @@ export function installAnnotationAutosave() {
             error instanceof Error ? error.message : String(error),
           );
         } finally {
-          timers.delete(tabId);
+          // Only drop our own entry — a newer timer may already have been
+          // scheduled for this tab under the same key.
+          if (timers.get(tabId) === timer) timers.delete(tabId);
         }
       }, 700);
       timers.set(tabId, timer);

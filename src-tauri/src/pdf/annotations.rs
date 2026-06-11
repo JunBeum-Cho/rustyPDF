@@ -205,6 +205,16 @@ fn subset_and_load(
     cmap_entries.sort_unstable();
     cmap_entries.dedup_by_key(|(cp, _)| *cp);
 
+    // A format-4 subtable encodes its byte length (16 + segCount*8) in a u16,
+    // and one segment per entry caps us at ~8189 entries before the length
+    // field (and the u16 segment arithmetic in `build_cmap_format4`) overflow
+    // and emit a corrupt cmap. Real annotations use a handful of distinct
+    // glyphs; cap defensively against a pathological document.
+    const MAX_CMAP_ENTRIES: usize = 8000;
+    if cmap_entries.len() > MAX_CMAP_ENTRIES {
+        cmap_entries.truncate(MAX_CMAP_ENTRIES);
+    }
+
     let with_cmap = inject_cmap(&subset, &cmap_entries)?;
     document
         .fonts_mut()
@@ -724,16 +734,33 @@ fn draw_text(
 
     let align = align_kind(style);
 
-    // Walk each visual line, place runs left-to-right, advance baseline by
-    // (line's tallest run's font_size * 1.25).
-    let mut current_y = page_height - rect.y - base_font_size;
+    // Mirror the on-screen CSS box model so exported glyphs land where the
+    // editor paints them. The text <div> uses `padding: 4px 6px` and
+    // `line-height: 1.25`, and the editor scales that padding by the zoom
+    // factor — so in page space the insets are a constant 6 (x) / 4 (y) and
+    // each line box is `font_size * LINE_HEIGHT` tall.
+    const PADDING_X: f32 = 6.0;
+    const PADDING_Y: f32 = 4.0;
+    const LINE_HEIGHT: f32 = 1.25;
+    // Fraction of the em the baseline sits below the glyph-box top. Browsers
+    // use the font's own ascent metric (~0.8 em for common sans fonts);
+    // combined with the half-leading this reproduces the editor's baseline.
+    const ASCENT_RATIO: f32 = 0.8;
+
+    let content_x = rect.x + PADDING_X;
+    let content_w = (rect.w - 2.0 * PADDING_X).max(0.0);
+
+    // Top edge of the text content area in PDF space (y grows upward). Each
+    // line consumes `size * LINE_HEIGHT` downward; the baseline within a line
+    // box is offset down by the half-leading plus the font ascent.
+    let mut line_top = page_height - rect.y - PADDING_Y;
 
     for line in lines {
         let runs: Vec<TextRun> = line.runs.into_iter().filter(|r| !r.text.is_empty()).collect();
         if runs.is_empty() {
             // Visible blank line — still advance so the rhythm matches
             // what the user typed.
-            current_y -= base_font_size * 1.25;
+            line_top -= base_font_size * LINE_HEIGHT;
             continue;
         }
 
@@ -779,13 +806,16 @@ fn draw_text(
             placed.push((object, width, run.style));
         }
 
-        // Stage 2 — alignment offset within the rect.
+        // Stage 2 — alignment offset within the padded content box.
         let line_x = match align {
-            "center" => rect.x + (rect.w - total_width) / 2.0,
-            "right" => rect.x + rect.w - total_width,
-            _ => rect.x,
+            "center" => content_x + (content_w - total_width) / 2.0,
+            "right" => content_x + content_w - total_width,
+            _ => content_x,
         };
-        let baseline_y = current_y;
+        // Baseline sits below the line-box top by the half-leading plus the
+        // font ascent — matching where the browser paints the glyphs.
+        let half_leading = (LINE_HEIGHT - 1.0) * 0.5 * line_max_size;
+        let baseline_y = line_top - half_leading - ASCENT_RATIO * line_max_size;
 
         // Stage 3 — translate each run to its final position and draw any
         // per-run underline. Underlines are stroked paths added AFTER the
@@ -827,7 +857,7 @@ fn draw_text(
                 .map_err(|e| PdfError::Pdfium(e.to_string()))?;
         }
 
-        current_y -= line_max_size * 1.25;
+        line_top -= line_max_size * LINE_HEIGHT;
     }
 
     Ok(())

@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, on } from "solid-js";
+import { For, Show, createEffect, createSignal, on, onCleanup } from "solid-js";
 import { activeTab, updateActiveTab } from "../state/document";
 import { setUiStore, uiStore } from "../state/ui";
 import { searchPdf, type SearchHit } from "../ipc/pdf";
@@ -42,6 +42,9 @@ export function SearchPanel() {
     const q = query().trim();
     const tab = activeTab();
     if (timer) clearTimeout(timer);
+    onCleanup(() => {
+      if (timer) clearTimeout(timer);
+    });
     if (!tab || q.length === 0) {
       setHits([]);
       setError(null);
@@ -50,17 +53,22 @@ export function SearchPanel() {
     }
     setLoading(true);
     const docId = tab.docId;
+    const tabId = tab.tabId;
     timer = setTimeout(async () => {
       try {
         const result = await searchPdf(docId, q);
+        // The user may have switched tabs while the search was in flight —
+        // don't paint another document's results into the current panel.
+        if (activeTab()?.tabId !== tabId) return;
         setHits(result);
         setActiveIndex(0);
         setError(null);
       } catch (e) {
+        if (activeTab()?.tabId !== tabId) return;
         setError(e instanceof Error ? e.message : String(e));
         setHits([]);
       } finally {
-        setLoading(false);
+        if (activeTab()?.tabId === tabId) setLoading(false);
       }
     }, DEBOUNCE_MS);
   });
@@ -70,7 +78,13 @@ export function SearchPanel() {
     if (list.length === 0) return;
     const idx = ((i % list.length) + list.length) % list.length;
     setActiveIndex(idx);
-    updateActiveTab((t) => { t.currentPage = list[idx].page; });
+    const tab = activeTab();
+    if (!tab) return;
+    // Clamp: a hit can outlive the page it pointed at (e.g. pages deleted
+    // after the search ran), and an out-of-range currentPage blanks the view.
+    const max = Math.max(0, tab.pageCount - 1);
+    const page = Math.max(0, Math.min(max, list[idx].page));
+    updateActiveTab((t) => { t.currentPage = page; });
   }
 
   function onKey(e: KeyboardEvent) {

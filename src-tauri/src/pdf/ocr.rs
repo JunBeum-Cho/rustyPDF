@@ -92,6 +92,15 @@ fn ocr_sidecar_path(pdf_path: &str) -> PathBuf {
     PathBuf::from(format!("{pdf_path}.ocr.json"))
 }
 
+/// Remove the on-disk OCR sidecar for a path. Called after a structural page
+/// edit (delete/insert/duplicate) shifts page indices: the sidecar is keyed by
+/// page index, so it no longer matches the document and must be discarded
+/// rather than silently reloaded onto the wrong pages. Best-effort — a missing
+/// file is fine.
+pub fn delete_sidecar(pdf_path: &str) {
+    let _ = std::fs::remove_file(ocr_sidecar_path(pdf_path));
+}
+
 pub fn load_sidecar_into_cache(
     cache: &OcrCache,
     doc_id: &str,

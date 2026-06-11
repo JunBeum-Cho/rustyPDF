@@ -91,11 +91,11 @@ const applyEditResult = (
   remapAnnotationsForTab(tab.tabId, result.pageMapping);
 };
 
-export async function copySelectedPages(): Promise<void> {
+export async function copySelectedPages(): Promise<boolean> {
   const tab = activeTab();
-  if (!tab) return;
+  if (!tab) return false;
   const indices = sortedSelection(tab);
-  if (indices.length === 0) return;
+  if (indices.length === 0) return false;
   try {
     const token = await copyPdfPages(tab.docId, indices);
     setPageClipboard({
@@ -104,8 +104,10 @@ export async function copySelectedPages(): Promise<void> {
       sourceTabPath: tab.path,
       copiedAt: Date.now(),
     });
+    return true;
   } catch (error) {
     console.error("copy pages failed", error);
+    return false;
   }
 }
 
@@ -139,7 +141,13 @@ export async function cutSelectedPages(): Promise<void> {
     window.alert("모든 페이지를 잘라낼 수는 없습니다.");
     return;
   }
-  await copySelectedPages();
+  // Only delete if the copy actually landed in the clipboard — otherwise a
+  // failed copy followed by a successful delete silently destroys the pages.
+  const copied = await copySelectedPages();
+  if (!copied) {
+    window.alert("페이지 복사에 실패하여 잘라내기를 취소했습니다.");
+    return;
+  }
   await deleteSelectedPages();
 }
 
@@ -156,6 +164,10 @@ export async function pastePagesAfter(afterIndex?: number): Promise<void> {
     window.alert("클립보드에 페이지가 없습니다.");
     return;
   }
+  // Capture the count alongside the token, before any await — otherwise a
+  // copy during the paste round-trip would change `count` and mis-size the
+  // post-paste selection.
+  const insertedCount = pageClipboard.count;
   const after =
     afterIndex !== undefined
       ? afterIndex
@@ -165,7 +177,6 @@ export async function pastePagesAfter(afterIndex?: number): Promise<void> {
   try {
     const result = await pastePdfPages(tab.docId, after, token);
     const insertedStart = after + 1;
-    const insertedCount = pageClipboard.count;
     const newSelection: number[] = [];
     for (let i = 0; i < insertedCount; i++) newSelection.push(insertedStart + i);
     applyEditResult(tab, result, newSelection, insertedStart);

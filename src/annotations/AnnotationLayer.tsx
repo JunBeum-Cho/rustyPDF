@@ -940,6 +940,11 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     const selected = () => selectedIds().has(annotation.id);
     const isEditing = () => annotationStore.editingId === annotation.id;
     const fontSize = () => (annotation.style.fontSize ?? 16) * props.zoom;
+    // Scale the text box's padding with zoom so its page-space inset stays a
+    // constant 6px (x) / 4px (y) at every zoom level. The PDF exporter assumes
+    // exactly those insets (see draw_text in src-tauri), so keeping them
+    // zoom-invariant here is what makes on-screen and exported positions agree.
+    const textPadding = () => `${4 * props.zoom}px ${6 * props.zoom}px`;
     const strokeWidth = () => Math.max(1, annotation.style.width * props.zoom);
     const shapeProps = {
       class: "annotation-shape",
@@ -1043,6 +1048,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                 style={{
                   color: annotation.style.color,
                   "font-size": `${fontSize()}px`,
+                  padding: textPadding(),
                   "font-family": annotation.style.fontFamily ?? "inherit",
                   "font-weight": annotation.style.fontWeight ?? "normal",
                   "font-style": annotation.style.fontStyle ?? "normal",
@@ -1063,6 +1069,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               style={{
                 color: annotation.style.color,
                 "font-size": `${fontSize()}px`,
+                padding: textPadding(),
                 "font-family": annotation.style.fontFamily ?? "inherit",
                 "font-weight": annotation.style.fontWeight ?? "normal",
                 "font-style": annotation.style.fontStyle ?? "normal",
