@@ -87,6 +87,16 @@ impl ExportFonts {
         if used_chars.is_empty() {
             return;
         }
+        // `draw_text` renders EVERY run of a CJK-bearing annotation with this
+        // one font (font selection is annotation-wide, not per-run), so the
+        // subset must also cover the ASCII — letters, digits, spaces,
+        // punctuation — that shares those annotations. Without it, every
+        // non-CJK char in mixed text ("한글 ABC 123") resolves to `.notdef`
+        // tofu because the injected cmap only maps the >127 codepoints. The
+        // ~95 printable-ASCII glyphs add negligible size.
+        let mut chars = used_chars.clone();
+        chars.extend((0x20u8..=0x7e).map(char::from));
+
         // Order: Korean-specific first (smaller subsets, better hinting),
         // then pan-CJK Noto. We only need ONE that loads.
         const CJK_CANDIDATES: &[&str] = &[
@@ -101,7 +111,7 @@ impl ExportFonts {
             let Ok(bytes) = std::fs::read(path) else {
                 continue;
             };
-            if let Some(token) = subset_and_load(document, &bytes, used_chars) {
+            if let Some(token) = subset_and_load(document, &bytes, &chars) {
                 self.cjk = Some(token);
                 self.cjk_bold = Some(token);
                 return;
@@ -1294,6 +1304,63 @@ mod tests {
                 "codepoint {c:?} must map to its remapped glyph id"
             );
         }
+    }
+
+    /// Regression for mixed CJK + ASCII export corruption. `draw_text` draws
+    /// every run of a CJK-bearing annotation with the embedded CJK subset, so
+    /// that subset must resolve the ASCII (letters / digits / spaces) sharing
+    /// the annotation — not just the >127 codepoints. `ensure_cjk` folds
+    /// printable ASCII into the subset for exactly this reason; here we
+    /// reproduce that char set and assert the embedded font maps Korean AND
+    /// the ASCII it mixes with. Skips if no system CJK font is installed.
+    #[test]
+    fn cjk_subset_covers_ascii_for_mixed_annotations() {
+        const CANDIDATES: &[&str] = &[
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        ];
+        let Some(font_bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+            eprintln!("skipping: no system CJK font available");
+            return;
+        };
+
+        // The >127 chars an annotation contributes to the CJK subset...
+        let mut chars: BTreeSet<char> = "한글 ABC 123"
+            .chars()
+            .filter(|c| (*c as u32) > 127)
+            .collect();
+        // ...plus the printable ASCII `ensure_cjk` now folds in.
+        chars.extend((0x20u8..=0x7e).map(char::from));
+
+        let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+        let mut remapper = subsetter::GlyphRemapper::new();
+        let mut char_old: Vec<(u32, u16)> = Vec::new();
+        for &c in &chars {
+            if let Some(g) = face.glyph_index(c) {
+                remapper.remap(g.0);
+                char_old.push((c as u32, g.0));
+            }
+        }
+        let subset = subsetter::subset(&font_bytes, 0, &remapper).unwrap();
+        let mut entries: Vec<(u16, u16)> = char_old
+            .iter()
+            .filter(|(cp, _)| *cp <= 0xFFFF)
+            .filter_map(|(cp, old)| remapper.get(*old).map(|n| (*cp as u16, n)))
+            .collect();
+        entries.sort_unstable();
+        entries.dedup_by_key(|(cp, _)| *cp);
+        let with_cmap = inject_cmap(&subset, &entries).unwrap();
+        let f = ttf_parser::Face::parse(&with_cmap, 0).unwrap();
+
+        assert!(f.glyph_index('한').is_some(), "Korean codepoint must map");
+        assert!(
+            f.glyph_index('A').is_some(),
+            "ASCII letter must map in the CJK subset (mixed-text fix)"
+        );
+        assert!(f.glyph_index('1').is_some(), "ASCII digit must map");
+        assert!(f.glyph_index(' ').is_some(), "space (U+0020) must map");
     }
 
     #[test]
