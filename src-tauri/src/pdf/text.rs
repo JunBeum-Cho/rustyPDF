@@ -2,6 +2,7 @@ use super::document::DocRegistry;
 use super::ocr::{OcrCache, OcrLine};
 use super::{create_pdfium, PdfError};
 use parking_lot::RwLock;
+use pdfium_render::prelude::PdfPageRenderRotation;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +10,12 @@ use std::sync::Arc;
 /// Per-document, per-page extracted text. We extract lazily — first call to
 /// `search` against a doc warms the entire cache, subsequent searches hit RAM.
 pub struct TextCache {
-    inner: RwLock<HashMap<String, Arc<Vec<String>>>>,
+    inner: RwLock<HashMap<String, TextCacheEntry>>,
+}
+
+struct TextCacheEntry {
+    revision: u64,
+    pages: Arc<Vec<String>>,
 }
 
 impl TextCache {
@@ -23,14 +29,22 @@ impl TextCache {
         self.inner.write().remove(doc_id);
     }
 
-    fn get(&self, doc_id: &str) -> Option<Arc<Vec<String>>> {
-        self.inner.read().get(doc_id).cloned()
+    fn get(&self, doc_id: &str, revision: u64) -> Option<Arc<Vec<String>>> {
+        self.inner
+            .read()
+            .get(doc_id)
+            .filter(|entry| entry.revision == revision)
+            .map(|entry| Arc::clone(&entry.pages))
     }
 
-    fn put(&self, doc_id: &str, pages: Vec<String>) {
-        self.inner
-            .write()
-            .insert(doc_id.to_string(), Arc::new(pages));
+    fn put(&self, doc_id: &str, revision: u64, pages: Vec<String>) {
+        self.inner.write().insert(
+            doc_id.to_string(),
+            TextCacheEntry {
+                revision,
+                pages: Arc::new(pages),
+            },
+        );
     }
 }
 
@@ -110,9 +124,12 @@ fn make_snippet(text: &str, byte_start: usize, byte_end: usize) -> String {
 pub fn extract_native_text_lines(
     registry: &DocRegistry,
     doc_id: &str,
+    expected_revision: u64,
     page_index: usize,
 ) -> Result<Vec<OcrLine>, PdfError> {
-    let handle = registry.get(doc_id)?;
+    let mutation_lock = registry.mutation_lock(doc_id)?;
+    let _mutation_guard = mutation_lock.lock();
+    let handle = registry.get_at_revision(doc_id, expected_revision)?;
     if page_index >= handle.page_count {
         return Err(PdfError::InvalidPage(page_index));
     }
@@ -124,8 +141,24 @@ pub fn extract_native_text_lines(
         .pages()
         .get(page_index as u16)
         .map_err(|e| PdfError::Pdfium(e.to_string()))?;
-    let page_w = page.width().value;
-    let page_h = page.height().value;
+    let display_w = page.width().value;
+    let display_h = page.height().value;
+    let rotation = page
+        .rotation()
+        .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+    // Pdfium exposes width/height after intrinsic `/Rotate`, while text
+    // segment bounds remain in the page's raw PDF coordinate system. Native
+    // text lines are intentionally normalized in that raw space; the
+    // frontend rotates the whole selectable layer with the page so glyph
+    // orientation and bounding boxes stay aligned.
+    let (page_w, page_h) = if matches!(
+        rotation,
+        PdfPageRenderRotation::Degrees90 | PdfPageRenderRotation::Degrees270
+    ) {
+        (display_h, display_w)
+    } else {
+        (display_w, display_h)
+    };
     if page_w <= 0.0 || page_h <= 0.0 {
         return Ok(Vec::new());
     }
@@ -149,10 +182,10 @@ pub fn extract_native_text_lines(
         if segment_text.is_empty() {
             continue;
         }
-        let left = bounds.left.value;
-        let right = bounds.right.value;
-        let top = bounds.top.value;
-        let bottom = bounds.bottom.value;
+        let left = bounds.left().value;
+        let right = bounds.right().value;
+        let top = bounds.top().value;
+        let bottom = bounds.bottom().value;
         let x = (left / page_w).clamp(0.0, 1.0);
         let w = ((right - left) / page_w).clamp(0.0, 1.0);
         // PDF Y-axis is bottom-up, screen is top-down → flip and use top
@@ -178,15 +211,21 @@ pub fn search(
     registry: &DocRegistry,
     ocr: &OcrCache,
     doc_id: &str,
+    expected_revision: u64,
     query: &str,
 ) -> Result<Vec<SearchHit>, PdfError> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let pages = match cache.get(doc_id) {
+    // Structural edits invalidate both native and OCR page-indexed text. Hold
+    // the same document lock they use until this cache read/extract/insert is
+    // complete, preventing a stale extraction from landing after invalidation.
+    let mutation_lock = registry.mutation_lock(doc_id)?;
+    let _mutation_guard = mutation_lock.lock();
+    let handle = registry.get_at_revision(doc_id, expected_revision)?;
+    let pages = match cache.get(doc_id, handle.revision) {
         Some(p) => p,
         None => {
-            let handle = registry.get(doc_id)?;
             let mut pages = extract_all_pages(&handle.bytes)?;
             // For pages where pdfium found no embedded text (typical of
             // scanned PDFs), substitute the OCR cache so search hits cover
@@ -194,13 +233,13 @@ pub fn search(
             // simply won't match them.
             for (i, text) in pages.iter_mut().enumerate() {
                 if text.trim().is_empty() {
-                    if let Some(ocr_text) = ocr.get_text(doc_id, i) {
+                    if let Some(ocr_text) = ocr.get_text(doc_id, i, handle.revision) {
                         *text = ocr_text;
                     }
                 }
             }
-            cache.put(doc_id, pages);
-            cache.get(doc_id).expect("just inserted")
+            cache.put(doc_id, handle.revision, pages);
+            cache.get(doc_id, handle.revision).expect("just inserted")
         }
     };
 
@@ -231,4 +270,68 @@ pub fn search(
         }
     }
     Ok(hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdf::document::DocHandle;
+    use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints};
+
+    fn extract_test_line(rotation: PdfPageRenderRotation) -> OcrLine {
+        let bytes = {
+            let pdfium = create_pdfium().unwrap();
+            let mut document = pdfium.create_new_pdf().unwrap();
+            let font = document.fonts_mut().helvetica();
+            let mut page = document
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .unwrap();
+            page.objects_mut()
+                .create_text_object(
+                    PdfPoints::new(100.0),
+                    PdfPoints::new(200.0),
+                    "ROTATION TEST",
+                    font,
+                    PdfPoints::new(24.0),
+                )
+                .unwrap();
+            page.set_rotation(rotation);
+            drop(page);
+            document.save_to_bytes().unwrap()
+        };
+
+        let registry = DocRegistry::new();
+        let disk_fingerprint = crate::storage::sha256_hex(&bytes);
+        let doc_id = registry.insert(DocHandle {
+            path: String::new(),
+            bytes: Arc::new(bytes),
+            page_count: 1,
+            pages: Vec::new(),
+            disk_fingerprint,
+            revision: 0,
+        });
+        extract_native_text_lines(&registry, &doc_id, 0, 0)
+            .unwrap()
+            .into_iter()
+            .find(|line| line.text.contains("ROTATION TEST"))
+            .expect("test text should be extractable")
+    }
+
+    #[test]
+    fn native_text_bounds_stay_in_raw_space_for_intrinsic_rotation() {
+        let expected = extract_test_line(PdfPageRenderRotation::None);
+        for rotation in [
+            PdfPageRenderRotation::Degrees90,
+            PdfPageRenderRotation::Degrees180,
+            PdfPageRenderRotation::Degrees270,
+        ] {
+            let actual = extract_test_line(rotation);
+            assert_eq!(actual.text, expected.text);
+            assert!((actual.x - expected.x).abs() < 0.001, "{rotation:?}");
+            assert!((actual.y - expected.y).abs() < 0.001, "{rotation:?}");
+            assert!((actual.w - expected.w).abs() < 0.001, "{rotation:?}");
+            assert!((actual.h - expected.h).abs() < 0.001, "{rotation:?}");
+        }
+    }
 }

@@ -10,6 +10,7 @@ interface Props {
   width: number; // rendered px
   height: number;
   docId: string;
+  revision: number;
   contentVersion: number;
   zoom: number;
   rotation: 0 | 90 | 180 | 270;
@@ -90,7 +91,7 @@ export function PageCanvas(props: Props) {
     const seq = ++renderSeq;
     (async () => {
       try {
-        const buf = await renderPage(id, idx, bucket, rot);
+        const buf = await renderPage(id, props.revision, idx, bucket, rot);
         // Skip if this run was superseded — a newer render (zoom/rotation/
         // visibility change) must not be overwritten by an older one that
         // resolves late.
@@ -119,6 +120,7 @@ export function PageCanvas(props: Props) {
       <TextLayer
         pageIndex={props.index}
         page={props.page}
+        revision={props.revision}
         contentVersion={props.contentVersion}
         zoom={props.zoom}
         rotation={props.rotation}

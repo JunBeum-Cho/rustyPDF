@@ -250,8 +250,8 @@ fn build_cmap_format4(entries: &[(u16, u16)]) -> Vec<u8> {
 
     let mut sub = Vec::new();
     sub.extend_from_slice(&4u16.to_be_bytes()); // format
-    // length = 14-byte fixed header + reservedPad (2) + 4 u16 arrays of
-    // seg_count entries each (endCode, startCode, idDelta, idRangeOffset).
+                                                // length = 14-byte fixed header + reservedPad (2) + 4 u16 arrays of
+                                                // seg_count entries each (endCode, startCode, idDelta, idRangeOffset).
     let length = 16 + (seg_count as usize) * 8;
     sub.extend_from_slice(&(length as u16).to_be_bytes());
     sub.extend_from_slice(&0u16.to_be_bytes()); // language
@@ -278,7 +278,7 @@ fn build_cmap_format4(entries: &[(u16, u16)]) -> Vec<u8> {
         sub.extend_from_slice(&delta.to_be_bytes());
     }
     sub.extend_from_slice(&1u16.to_be_bytes()); // terminating segment delta
-    // idRangeOffset[]: 0 everywhere (we use idDelta directly).
+                                                // idRangeOffset[]: 0 everywhere (we use idDelta directly).
     for _ in entries {
         sub.extend_from_slice(&0u16.to_be_bytes());
     }
@@ -543,6 +543,34 @@ fn default_font_size() -> f32 {
     16.0
 }
 
+/// Annotation geometry is stored in the coordinate system the user sees:
+/// top-left origin, after the PDF page's intrinsic `/Rotate` has been
+/// applied. Drawing helpers below first create objects in an equivalent
+/// bottom-left display space. This matrix maps those objects back into the
+/// page's raw PDF coordinate space. When a PDF viewer applies `/Rotate`, the
+/// two transforms cancel and text/images remain upright exactly where the
+/// editor placed them.
+fn display_to_raw_page_matrix(
+    rotation: PdfPageRenderRotation,
+    display_width: f32,
+    display_height: f32,
+) -> Option<[f32; 6]> {
+    match rotation {
+        PdfPageRenderRotation::None => None,
+        PdfPageRenderRotation::Degrees90 => {
+            // raw x = display_height - display y; raw y = display x
+            Some([0.0, 1.0, -1.0, 0.0, display_height, 0.0])
+        }
+        PdfPageRenderRotation::Degrees180 => {
+            Some([-1.0, 0.0, 0.0, -1.0, display_width, display_height])
+        }
+        PdfPageRenderRotation::Degrees270 => {
+            // raw x = display y; raw y = display_width - display x
+            Some([0.0, -1.0, 1.0, 0.0, 0.0, display_width])
+        }
+    }
+}
+
 pub fn flatten_pdf_bytes(source_bytes: &[u8], data: Value) -> Result<Vec<u8>, PdfError> {
     let sidecar: AnnotationSidecar = serde_json::from_value(data)?;
     let pdfium = create_pdfium()?;
@@ -586,10 +614,30 @@ pub fn flatten_pdf_bytes(source_bytes: &[u8], data: Value) -> Result<Vec<u8>, Pd
             .get(page_index as PdfPageIndex)
             .map_err(|e| PdfError::Pdfium(e.to_string()))?;
         page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
-        let page_height = page.height().value;
+        let display_width = page.width().value;
+        let display_height = page.height().value;
+        let rotation = page
+            .rotation()
+            .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+        let first_annotation_object = page.objects().len();
 
         for annotation in annotations {
-            draw_annotation(&mut page, &annotation, page_height, &fonts)?;
+            draw_annotation(&mut page, &annotation, display_height, &fonts)?;
+        }
+
+        if let Some([a, b, c, d, e, f]) =
+            display_to_raw_page_matrix(rotation, display_width, display_height)
+        {
+            let last_annotation_object = page.objects().len();
+            let objects = page.objects();
+            for index in first_annotation_object..last_annotation_object {
+                let mut object = objects
+                    .get(index)
+                    .map_err(|error| PdfError::Pdfium(error.to_string()))?;
+                object
+                    .transform(a, b, c, d, e, f)
+                    .map_err(|error| PdfError::Pdfium(error.to_string()))?;
+            }
         }
 
         page.regenerate_content()
@@ -602,11 +650,8 @@ pub fn flatten_pdf_bytes(source_bytes: &[u8], data: Value) -> Result<Vec<u8>, Pd
     Ok(bytes)
 }
 
-pub fn export_flattened_pdf(
-    source_path: &str,
-    target_path: &str,
-    data: Value,
-) -> Result<(), PdfError> {
+#[cfg(test)]
+fn export_flattened_pdf(source_path: &str, target_path: &str, data: Value) -> Result<(), PdfError> {
     // Read source bytes upfront so we don't hold an OS file handle on the
     // source. Required when source_path == target_path (the in-place save
     // flow): `std::fs::write` below truncates the file, and a still-open
@@ -705,12 +750,7 @@ fn draw_text(
     // Draw background/fill if present
     if let Some(fill) = annotation_fill_color(style) {
         page.objects_mut()
-            .create_path_object_rect(
-                rect_to_pdf(rect, page_height),
-                None,
-                None,
-                Some(fill),
-            )
+            .create_path_object_rect(rect_to_pdf(rect, page_height), None, None, Some(fill))
             .map_err(|e| PdfError::Pdfium(e.to_string()))?;
     }
 
@@ -766,7 +806,11 @@ fn draw_text(
     let mut line_top = page_height - rect.y - PADDING_Y;
 
     for line in lines {
-        let runs: Vec<TextRun> = line.runs.into_iter().filter(|r| !r.text.is_empty()).collect();
+        let runs: Vec<TextRun> = line
+            .runs
+            .into_iter()
+            .filter(|r| !r.text.is_empty())
+            .collect();
         if runs.is_empty() {
             // Visible blank line — still advance so the rhythm matches
             // what the user typed.
@@ -809,9 +853,7 @@ fn draw_text(
             let width = object
                 .width()
                 .map(|w| w.value)
-                .unwrap_or_else(|_| {
-                    run.style.font_size * 0.55 * run.text.chars().count() as f32
-                });
+                .unwrap_or_else(|_| run.style.font_size * 0.55 * run.text.chars().count() as f32);
             total_width += width;
             placed.push((object, width, run.style));
         }
@@ -1372,11 +1414,20 @@ mod tests {
         assert_eq!(&table[0..2], &0u16.to_be_bytes(), "cmap version");
         assert_eq!(&table[2..4], &1u16.to_be_bytes(), "numTables");
         assert_eq!(&table[4..6], &3u16.to_be_bytes(), "platformID = Windows");
-        assert_eq!(&table[6..8], &1u16.to_be_bytes(), "encodingID = Unicode BMP");
+        assert_eq!(
+            &table[6..8],
+            &1u16.to_be_bytes(),
+            "encodingID = Unicode BMP"
+        );
         let sub_off = u32::from_be_bytes(table[8..12].try_into().unwrap()) as usize;
         assert_eq!(sub_off, 12);
-        assert_eq!(&table[sub_off..sub_off + 2], &4u16.to_be_bytes(), "format 4");
-        let declared = u16::from_be_bytes(table[sub_off + 2..sub_off + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &table[sub_off..sub_off + 2],
+            &4u16.to_be_bytes(),
+            "format 4"
+        );
+        let declared =
+            u16::from_be_bytes(table[sub_off + 2..sub_off + 4].try_into().unwrap()) as usize;
         assert_eq!(
             declared,
             table.len() - sub_off,
@@ -1410,11 +1461,7 @@ mod tests {
 
     #[test]
     fn decodes_png_data_url() {
-        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
-            1,
-            1,
-            Rgba([10, 20, 30, 255]),
-        ));
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([10, 20, 30, 255])));
         let mut bytes = Cursor::new(Vec::new());
         source
             .write_to(&mut bytes, image::ImageFormat::Png)
@@ -1443,11 +1490,134 @@ mod tests {
 
     #[test]
     fn applies_image_opacity_to_alpha() {
-        let source =
-            DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 200])));
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 200])));
         let output = apply_image_opacity(source, 0.5).to_rgba8();
 
         assert_eq!(output.get_pixel(0, 0).0, [1, 2, 3, 100]);
+    }
+
+    #[test]
+    fn flattened_annotations_keep_visible_position_and_orientation_on_rotated_pages() {
+        let mut stamp = RgbaImage::from_pixel(20, 10, Rgba([255, 0, 0, 255]));
+        for y in 0..stamp.height() {
+            for x in 10..stamp.width() {
+                stamp.put_pixel(x, y, Rgba([0, 0, 255, 255]));
+            }
+        }
+        let mut image_bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(stamp)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let src = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(image_bytes.into_inner())
+        );
+
+        for rotation in [
+            PdfPageRenderRotation::None,
+            PdfPageRenderRotation::Degrees90,
+            PdfPageRenderRotation::Degrees180,
+            PdfPageRenderRotation::Degrees270,
+        ] {
+            let pdfium = create_pdfium().unwrap();
+            let mut source = pdfium.create_new_pdf().unwrap();
+            let mut page = source
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .unwrap();
+            page.set_rotation(rotation);
+            drop(page);
+            let source_bytes = source.save_to_bytes().unwrap();
+            drop(source);
+            drop(pdfium);
+
+            let data = json!({
+                "annotations": [
+                    {
+                        "page": 0,
+                        "type": "image",
+                        "rect": { "x": 72.0, "y": 72.0, "w": 120.0, "h": 60.0 },
+                        "style": { "opacity": 1.0 },
+                        "payload": { "imageSrc": src }
+                    },
+                    {
+                        "page": 0,
+                        "type": "rect",
+                        "rect": { "x": 72.0, "y": 180.0, "w": 80.0, "h": 45.0 },
+                        "style": {
+                            "color": "#00aa00",
+                            "fill": "#00aa00",
+                            "width": 2.0,
+                            "opacity": 1.0
+                        }
+                    },
+                    {
+                        "page": 0,
+                        "type": "text",
+                        "rect": { "x": 250.0, "y": 72.0, "w": 220.0, "h": 70.0 },
+                        "style": {
+                            "color": "#000000",
+                            "fontSize": 32.0,
+                            "opacity": 1.0
+                        },
+                        "payload": { "text": "TEXT" }
+                    }
+                ]
+            });
+            let flattened = flatten_pdf_bytes(&source_bytes, data).unwrap();
+            let pdfium = create_pdfium().unwrap();
+            let saved = pdfium.load_pdf_from_byte_slice(&flattened, None).unwrap();
+            let page = saved.pages().get(0).unwrap();
+            let target_width = page.width().value.round() as i32;
+            let rendered = page
+                .render_with_config(&PdfRenderConfig::new().set_target_width(target_width))
+                .unwrap()
+                .as_image()
+                .into_rgba8();
+
+            let left = rendered.get_pixel(92, 100).0;
+            let right = rendered.get_pixel(172, 100).0;
+            assert!(
+                left[0] > 200 && left[1] < 50 && left[2] < 50,
+                "expected visible left side to be red for {rotation:?}, got {left:?}"
+            );
+            assert!(
+                right[0] < 50 && right[1] < 50 && right[2] > 200,
+                "expected visible right side to be blue for {rotation:?}, got {right:?}"
+            );
+
+            let shape = rendered.get_pixel(110, 200).0;
+            assert!(
+                shape[0] < 50 && shape[1] > 120 && shape[2] < 50,
+                "expected visible rectangle to be green for {rotation:?}, got {shape:?}"
+            );
+
+            // An upright horizontal word has a much wider ink bbox than it
+            // is tall. If the display-to-raw transform misses the page's
+            // intrinsic rotation, this ratio swaps on 90°/270° pages.
+            let mut ink_bounds: Option<(u32, u32, u32, u32)> = None;
+            for y in 65..145 {
+                for x in 245..475 {
+                    let pixel = rendered.get_pixel(x, y).0;
+                    if pixel[0] < 80 && pixel[1] < 80 && pixel[2] < 80 {
+                        ink_bounds = Some(match ink_bounds {
+                            Some((min_x, min_y, max_x, max_y)) => {
+                                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                            }
+                            None => (x, y, x, y),
+                        });
+                    }
+                }
+            }
+            let (min_x, min_y, max_x, max_y) =
+                ink_bounds.unwrap_or_else(|| panic!("text ink missing for {rotation:?}"));
+            let ink_width = max_x - min_x + 1;
+            let ink_height = max_y - min_y + 1;
+            assert!(
+                ink_width > ink_height * 2,
+                "expected upright horizontal text for {rotation:?}, ink bbox was {ink_width}x{ink_height}"
+            );
+        }
     }
 
     #[test]
@@ -1470,11 +1640,7 @@ mod tests {
             std::fs::write(&path, source_bytes).unwrap();
         }
 
-        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
-            4,
-            4,
-            Rgba([255, 0, 0, 255]),
-        ));
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255])));
         let mut bytes = Cursor::new(Vec::new());
         source
             .write_to(&mut bytes, image::ImageFormat::Png)

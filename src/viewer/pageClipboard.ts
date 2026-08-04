@@ -6,6 +6,7 @@ import {
   documentStore,
   setDocumentStore,
   updateActiveTab,
+  updateTabById,
   type PageMeta,
   type Tab,
 } from "../state/document";
@@ -13,6 +14,7 @@ import {
   annotationClipboardCopiedAt,
   annotationStore,
   copySelectedAnnotations,
+  createAnnotationId,
   cutSelectedAnnotations,
   duplicateSelectedAnnotations,
   hasAnnotationClipboard,
@@ -25,11 +27,17 @@ import {
   duplicatePdfPages,
   pastePdfPages,
 } from "../ipc/pdf";
+import { enqueueDocumentMutation } from "../ipc/documentMutations";
+import { invalidateOcrForDocument } from "../ocr/ocr";
+import type { Annotation } from "../annotations/types";
 
 interface PageClipboardState {
   token: string | null;
   count: number;
   sourceTabPath: string | null;
+  /** Editable annotations belonging to the copied pages. Their page indices
+   * are local to the clipboard (0..count-1), not the source document. */
+  annotations: Annotation[];
   /** When the page clipboard was last written, for paste arbitration against
    * the annotation clipboard. */
   copiedAt: number;
@@ -39,6 +47,7 @@ const [pageClipboard, setPageClipboard] = createStore<PageClipboardState>({
   token: null,
   count: 0,
   sourceTabPath: null,
+  annotations: [],
   copiedAt: 0,
 });
 
@@ -56,30 +65,82 @@ const sortedSelection = (tab: Tab): number[] => {
   return out;
 };
 
-const applyEditResult = (
+const cloneAnnotations = (items: Annotation[]): Annotation[] =>
+  JSON.parse(JSON.stringify(items)) as Annotation[];
+
+/** Capture sidecar-backed annotations in the exact order in which the
+ * backend copies the selected PDF pages. */
+const snapshotAnnotationsForPages = (
   tab: Tab,
+  pageIndices: number[],
+): Annotation[] => {
+  const clipboardPageBySource = new Map<number, number>();
+  pageIndices.forEach((page, clipboardPage) => {
+    clipboardPageBySource.set(page, clipboardPage);
+  });
+  return cloneAnnotations(tab.annotations.items)
+    .filter((annotation) => clipboardPageBySource.has(annotation.page))
+    .map((annotation) => ({
+      ...annotation,
+      page: clipboardPageBySource.get(annotation.page)!,
+    }));
+};
+
+/** Materialize a clipboard annotation snapshot on newly inserted pages.
+ * Fresh IDs keep the originals and pasted copies independently editable. */
+const materializePageAnnotations = (
+  snapshot: Annotation[],
+  insertedStart: number,
+): Annotation[] =>
+  cloneAnnotations(snapshot).map((annotation) => ({
+    ...annotation,
+    id: createAnnotationId(),
+    page: insertedStart + annotation.page,
+  }));
+
+const applyEditResult = (
+  tabId: string,
+  expectedDocId: string,
+  expectedRevision: number,
   result: {
     id: string;
+    revision: number;
     path: string;
     pageCount: number;
-    pages: { index: number; width: number; height: number }[];
+    pages: PageMeta[];
     fileSize: number;
     pageMapping: Array<number | null>;
   },
   newSelection: number[],
   newCurrentPage: number,
+  insertedAnnotations: Annotation[] = [],
 ) => {
   const pages: PageMeta[] = result.pages.map((p) => ({
     index: p.index,
     width: p.width,
     height: p.height,
+    rotation: p.rotation,
   }));
-  updateActiveTab((t) => {
+  const live = documentStore.tabs.find((tab) => tab.tabId === tabId);
+  if (!live) return;
+  if (
+    live.docId !== expectedDocId ||
+    live.revision !== expectedRevision ||
+    result.id !== expectedDocId ||
+    result.revision !== expectedRevision + 1
+  ) {
+    throw new Error(
+      "문서가 편집 응답을 기다리는 동안 변경되어 결과를 적용하지 않았습니다.",
+    );
+  }
+  updateTabById(tabId, (t) => {
     t.docId = result.id;
+    t.revision = result.revision;
     t.path = result.path;
     t.pageCount = result.pageCount;
     t.pages = pages;
     t.fileSize = result.fileSize;
+    t.contentVersion += 1;
     t.pageDirty = true;
     t.selectedPageIndices = newSelection;
     t.pageAnchor = newSelection.length > 0 ? newSelection[0] : null;
@@ -88,20 +149,26 @@ const applyEditResult = (
       Math.min(result.pageCount - 1, newCurrentPage),
     );
   });
-  remapAnnotationsForTab(tab.tabId, result.pageMapping);
+  remapAnnotationsForTab(tabId, result.pageMapping, insertedAnnotations);
+  invalidateOcrForDocument(result.id, result.revision, result.pageCount);
 };
 
-export async function copySelectedPages(): Promise<boolean> {
-  const tab = activeTab();
+async function performCopySelectedPages(
+  tabId: string,
+  selectedIndices?: number[],
+): Promise<boolean> {
+  const tab = documentStore.tabs.find((candidate) => candidate.tabId === tabId);
   if (!tab) return false;
-  const indices = sortedSelection(tab);
+  const indices = selectedIndices ?? sortedSelection(tab);
   if (indices.length === 0) return false;
+  const annotationSnapshot = snapshotAnnotationsForPages(tab, indices);
   try {
-    const token = await copyPdfPages(tab.docId, indices);
+    const token = await copyPdfPages(tab.docId, tab.revision, indices);
     setPageClipboard({
       token,
       count: indices.length,
       sourceTabPath: tab.path,
+      annotations: annotationSnapshot,
       copiedAt: Date.now(),
     });
     return true;
@@ -111,20 +178,44 @@ export async function copySelectedPages(): Promise<boolean> {
   }
 }
 
-export async function deleteSelectedPages(): Promise<void> {
+export function copySelectedPages(): Promise<boolean> {
   const tab = activeTab();
+  if (!tab) return Promise.resolve(false);
+  return enqueueDocumentMutation(tab.tabId, () =>
+    performCopySelectedPages(tab.tabId),
+  );
+}
+
+async function performDeleteSelectedPages(
+  tabId: string,
+  selectedIndices?: number[],
+): Promise<void> {
+  const tab = documentStore.tabs.find((candidate) => candidate.tabId === tabId);
   if (!tab) return;
-  const indices = sortedSelection(tab);
+  const indices = selectedIndices ?? sortedSelection(tab);
   if (indices.length === 0) return;
   if (indices.length >= tab.pageCount) {
     window.alert("모든 페이지를 삭제할 수는 없습니다.");
     return;
   }
   try {
-    const result = await deletePdfPages(tab.docId, indices);
+    const expectedDocId = tab.docId;
+    const expectedRevision = tab.revision;
+    const result = await deletePdfPages(
+      expectedDocId,
+      expectedRevision,
+      indices,
+    );
     const firstDeleted = indices[0];
     const newCurrent = Math.min(firstDeleted, result.pageCount - 1);
-    applyEditResult(tab, result, [], newCurrent);
+    applyEditResult(
+      tabId,
+      expectedDocId,
+      expectedRevision,
+      result,
+      [],
+      newCurrent,
+    );
   } catch (error) {
     console.error("delete pages failed", error);
     window.alert(
@@ -133,22 +224,39 @@ export async function deleteSelectedPages(): Promise<void> {
   }
 }
 
-export async function cutSelectedPages(): Promise<void> {
+export function deleteSelectedPages(): Promise<void> {
   const tab = activeTab();
+  if (!tab) return Promise.resolve();
+  return enqueueDocumentMutation(tab.tabId, () =>
+    performDeleteSelectedPages(tab.tabId),
+  );
+}
+
+async function performCutSelectedPages(tabId: string): Promise<void> {
+  const tab = documentStore.tabs.find((candidate) => candidate.tabId === tabId);
   if (!tab) return;
   if (tab.selectedPageIndices.length === 0) return;
   if (tab.selectedPageIndices.length >= tab.pageCount) {
     window.alert("모든 페이지를 잘라낼 수는 없습니다.");
     return;
   }
+  const indices = sortedSelection(tab);
   // Only delete if the copy actually landed in the clipboard — otherwise a
   // failed copy followed by a successful delete silently destroys the pages.
-  const copied = await copySelectedPages();
+  const copied = await performCopySelectedPages(tabId, indices);
   if (!copied) {
     window.alert("페이지 복사에 실패하여 잘라내기를 취소했습니다.");
     return;
   }
-  await deleteSelectedPages();
+  await performDeleteSelectedPages(tabId, indices);
+}
+
+export function cutSelectedPages(): Promise<void> {
+  const tab = activeTab();
+  if (!tab) return Promise.resolve();
+  return enqueueDocumentMutation(tab.tabId, () =>
+    performCutSelectedPages(tab.tabId),
+  );
 }
 
 /**
@@ -156,57 +264,108 @@ export async function cutSelectedPages(): Promise<void> {
  * Defaults to "after the current selection's last page" or "after the current
  * page" if nothing is selected.
  */
-export async function pastePagesAfter(afterIndex?: number): Promise<void> {
+export function pastePagesAfter(afterIndex?: number): Promise<void> {
   const tab = activeTab();
-  if (!tab) return;
+  if (!tab) return Promise.resolve();
+  const tabId = tab.tabId;
   const token = pageClipboard.token;
   if (!token) {
     window.alert("클립보드에 페이지가 없습니다.");
-    return;
+    return Promise.resolve();
   }
-  // Capture the count alongside the token, before any await — otherwise a
-  // copy during the paste round-trip would change `count` and mis-size the
-  // post-paste selection.
-  const insertedCount = pageClipboard.count;
-  const after =
-    afterIndex !== undefined
-      ? afterIndex
-      : tab.selectedPageIndices.length > 0
-        ? Math.max(...tab.selectedPageIndices)
-        : tab.currentPage;
-  try {
-    const result = await pastePdfPages(tab.docId, after, token);
-    const insertedStart = after + 1;
-    const newSelection: number[] = [];
-    for (let i = 0; i < insertedCount; i++) newSelection.push(insertedStart + i);
-    applyEditResult(tab, result, newSelection, insertedStart);
-  } catch (error) {
-    console.error("paste pages failed", error);
-    window.alert(
-      `페이지 붙여넣기 실패: ${error instanceof Error ? error.message : String(error)}`,
+  // Capture the annotation payload alongside the token before any await. A
+  // later copy may replace the visible clipboard while this paste is queued.
+  const annotationSnapshot = cloneAnnotations(pageClipboard.annotations);
+  return enqueueDocumentMutation(tabId, async () => {
+    const current = documentStore.tabs.find(
+      (candidate) => candidate.tabId === tabId,
     );
-  }
+    if (!current) return;
+    const after =
+      afterIndex !== undefined
+        ? afterIndex
+        : current.selectedPageIndices.length > 0
+          ? Math.max(...current.selectedPageIndices)
+          : current.currentPage;
+    try {
+      const expectedDocId = current.docId;
+      const expectedRevision = current.revision;
+      const result = await pastePdfPages(
+        expectedDocId,
+        expectedRevision,
+        after,
+        token,
+      );
+      // The backend clamps an out-of-range afterIndex to the document bounds.
+      // Mirror that exact insertion point for selection and annotation pages.
+      const insertedStart = Math.max(
+        0,
+        Math.min(current.pageCount, after + 1),
+      );
+      const actualInsertedCount = result.pageCount - current.pageCount;
+      const newSelection: number[] = [];
+      for (let i = 0; i < actualInsertedCount; i++) {
+        newSelection.push(insertedStart + i);
+      }
+      applyEditResult(
+        tabId,
+        expectedDocId,
+        expectedRevision,
+        result,
+        newSelection,
+        insertedStart,
+        materializePageAnnotations(annotationSnapshot, insertedStart),
+      );
+    } catch (error) {
+      console.error("paste pages failed", error);
+      window.alert(
+        `페이지 붙여넣기 실패: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
 }
 
-export async function duplicateSelectedPages(): Promise<void> {
+export function duplicateSelectedPages(): Promise<void> {
   const tab = activeTab();
-  if (!tab) return;
-  const indices = sortedSelection(tab);
-  if (indices.length === 0) return;
-  try {
-    const result = await duplicatePdfPages(tab.docId, indices);
-    const insertedStart = indices[indices.length - 1] + 1;
-    const newSelection: number[] = [];
-    for (let i = 0; i < indices.length; i++) {
-      newSelection.push(insertedStart + i);
-    }
-    applyEditResult(tab, result, newSelection, insertedStart);
-  } catch (error) {
-    console.error("duplicate pages failed", error);
-    window.alert(
-      `페이지 복제 실패: ${error instanceof Error ? error.message : String(error)}`,
+  if (!tab) return Promise.resolve();
+  const tabId = tab.tabId;
+  return enqueueDocumentMutation(tabId, async () => {
+    const current = documentStore.tabs.find(
+      (candidate) => candidate.tabId === tabId,
     );
-  }
+    if (!current) return;
+    const indices = sortedSelection(current);
+    if (indices.length === 0) return;
+    const annotationSnapshot = snapshotAnnotationsForPages(current, indices);
+    try {
+      const expectedDocId = current.docId;
+      const expectedRevision = current.revision;
+      const result = await duplicatePdfPages(
+        expectedDocId,
+        expectedRevision,
+        indices,
+      );
+      const insertedStart = indices[indices.length - 1] + 1;
+      const newSelection: number[] = [];
+      for (let i = 0; i < indices.length; i++) {
+        newSelection.push(insertedStart + i);
+      }
+      applyEditResult(
+        tabId,
+        expectedDocId,
+        expectedRevision,
+        result,
+        newSelection,
+        insertedStart,
+        materializePageAnnotations(annotationSnapshot, insertedStart),
+      );
+    } catch (error) {
+      console.error("duplicate pages failed", error);
+      window.alert(
+        `페이지 복제 실패: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
 }
 
 // Thumbnail multi-selection helpers

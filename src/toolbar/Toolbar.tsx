@@ -17,6 +17,7 @@ import { applyTheme, setUiStore, uiStore } from "../state/ui";
 import { requestOpenPdfDialog, saveActivePdf } from "../ipc/pdf";
 import { AnnotationToolbar } from "../annotations/AnnotationToolbar";
 import { OcrButton } from "../ocr/OcrButton";
+import { rotateDocument } from "../viewer/pageRotation";
 import "./toolbar.css";
 
 function cycleTheme() {
@@ -44,13 +45,6 @@ function zoomOut() {
   if (!tab) return;
   const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
   if (prev) updateActiveTab((t) => { t.zoom = prev; });
-}
-
-function rotateRight() {
-  const tab = activeTab();
-  if (!tab) return;
-  const r = ((tab.rotation + 90) % 360) as 0 | 90 | 180 | 270;
-  updateActiveTab((t) => { t.rotation = r; });
 }
 
 const ICON_SIZE = 16;
@@ -161,8 +155,8 @@ export function Toolbar() {
               </button>
               <button
                 class="toolbar-btn icon-only"
-                onClick={rotateRight}
-                title="회전 (R)"
+                onClick={() => void rotateDocument(1)}
+                title="문서 시계 방향 회전 (R)"
               >
                 <RotateCw size={ICON_SIZE} />
               </button>

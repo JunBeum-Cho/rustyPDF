@@ -18,6 +18,7 @@ interface ThumbnailCanvasProps {
   page: PageMeta;
   index: number;
   docId: string;
+  revision: number;
   contentVersion: number;
   rotation: 0 | 90 | 180 | 270;
   thumbWidth: number;
@@ -86,7 +87,13 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
     let cancelled = false;
     (async () => {
       try {
-        const buf = await renderPage(docId, idx, currentScale, rot);
+        const buf = await renderPage(
+          docId,
+          props.revision,
+          idx,
+          currentScale,
+          rot,
+        );
         if (!cancelled) paintRgba(canvas, buf);
       } catch (error) {
         if (!cancelled) console.error("render thumbnail failed", idx, error);
@@ -217,6 +224,7 @@ export function Thumbnails() {
                 page={page}
                 index={index()}
                 docId={tab().docId}
+                revision={tab().revision}
                 contentVersion={tab().contentVersion}
                 rotation={tab().rotation}
                 thumbWidth={thumbWidth()}

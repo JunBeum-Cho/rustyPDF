@@ -9,6 +9,7 @@ import "./textLayer.css";
 interface Props {
   pageIndex: number;
   page: PageMeta;
+  revision: number;
   contentVersion: number;
   zoom: number;
   rotation: Rotation;
@@ -24,23 +25,51 @@ interface Props {
  * progressively the further you zoom from 100%.
  */
 export function TextLayer(props: Props) {
-  const [lines, setLines] = createSignal<OcrLine[]>([]);
-  const pageWidth = () => props.page.width * props.zoom;
-  const pageHeight = () => props.page.height * props.zoom;
+  type LineSpace = "raw" | "display";
+  const [layerData, setLayerData] = createSignal<{
+    lines: OcrLine[];
+    space: LineSpace;
+  }>({ lines: [], space: "display" });
+
+  // Pdfium reports page width/height *after* the PDF's intrinsic `/Rotate`,
+  // but native text bounds live in the page's unrotated coordinate system.
+  // OCR bounds, on the other hand, already describe the rendered page. Keep
+  // track of which coordinate space we received so the selectable layer is
+  // transformed exactly once.
+  const rawPageWidth = () =>
+    props.page.rotation === 90 || props.page.rotation === 270
+      ? props.page.height
+      : props.page.width;
+  const rawPageHeight = () =>
+    props.page.rotation === 90 || props.page.rotation === 270
+      ? props.page.width
+      : props.page.height;
+  const basePageWidth = () =>
+    (layerData().space === "raw" ? rawPageWidth() : props.page.width) *
+    props.zoom;
+  const basePageHeight = () =>
+    (layerData().space === "raw" ? rawPageHeight() : props.page.height) *
+    props.zoom;
+
+  const layerRotation = (): Rotation => {
+    const intrinsic = layerData().space === "raw" ? props.page.rotation : 0;
+    return ((intrinsic + props.rotation) % 360) as Rotation;
+  };
 
   const rotationTransform = () => {
-    switch (props.rotation) {
+    switch (layerRotation()) {
       case 90:
-        return `translateX(${pageHeight()}px) rotate(90deg)`;
+        return `translateX(${basePageHeight()}px) rotate(90deg)`;
       case 180:
-        return `translate(${pageWidth()}px, ${pageHeight()}px) rotate(180deg)`;
+        return `translate(${basePageWidth()}px, ${basePageHeight()}px) rotate(180deg)`;
       case 270:
-        return `translateY(${pageWidth()}px) rotate(270deg)`;
+        return `translateY(${basePageWidth()}px) rotate(270deg)`;
       default:
         return "none";
     }
   };
 
+  let fetchSequence = 0;
   createEffect(
     on(
       () => {
@@ -49,6 +78,7 @@ export function TextLayer(props: Props) {
         const doc = ocrState.byDoc[tab.docId];
         return [
           tab.docId,
+          props.revision,
           props.pageIndex,
           doc?.done.size ?? 0,
           props.contentVersion,
@@ -56,18 +86,22 @@ export function TextLayer(props: Props) {
       },
       async (deps) => {
         if (!deps) return;
-        const [docId, pageIndex] = deps;
+        const sequence = ++fetchSequence;
+        const [docId, revision, pageIndex] = deps;
         try {
-          const native = await pdfNativeTextLines(docId, pageIndex);
+          const native = await pdfNativeTextLines(docId, revision, pageIndex);
+          if (sequence !== fetchSequence) return;
           if (native.length > 0) {
-            setLines(native);
+            setLayerData({ lines: native, space: "raw" });
             return;
           }
-          const ocr = await ocrPdfLines(docId, pageIndex);
-          setLines(ocr ?? []);
+          const ocr = await ocrPdfLines(docId, revision, pageIndex);
+          if (sequence !== fetchSequence) return;
+          setLayerData({ lines: ocr ?? [], space: "display" });
         } catch (error) {
+          if (sequence !== fetchSequence) return;
           console.warn("text-layer fetch failed", error);
-          setLines([]);
+          setLayerData({ lines: [], space: "display" });
         }
       },
     ),
@@ -77,13 +111,19 @@ export function TextLayer(props: Props) {
     <div
       class="ocr-text-layer"
       style={{
-        width: `${pageWidth()}px`,
-        height: `${pageHeight()}px`,
+        width: `${basePageWidth()}px`,
+        height: `${basePageHeight()}px`,
         transform: rotationTransform(),
       }}
     >
-      <For each={lines()}>
-        {(line) => <Line line={line} pageWidth={pageWidth} pageHeight={pageHeight} />}
+      <For each={layerData().lines}>
+        {(line) => (
+          <Line
+            line={line}
+            pageWidth={basePageWidth}
+            pageHeight={basePageHeight}
+          />
+        )}
       </For>
     </div>
   );

@@ -12,6 +12,7 @@ import {
   redoAnnotations,
   undoAnnotations,
 } from "./annotations/store";
+import { rotateDocument } from "./viewer/pageRotation";
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 
@@ -61,17 +62,6 @@ function prevZoom() {
   if (!tab) return;
   const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
   if (prev) updateActiveTab((t) => { t.zoom = prev; });
-}
-
-function rotate(direction: 1 | -1) {
-  const tab = activeTab();
-  if (!tab) return;
-  const r = ((tab.rotation + direction * 90 + 360) % 360) as
-    | 0
-    | 90
-    | 180
-    | 270;
-  updateActiveTab((t) => { t.rotation = r; });
 }
 
 function gotoPage(delta: number) {
@@ -193,8 +183,9 @@ export function installKeyboardShortcuts() {
             gotoPage(1);
             break;
           case "r":
+          case "R":
             e.preventDefault();
-            rotate(e.shiftKey ? -1 : 1);
+            void rotateDocument(e.shiftKey ? -1 : 1);
             break;
           case "t":
             e.preventDefault();

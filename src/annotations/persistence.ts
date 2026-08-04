@@ -1,19 +1,26 @@
 import { createEffect, onCleanup } from "solid-js";
 import { saveAnnotationSidecar } from "../ipc/pdf";
-import { documentStore } from "../state/document";
+import { enqueueDocumentMutation } from "../ipc/documentMutations";
+import { documentStore, updateTabById, type Tab } from "../state/document";
 import {
-  markAnnotationsSavedForTab,
   markAnnotationSaveErrorForTab,
   setAnnotationSaveStatusForTab,
 } from "./store";
 import type { Annotation, AnnotationSidecar } from "./types";
 
 export const buildAnnotationSidecar = (
-  sourcePath: string,
+  tab: Tab,
   annotations: Annotation[],
 ): AnnotationSidecar => ({
-  version: 1,
-  sourcePath,
+  version: 2,
+  documentKey: tab.annotationDocumentKey,
+  sourcePath: tab.path,
+  documentRevision: tab.revision,
+  pageLayout: tab.pages.map(({ width, height, rotation }) => ({
+    width,
+    height,
+    rotation,
+  })),
   updatedAt: new Date().toISOString(),
   annotations,
 });
@@ -30,7 +37,11 @@ export function installAnnotationAutosave() {
     const seen = new Set<string>();
     for (const tab of documentStore.tabs) {
       seen.add(tab.tabId);
-      if (!tab.annotations.dirty) {
+      // Page edits and their annotation-coordinate remap must be committed as
+      // one transaction by saveTabPdf(). Writing the remapped sidecar while
+      // the rotated/reordered PDF still exists only in memory would corrupt
+      // alignment if the user later chose "저장 안 함" or the app exited.
+      if (!tab.annotations.dirty || tab.pageDirty) {
         const existing = timers.get(tab.tabId);
         if (existing !== undefined) {
           window.clearTimeout(existing);
@@ -40,8 +51,10 @@ export function installAnnotationAutosave() {
       }
 
       const tabId = tab.tabId;
-      const path = tab.path;
-      const payload = JSON.stringify(tab.annotations.items);
+      // Reading the serialized payload makes item edits a dependency of this
+      // debounce effect. The authoritative snapshot is captured later, when
+      // the queued save actually starts.
+      JSON.stringify(tab.annotations.items);
 
       const existing = timers.get(tabId);
       if (existing !== undefined) {
@@ -50,12 +63,33 @@ export function installAnnotationAutosave() {
 
       const timer = window.setTimeout(async () => {
         try {
-          setAnnotationSaveStatusForTab(tabId, "saving");
-          await saveAnnotationSidecar(
-            path,
-            buildAnnotationSidecar(path, JSON.parse(payload)),
-          );
-          markAnnotationsSavedForTab(tabId);
+          await enqueueDocumentMutation(tabId, async () => {
+            const current = documentStore.tabs.find(
+              (candidate) => candidate.tabId === tabId,
+            );
+            // A queued structural edit/save may have superseded this timer.
+            if (!current || !current.annotations.dirty || current.pageDirty) {
+              return;
+            }
+            const snapshot = JSON.stringify(current.annotations.items);
+            setAnnotationSaveStatusForTab(tabId, "saving");
+            await saveAnnotationSidecar(
+              current.docId,
+              current.revision,
+              current.path,
+              buildAnnotationSidecar(current, JSON.parse(snapshot)),
+            );
+            updateTabById(tabId, (latest) => {
+              if (JSON.stringify(latest.annotations.items) === snapshot) {
+                latest.annotations.dirty = false;
+                latest.annotations.saveStatus = "saved";
+                latest.annotations.lastSavedAt = new Date().toISOString();
+              } else {
+                latest.annotations.saveStatus = "idle";
+              }
+              latest.annotations.saveError = null;
+            });
+          });
         } catch (error) {
           markAnnotationSaveErrorForTab(
             tabId,

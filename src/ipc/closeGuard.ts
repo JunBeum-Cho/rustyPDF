@@ -4,7 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { documentStore, fileNameFromPath } from "../state/document";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { saveTabPdf } from "./pdf";
+import { saveTabPdfUntilClean } from "./pdf";
+import {
+  hasPendingDocumentMutations,
+  waitForAllDocumentMutations,
+} from "./documentMutations";
 
 const hasUnsavedTabs = () =>
   documentStore.tabs.some((t) => t.annotations.dirty || t.pageDirty);
@@ -32,6 +36,7 @@ export function installCloseGuard() {
       closeFlowRunning = true;
 
       try {
+        await waitForAllDocumentMutations();
         const tabsToSave = unsavedTabs();
         if (tabsToSave.length > 0) {
           const dirtyNames = tabsToSave.map((t) => fileNameFromPath(t.path));
@@ -55,7 +60,7 @@ export function installCloseGuard() {
             const failedNames: string[] = [];
             for (const tab of tabsToSave) {
               try {
-                const saved = await saveTabPdf(tab.tabId);
+                const saved = await saveTabPdfUntilClean(tab.tabId);
                 if (!saved) failedNames.push(fileNameFromPath(tab.path));
               } catch (error) {
                 console.error("close-guard save failed", tab.path, error);
@@ -98,7 +103,7 @@ export function installCloseGuard() {
     })();
 
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (!hasUnsavedTabs()) return;
+      if (!hasUnsavedTabs() && !hasPendingDocumentMutations()) return;
       event.preventDefault();
       event.returnValue = "";
     };

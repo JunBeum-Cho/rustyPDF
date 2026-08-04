@@ -623,6 +623,7 @@ export const markAnnotationSaveErrorForTab = (tabId: string, message: string) =>
 export const remapAnnotationsForTab = (
   tabId: string,
   mapping: Array<number | null>,
+  insertedAnnotations: Annotation[] = [],
 ) => {
   updateTabById(tabId, (tab) => {
     const remapped: Annotation[] = [];
@@ -631,12 +632,19 @@ export const remapAnnotationsForTab = (
       if (target == null) continue;
       remapped.push({ ...annotation, page: target });
     }
+    // Page duplicate/paste operations copy the PDF page in the backend, while
+    // editable annotations live in a sidecar. Add their independently cloned
+    // counterparts in the same transaction as the old-page remap so no render
+    // can observe a half-updated annotation layout.
+    remapped.push(...cloneAnnotations(insertedAnnotations));
     tab.annotations.items = remapped;
     tab.annotations.history = [];
     tab.annotations.future = [];
     tab.annotations.selectedIds = [];
     tab.annotations.editingId = null;
     tab.annotations.dirty = true;
+    tab.annotations.saveStatus = "idle";
+    tab.annotations.saveError = null;
   });
 };
 

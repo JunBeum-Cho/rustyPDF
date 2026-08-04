@@ -3,8 +3,11 @@ import type { Annotation, AnnotationTool } from "../annotations/types";
 
 export interface PageMeta {
   index: number;
+  /** Display dimensions after the PDF page's intrinsic rotation. */
   width: number; // PDF points (1pt = 1/72 inch)
   height: number;
+  /** Intrinsic clockwise rotation persisted in the PDF's `/Rotate` entry. */
+  rotation: 0 | 90 | 180 | 270;
 }
 
 export type PrefetchPolicy = "all" | "lazy";
@@ -36,7 +39,9 @@ export const emptyAnnotationTabState = (): AnnotationTabState => ({
 
 export interface Tab {
   tabId: string;            // stable local id used for tab identity
-  docId: string;            // backend doc handle (changes after page mutations)
+  docId: string;            // stable backend document handle
+  revision: number;         // backend generation; incremented by mutations/saves
+  annotationDocumentKey: string; // distinguishes identical PDF copies
   path: string;
   pageCount: number;
   pages: PageMeta[];
@@ -44,6 +49,7 @@ export interface Tab {
   contentVersion: number;   // bumps when saved bytes change without a new docId
   prefetchPolicy: PrefetchPolicy;
   zoom: number;
+  /** Additional transient viewer rotation. Persistent editor rotation keeps this at zero. */
   rotation: 0 | 90 | 180 | 270;
   currentPage: number;
   selectedPageIndices: number[];   // for thumbnail multi-select

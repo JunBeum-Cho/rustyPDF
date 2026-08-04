@@ -1,4 +1,4 @@
-import { Show, createMemo, onMount } from "solid-js";
+import { Show, createEffect, createMemo } from "solid-js";
 import { ScanText } from "lucide-solid";
 import { activeTab } from "../state/document";
 import { ocrState, refreshOcrStatus, runOcrAll } from "./ocr";
@@ -10,16 +10,16 @@ export function OcrButton() {
   // Re-fetch status whenever the active tab changes — covers reopening a
   // doc that already has an OCR sidecar so progress reflects the cached
   // pages without re-running anything.
-  onMount(() => {
+  createEffect(() => {
     const t = tab();
-    if (t) void refreshOcrStatus(t.docId, t.pageCount);
+    if (t) void refreshOcrStatus(t.docId, t.revision, t.pageCount);
   });
 
   const progress = createMemo(() => {
     const t = tab();
     if (!t) return null;
     const s = ocrState.byDoc[t.docId];
-    if (!s) return null;
+    if (!s || s.revision !== t.revision) return null;
     return {
       done: s.done.size,
       total: s.total,
@@ -32,8 +32,16 @@ export function OcrButton() {
     const t = tab();
     if (!t) return;
     if (progress()?.busy) return;
-    await refreshOcrStatus(t.docId, t.pageCount);
-    await runOcrAll(t.docId, t.pageCount);
+    const { tabId, docId, revision, pageCount } = t;
+    await refreshOcrStatus(docId, revision, pageCount);
+    const live = tab();
+    if (
+      !live ||
+      live.tabId !== tabId ||
+      live.docId !== docId ||
+      live.revision !== revision
+    ) return;
+    await runOcrAll(docId, revision, pageCount);
   };
 
   return (

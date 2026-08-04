@@ -23,6 +23,7 @@ export async function captureRegion(
     "pdf_capture_region",
     {
       docId: tab.docId,
+      expectedRevision: tab.revision,
       pageIndex: args.pageIndex,
       x: args.x,
       y: args.y,

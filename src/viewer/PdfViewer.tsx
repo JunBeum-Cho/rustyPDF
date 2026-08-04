@@ -117,8 +117,14 @@ export function PdfViewer() {
 
   createEffect(
     on(
-      () => [tab().docId, tab().zoom, tab().rotation, tab().contentVersion] as const,
-      ([docId, zoom, rotation]) => {
+      () => [
+        tab().docId,
+        tab().revision,
+        tab().zoom,
+        tab().rotation,
+        tab().contentVersion,
+      ] as const,
+      ([docId, revision, zoom, rotation]) => {
         if (tab().prefetchPolicy !== "all") return;
 
         let aborted = false;
@@ -144,7 +150,7 @@ export function PdfViewer() {
             const idx = order.shift();
             if (idx === undefined) return;
             try {
-              await renderPage(docId, idx, bucket, rotation);
+              await renderPage(docId, revision, idx, bucket, rotation);
             } catch {
               /* ignored */
             }
@@ -195,6 +201,7 @@ export function PdfViewer() {
                 width={renderedDims()[i()].width}
                 height={renderedDims()[i()].height}
                 docId={tab().docId}
+                revision={tab().revision}
                 contentVersion={tab().contentVersion}
                 zoom={tab().zoom}
                 rotation={tab().rotation}

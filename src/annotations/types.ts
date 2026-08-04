@@ -56,8 +56,18 @@ export interface Annotation {
 }
 
 export interface AnnotationSidecar {
-  version: 1;
+  /** v1 records are accepted only as exact-path migration input. */
+  version: 1 | 2;
+  documentKey?: string;
   sourcePath: string;
+  /** Filled and verified by the backend when persisted. */
+  pdfFingerprint?: string;
+  documentRevision?: number;
+  pageLayout?: Array<{
+    width: number;
+    height: number;
+    rotation: 0 | 90 | 180 | 270;
+  }>;
   updatedAt: string;
   annotations: Annotation[];
 }

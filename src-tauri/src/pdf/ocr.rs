@@ -1,13 +1,16 @@
 use super::cache::PageCache;
-use super::document::DocRegistry;
+use super::document::{DocHandle, DocRegistry};
 use super::render::render_page;
 use super::PdfError;
+use crate::storage::{atomic_write, sha256_hex};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use uuid::Uuid;
 
 /// One recognized line of text together with its position. Coordinates are
 /// in normalized 0–1 page space with origin at the top-left, regardless of
@@ -36,7 +39,13 @@ pub struct OcrPage {
 /// session and is also persisted alongside the document on disk. Hitting OCR
 /// is expensive, so we want the second open of the same file to be instant.
 pub struct OcrCache {
-    inner: RwLock<HashMap<String, OcrPage>>,
+    inner: RwLock<HashMap<String, OcrCacheEntry>>,
+}
+
+#[derive(Clone)]
+struct OcrCacheEntry {
+    revision: u64,
+    page: OcrPage,
 }
 
 impl OcrCache {
@@ -50,16 +59,26 @@ impl OcrCache {
         format!("{doc_id}::{page}")
     }
 
-    pub fn get(&self, doc_id: &str, page: usize) -> Option<OcrPage> {
-        self.inner.read().get(&Self::key(doc_id, page)).cloned()
+    pub fn get(&self, doc_id: &str, page: usize, revision: u64) -> Option<OcrPage> {
+        self.inner
+            .read()
+            .get(&Self::key(doc_id, page))
+            .filter(|entry| entry.revision == revision)
+            .map(|entry| entry.page.clone())
     }
 
-    pub fn get_text(&self, doc_id: &str, page: usize) -> Option<String> {
-        self.get(doc_id, page).map(|p| p.text)
+    pub fn get_text(&self, doc_id: &str, page: usize, revision: u64) -> Option<String> {
+        self.get(doc_id, page, revision).map(|page| page.text)
     }
 
-    pub fn put(&self, doc_id: &str, page: usize, page_data: OcrPage) {
-        self.inner.write().insert(Self::key(doc_id, page), page_data);
+    pub fn put(&self, doc_id: &str, page: usize, revision: u64, page_data: OcrPage) {
+        self.inner.write().insert(
+            Self::key(doc_id, page),
+            OcrCacheEntry {
+                revision,
+                page: page_data,
+            },
+        );
     }
 
     pub fn invalidate(&self, doc_id: &str) {
@@ -67,23 +86,32 @@ impl OcrCache {
         self.inner.write().retain(|k, _| !k.starts_with(&prefix));
     }
 
-    pub fn snapshot_for_doc(&self, doc_id: &str) -> HashMap<usize, OcrPage> {
+    pub fn snapshot_for_doc(&self, doc_id: &str, revision: u64) -> HashMap<usize, OcrPage> {
         let prefix = format!("{doc_id}::");
         self.inner
             .read()
             .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix(&prefix)
+            .filter_map(|(key, entry)| {
+                if entry.revision != revision {
+                    return None;
+                }
+                key.strip_prefix(&prefix)
                     .and_then(|s| s.parse::<usize>().ok())
-                    .map(|i| (i, v.clone()))
+                    .map(|index| (index, entry.page.clone()))
             })
             .collect()
     }
 
-    pub fn load_from_sidecar(&self, doc_id: &str, sidecar: HashMap<usize, OcrPage>) {
+    pub fn load_from_sidecar(&self, doc_id: &str, revision: u64, sidecar: HashMap<usize, OcrPage>) {
         let mut map = self.inner.write();
         for (page, value) in sidecar {
-            map.insert(Self::key(doc_id, page), value);
+            map.insert(
+                Self::key(doc_id, page),
+                OcrCacheEntry {
+                    revision,
+                    page: value,
+                },
+            );
         }
     }
 }
@@ -92,71 +120,65 @@ fn ocr_sidecar_path(pdf_path: &str) -> PathBuf {
     PathBuf::from(format!("{pdf_path}.ocr.json"))
 }
 
-/// Remove the on-disk OCR sidecar for a path. Called after a structural page
-/// edit (delete/insert/duplicate) shifts page indices: the sidecar is keyed by
-/// page index, so it no longer matches the document and must be discarded
-/// rather than silently reloaded onto the wrong pages. Best-effort — a missing
-/// file is fine.
-pub fn delete_sidecar(pdf_path: &str) {
-    let _ = std::fs::remove_file(ocr_sidecar_path(pdf_path));
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OcrSidecarV2 {
+    version: u8,
+    pdf_fingerprint: String,
+    document_revision: u64,
+    pages: HashMap<String, OcrPage>,
 }
 
 pub fn load_sidecar_into_cache(
     cache: &OcrCache,
     doc_id: &str,
-    pdf_path: &str,
+    handle: &DocHandle,
 ) -> Result<(), PdfError> {
-    let path = ocr_sidecar_path(pdf_path);
+    let path = ocr_sidecar_path(&handle.path);
     if !path.exists() {
         return Ok(());
     }
     let bytes = std::fs::read(&path)?;
-    // Try the modern structured format first; fall back to the legacy
-    // string-only sidecar so users with files OCR'd by an earlier build
-    // don't lose their cached text. Old entries get an empty `lines`
-    // array (search still works; selection layer just isn't rebuilt).
-    if let Ok(parsed) = serde_json::from_slice::<HashMap<String, OcrPage>>(&bytes) {
+    let pdf_fingerprint = sha256_hex(handle.bytes.as_ref());
+    if let Ok(parsed) = serde_json::from_slice::<OcrSidecarV2>(&bytes) {
+        // Page-indexed OCR is valid only for the exact PDF bytes from which
+        // its boxes were measured. A structural edit naturally changes this
+        // fingerprint, so a stale sidecar is ignored without deleting the
+        // still-valid cache for the older on-disk file.
+        if parsed.pdf_fingerprint != pdf_fingerprint {
+            return Ok(());
+        }
         let mut as_int: HashMap<usize, OcrPage> = HashMap::new();
-        for (k, v) in parsed {
-            if let Ok(i) = k.parse::<usize>() {
-                as_int.insert(i, v);
+        for (key, value) in parsed.pages {
+            if let Ok(index) = key.parse::<usize>() {
+                as_int.insert(index, value);
             }
         }
-        cache.load_from_sidecar(doc_id, as_int);
+        cache.load_from_sidecar(doc_id, handle.revision, as_int);
         return Ok(());
     }
-    if let Ok(legacy) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
-        let mut as_int: HashMap<usize, OcrPage> = HashMap::new();
-        for (k, v) in legacy {
-            if let Ok(i) = k.parse::<usize>() {
-                as_int.insert(
-                    i,
-                    OcrPage {
-                        text: v,
-                        lines: Vec::new(),
-                    },
-                );
-            }
-        }
-        cache.load_from_sidecar(doc_id, as_int);
-        return Ok(());
-    }
+    // Legacy OCR maps contain no PDF fingerprint, so there is no safe way to
+    // know whether their page indices survived an external edit or an older
+    // app version's rotation. OCR is reproducible data; ignore these records
+    // and regenerate instead of risking searchable text on the wrong page.
     Ok(())
 }
 
-pub fn persist_sidecar(
-    cache: &OcrCache,
-    doc_id: &str,
-    pdf_path: &str,
-) -> Result<(), PdfError> {
-    let snap = cache.snapshot_for_doc(doc_id);
+pub fn persist_sidecar(cache: &OcrCache, doc_id: &str, handle: &DocHandle) -> Result<(), PdfError> {
+    let snap = cache.snapshot_for_doc(doc_id, handle.revision);
     if snap.is_empty() {
         return Ok(());
     }
-    let stringified: HashMap<String, OcrPage> =
+    let pages: HashMap<String, OcrPage> =
         snap.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-    let bytes = serde_json::to_vec_pretty(&stringified)?;
-    std::fs::write(ocr_sidecar_path(pdf_path), bytes)?;
+    let sidecar = OcrSidecarV2 {
+        version: 2,
+        pdf_fingerprint: sha256_hex(handle.bytes.as_ref()),
+        document_revision: handle.revision,
+        pages,
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar)?;
+    atomic_write(ocr_sidecar_path(&handle.path), &bytes)?;
     Ok(())
 }
 
@@ -168,16 +190,38 @@ pub fn ocr_page(
     cache: &PageCache,
     ocr_cache: &OcrCache,
     doc_id: &str,
+    expected_revision: u64,
     page_index: usize,
 ) -> Result<OcrPage, PdfError> {
-    if let Some(cached) = ocr_cache.get(doc_id, page_index) {
-        return Ok(cached);
-    }
+    let source_handle = {
+        let mutation_lock = registry.mutation_lock(doc_id)?;
+        let _mutation_guard = mutation_lock.lock();
+        let handle = registry.get_at_revision(doc_id, expected_revision)?;
+        if let Some(cached) = ocr_cache.get(doc_id, page_index, expected_revision) {
+            return Ok(cached);
+        }
+        handle
+    };
 
     // Render at ~2x for OCR clarity. Higher scales are slower without much
     // accuracy gain on the 300dpi-equivalent native engines we target.
     const OCR_SCALE: f32 = 2.0;
-    let raw = render_page(registry, cache, doc_id, page_index, OCR_SCALE, 0)?;
+    let raw = render_page(
+        registry,
+        cache,
+        doc_id,
+        expected_revision,
+        page_index,
+        OCR_SCALE,
+        0,
+    )?;
+    let after_render = registry.get(doc_id)?;
+    if !Arc::ptr_eq(&source_handle, &after_render) {
+        return Err(PdfError::StaleDocument {
+            expected: expected_revision,
+            actual: after_render.revision,
+        });
+    }
     // raw layout: [u32 BE width][u32 BE height][rgba bytes]
     if raw.len() < 8 {
         return Err(PdfError::Pdfium("ocr render returned empty".into()));
@@ -197,15 +241,35 @@ pub fn ocr_page(
     }
 
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("rustpdf-ocr-{}-{}.png", doc_id, page_index));
-    std::fs::write(&tmp, &buf)?;
+    tmp.push(format!(
+        "rustpdf-ocr-{}-{}-{}.png",
+        doc_id,
+        page_index,
+        Uuid::new_v4()
+    ));
+    atomic_write(&tmp, &buf)?;
 
     let result = run_platform_ocr(&tmp);
     // Best-effort cleanup; OS will sweep tmp anyway.
     let _ = std::fs::remove_file(&tmp);
 
     let page_data = result?;
-    ocr_cache.put(doc_id, page_index, page_data.clone());
+    {
+        // Serialize only the final generation check + cache publication. If a
+        // page edit finished while OCR was running, reject the result. If an
+        // edit starts immediately after publication, it will invalidate this
+        // entry while holding the same lock.
+        let mutation_lock = registry.mutation_lock(doc_id)?;
+        let _mutation_guard = mutation_lock.lock();
+        let current = registry.get(doc_id)?;
+        if !Arc::ptr_eq(&source_handle, &current) {
+            return Err(PdfError::StaleDocument {
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        ocr_cache.put(doc_id, page_index, expected_revision, page_data.clone());
+    }
     Ok(page_data)
 }
 
@@ -300,8 +364,7 @@ FileHandle.standardOutput.write(data)
 /// by the Windows path; engine differences are absorbed by the inline
 /// scripts.
 fn parse_lines_json(stdout: &[u8]) -> Result<OcrPage, PdfError> {
-    let lines: Vec<OcrLine> =
-        serde_json::from_slice(stdout).unwrap_or_default();
+    let lines: Vec<OcrLine> = serde_json::from_slice(stdout).unwrap_or_default();
     // Defensive clamp — anything outside [0,1] would render off-page.
     let cleaned: Vec<OcrLine> = lines
         .into_iter()
@@ -419,4 +482,67 @@ fn run_platform_ocr(_image_path: &PathBuf) -> Result<OcrPage, PdfError> {
          Linux support requires Tesseract; install it and we'll wire it up next."
             .into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn page(text: &str) -> OcrPage {
+        OcrPage {
+            text: text.into(),
+            lines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cache_entries_are_visible_only_to_their_document_revision() {
+        let cache = OcrCache::new();
+        cache.put("doc", 0, 3, page("generation three"));
+        assert_eq!(cache.get("doc", 0, 3).unwrap().text, "generation three");
+        assert!(cache.get("doc", 0, 4).is_none());
+        assert!(cache.snapshot_for_doc("doc", 4).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_mismatch_prevents_stale_sidecar_reload() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustpdf-ocr-sidecar-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("document.pdf");
+        std::fs::write(&pdf_path, b"old pdf bytes").unwrap();
+
+        let source_cache = OcrCache::new();
+        source_cache.put("doc", 0, 7, page("stale text"));
+        let handle = DocHandle {
+            path: pdf_path.to_string_lossy().into_owned(),
+            bytes: Arc::new(b"old pdf bytes".to_vec()),
+            page_count: 1,
+            pages: Vec::new(),
+            disk_fingerprint: sha256_hex(b"old pdf bytes"),
+            revision: 7,
+        };
+        persist_sidecar(&source_cache, "doc", &handle).unwrap();
+
+        std::fs::write(&pdf_path, b"new pdf bytes").unwrap();
+        let loaded_cache = OcrCache::new();
+        let reopened = DocHandle {
+            path: pdf_path.to_string_lossy().into_owned(),
+            bytes: Arc::new(b"different-pdf".to_vec()),
+            page_count: 1,
+            pages: Vec::new(),
+            disk_fingerprint: sha256_hex(b"different-pdf"),
+            revision: 0,
+        };
+        load_sidecar_into_cache(&loaded_cache, "reopened", &reopened).unwrap();
+        assert!(loaded_cache.get("reopened", 0, 0).is_none());
+
+        let _ = std::fs::remove_file(ocr_sidecar_path(pdf_path.to_str().unwrap()));
+        let _ = std::fs::remove_file(pdf_path);
+        let _ = std::fs::remove_dir(dir);
+    }
 }

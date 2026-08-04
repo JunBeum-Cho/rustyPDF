@@ -14,6 +14,7 @@ export function SearchPanel() {
   const [activeIndex, setActiveIndex] = createSignal(0);
 
   let inputEl: HTMLInputElement | undefined;
+  let searchSequence = 0;
 
   createEffect(
     on(
@@ -39,6 +40,7 @@ export function SearchPanel() {
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   createEffect(() => {
+    const sequence = ++searchSequence;
     const q = query().trim();
     const tab = activeTab();
     if (timer) clearTimeout(timer);
@@ -54,21 +56,38 @@ export function SearchPanel() {
     setLoading(true);
     const docId = tab.docId;
     const tabId = tab.tabId;
+    const revision = tab.revision;
     timer = setTimeout(async () => {
       try {
-        const result = await searchPdf(docId, q);
+        const result = await searchPdf(docId, revision, q);
         // The user may have switched tabs while the search was in flight —
-        // don't paint another document's results into the current panel.
-        if (activeTab()?.tabId !== tabId) return;
+        // or edited/requeried this document. Never let an older response
+        // paint its page indices over a newer generation or query.
+        const live = activeTab();
+        if (
+          sequence !== searchSequence ||
+          live?.tabId !== tabId ||
+          live.revision !== revision
+        ) return;
         setHits(result);
         setActiveIndex(0);
         setError(null);
       } catch (e) {
-        if (activeTab()?.tabId !== tabId) return;
+        const live = activeTab();
+        if (
+          sequence !== searchSequence ||
+          live?.tabId !== tabId ||
+          live.revision !== revision
+        ) return;
         setError(e instanceof Error ? e.message : String(e));
         setHits([]);
       } finally {
-        if (activeTab()?.tabId === tabId) setLoading(false);
+        const live = activeTab();
+        if (
+          sequence === searchSequence &&
+          live?.tabId === tabId &&
+          live.revision === revision
+        ) setLoading(false);
       }
     }, DEBOUNCE_MS);
   });

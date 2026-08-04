@@ -17,6 +17,14 @@ pub enum PdfError {
     Init(String),
     #[error("invalid document handle")]
     InvalidHandle,
+    #[error(
+        "document revision changed (expected {expected}, current {actual}); retry the operation"
+    )]
+    StaleDocument { expected: u64, actual: u64 },
+    #[error("PDF changed on disk since it was opened or last saved; refusing to overwrite: {0}")]
+    ExternalModification(String),
+    #[error("refusing to overwrite a PDF that is open in another tab: {0}")]
+    OpenDocumentConflict(String),
     #[error("invalid page index {0}")]
     InvalidPage(usize),
     #[error("pdfium error: {0}")]

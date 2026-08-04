@@ -55,9 +55,7 @@ pub fn parse_html(html: &str, base: RunStyle) -> Vec<TextLine> {
     let mut style_stack: Vec<RunStyle> = vec![base];
     let mut buf = String::new();
 
-    let push_text = |buf: &mut String,
-                     lines: &mut Vec<TextLine>,
-                     style_stack: &Vec<RunStyle>| {
+    let push_text = |buf: &mut String, lines: &mut Vec<TextLine>, style_stack: &Vec<RunStyle>| {
         if buf.is_empty() {
             return;
         }
@@ -133,11 +131,7 @@ fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
         .map(|p| p + from)
 }
 
-fn handle_tag(
-    tag_chars: &[char],
-    style_stack: &mut Vec<RunStyle>,
-    lines: &mut Vec<TextLine>,
-) {
+fn handle_tag(tag_chars: &[char], style_stack: &mut Vec<RunStyle>, lines: &mut Vec<TextLine>) {
     if tag_chars.is_empty() {
         return;
     }
@@ -240,7 +234,9 @@ fn apply_attr_styles(attrs_str: &str, style: &mut RunStyle) {
 
 fn apply_inline_css(css: &str, style: &mut RunStyle) {
     for decl in css.split(';') {
-        let Some((k, v)) = decl.split_once(':') else { continue };
+        let Some((k, v)) = decl.split_once(':') else {
+            continue;
+        };
         let key = k.trim().to_ascii_lowercase();
         let value = v.trim().trim_matches('"').trim_matches('\'');
         match key.as_str() {

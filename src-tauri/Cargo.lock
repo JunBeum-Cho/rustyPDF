@@ -3134,6 +3134,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "sha2",
  "subsetter",
  "tauri",
  "tauri-build",

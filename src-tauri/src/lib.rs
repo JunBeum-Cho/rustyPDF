@@ -1,16 +1,17 @@
+mod annotation_store;
 mod ipc;
 mod pdf;
+mod storage;
 
 use ipc::AppState;
-use pdf::annotations::export_flattened_pdf;
 use pdf::document::{close_document, open_document, OpenedDocument};
 use pdf::edit::{
-    capture_region, copy_pages_to_clipboard, delete_pages, duplicate_pages, paste_pages,
-    save_doc_as, save_doc_with_annotations, PdfPageEditResult,
+    capture_region, copy_pages_to_clipboard, delete_pages, duplicate_pages,
+    export_doc_with_annotations, paste_pages, rotate_pages, save_doc_with_annotations,
+    PdfPageEditResult,
 };
 use pdf::ocr::{
-    delete_sidecar, load_sidecar_into_cache, ocr_page as ocr_page_impl, persist_sidecar, OcrLine,
-    OcrPage,
+    load_sidecar_into_cache, ocr_page as ocr_page_impl, persist_sidecar, OcrLine, OcrPage,
 };
 use pdf::render::render_page;
 use pdf::text::{extract_native_text_lines, search as text_search, SearchHit};
@@ -25,7 +26,9 @@ use tauri::State;
 async fn pdf_open(state: State<'_, AppState>, path: String) -> Result<OpenedDocument, PdfError> {
     let opened = open_document(&state.registry, path.clone())?;
     // Best-effort sidecar load — missing file just means no prior OCR yet.
-    let _ = load_sidecar_into_cache(&state.ocr, &opened.id, &path);
+    if let Ok(handle) = state.registry.get_at_revision(&opened.id, opened.revision) {
+        let _ = load_sidecar_into_cache(&state.ocr, &opened.id, &handle);
+    }
     Ok(opened)
 }
 
@@ -41,12 +44,23 @@ async fn pdf_close(state: State<'_, AppState>, doc_id: String) -> Result<bool, P
 async fn pdf_ocr_page(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     page_index: usize,
 ) -> Result<OcrPage, PdfError> {
-    let page = ocr_page_impl(&state.registry, &state.cache, &state.ocr, &doc_id, page_index)?;
+    let page = ocr_page_impl(
+        &state.registry,
+        &state.cache,
+        &state.ocr,
+        &doc_id,
+        expected_revision,
+        page_index,
+    )?;
     // Persist sidecar so subsequent opens of this PDF skip the slow path.
-    if let Ok(handle) = state.registry.get(&doc_id) {
-        let _ = persist_sidecar(&state.ocr, &doc_id, &handle.path);
+    if let Ok(mutation_lock) = state.registry.mutation_lock(&doc_id) {
+        let _mutation_guard = mutation_lock.lock();
+        if let Ok(handle) = state.registry.get_at_revision(&doc_id, expected_revision) {
+            let _ = persist_sidecar(&state.ocr, &doc_id, &handle);
+        }
     }
     // Refresh the text-search cache so the newly OCR'd page is searchable.
     state.text.invalidate(&doc_id);
@@ -61,9 +75,16 @@ async fn pdf_ocr_page(
 async fn pdf_ocr_lines(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     page_index: usize,
 ) -> Result<Option<Vec<OcrLine>>, PdfError> {
-    Ok(state.ocr.get(&doc_id, page_index).map(|p| p.lines))
+    let mutation_lock = state.registry.mutation_lock(&doc_id)?;
+    let _mutation_guard = mutation_lock.lock();
+    let handle = state.registry.get_at_revision(&doc_id, expected_revision)?;
+    Ok(state
+        .ocr
+        .get(&doc_id, page_index, handle.revision)
+        .map(|page| page.lines))
 }
 
 /// Extract the embedded text layer from the PDF itself (no OCR). PDFs
@@ -74,19 +95,24 @@ async fn pdf_ocr_lines(
 async fn pdf_text_lines(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     page_index: usize,
 ) -> Result<Vec<OcrLine>, PdfError> {
-    extract_native_text_lines(&state.registry, &doc_id, page_index)
+    extract_native_text_lines(&state.registry, &doc_id, expected_revision, page_index)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn pdf_ocr_status(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
 ) -> Result<Vec<usize>, PdfError> {
     // Return the list of page indices we already have OCR for. The frontend
     // uses this to compute progress and skip already-processed pages.
-    let snap = state.ocr.snapshot_for_doc(&doc_id);
+    let mutation_lock = state.registry.mutation_lock(&doc_id)?;
+    let _mutation_guard = mutation_lock.lock();
+    let handle = state.registry.get_at_revision(&doc_id, expected_revision)?;
+    let snap = state.ocr.snapshot_for_doc(&doc_id, handle.revision);
     let mut keys: Vec<usize> = snap.keys().copied().collect();
     keys.sort_unstable();
     Ok(keys)
@@ -96,6 +122,7 @@ async fn pdf_ocr_status(
 async fn pdf_render_page(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     page_index: usize,
     scale: f32,
     rotation: i32,
@@ -104,6 +131,7 @@ async fn pdf_render_page(
         &state.registry,
         &state.cache,
         &doc_id,
+        expected_revision,
         page_index,
         scale,
         rotation,
@@ -115,15 +143,24 @@ async fn pdf_render_page(
 async fn pdf_search(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     query: String,
 ) -> Result<Vec<SearchHit>, PdfError> {
-    text_search(&state.text, &state.registry, &state.ocr, &doc_id, &query)
+    text_search(
+        &state.text,
+        &state.registry,
+        &state.ocr,
+        &doc_id,
+        expected_revision,
+        &query,
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn pdf_delete_pages(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     indices: Vec<usize>,
 ) -> Result<PdfPageEditResult, PdfError> {
     let result = delete_pages(
@@ -131,12 +168,12 @@ async fn pdf_delete_pages(
         &state.cache,
         &state.text,
         &doc_id,
+        expected_revision,
         &indices,
     )?;
     // Page indices shifted — the OCR cache and on-disk sidecar are keyed by
     // index and would now map onto the wrong pages.
     state.ocr.invalidate(&doc_id);
-    delete_sidecar(&result.path);
     Ok(result)
 }
 
@@ -144,15 +181,23 @@ async fn pdf_delete_pages(
 async fn pdf_copy_pages(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     indices: Vec<usize>,
 ) -> Result<String, PdfError> {
-    copy_pages_to_clipboard(&state.registry, &state.clipboard, &doc_id, &indices)
+    copy_pages_to_clipboard(
+        &state.registry,
+        &state.clipboard,
+        &doc_id,
+        expected_revision,
+        &indices,
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn pdf_paste_pages(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     after_index: i64,
     clipboard_id: String,
 ) -> Result<PdfPageEditResult, PdfError> {
@@ -162,11 +207,11 @@ async fn pdf_paste_pages(
         &state.text,
         &state.clipboard,
         &doc_id,
+        expected_revision,
         after_index,
         &clipboard_id,
     )?;
     state.ocr.invalidate(&doc_id);
-    delete_sidecar(&result.path);
     Ok(result)
 }
 
@@ -174,6 +219,7 @@ async fn pdf_paste_pages(
 async fn pdf_duplicate_pages(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     indices: Vec<usize>,
 ) -> Result<PdfPageEditResult, PdfError> {
     let result = duplicate_pages(
@@ -181,40 +227,96 @@ async fn pdf_duplicate_pages(
         &state.cache,
         &state.text,
         &doc_id,
+        expected_revision,
         &indices,
     )?;
     state.ocr.invalidate(&doc_id);
-    delete_sidecar(&result.path);
     Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-async fn pdf_save_as(
+async fn pdf_rotate_pages(
     state: State<'_, AppState>,
     doc_id: String,
-    target_path: String,
-) -> Result<(), PdfError> {
-    save_doc_as(&state.registry, &doc_id, &target_path)
+    expected_revision: u64,
+    indices: Vec<usize>,
+    direction: i8,
+) -> Result<PdfPageEditResult, PdfError> {
+    let result = rotate_pages(
+        &state.registry,
+        &state.cache,
+        &state.text,
+        &doc_id,
+        expected_revision,
+        &indices,
+        direction,
+    )?;
+    // OCR/text boxes are expressed in the old displayed page coordinate
+    // system. Recompute them after the persistent page rotation.
+    state.ocr.invalidate(&doc_id);
+    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn pdf_save_document(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     target_path: String,
     data: Option<Value>,
+    sidecar: Option<Value>,
 ) -> Result<OpenedDocument, PdfError> {
     // `save_doc_with_annotations` already swaps the registry handle in place
     // (same doc_id, new bytes/path). Reopening with a fresh doc_id used to
     // cause the page list to remount on every save — visible as a viewer
     // flash — so keep the existing handle and just invalidate caches.
-    let saved = save_doc_with_annotations(&state.registry, &doc_id, &target_path, data)?;
+    let staged_app = app.clone();
+    let staged_path = target_path.clone();
+    let staged_sidecar = sidecar.clone();
+    let saved = save_doc_with_annotations(
+        &state.registry,
+        &doc_id,
+        expected_revision,
+        &target_path,
+        data,
+        move |pdf_bytes| {
+            if let Some(sidecar) = staged_sidecar {
+                annotation_store::stage_for_pdf_bytes(
+                    &staged_app,
+                    &staged_path,
+                    pdf_bytes,
+                    sidecar,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(sidecar) = sidecar {
+        // The fingerprint-addressed copy was durably staged before the PDF
+        // commit. Alias repair is helpful but non-critical; reporting this as
+        // a failed save after the PDF/revision already committed would leave
+        // the frontend on a stale revision and make the next command fail.
+        if let Ok(handle) = state.registry.get_at_revision(&doc_id, saved.revision) {
+            if let Err(error) = annotation_store::save_for_pdf_bytes(
+                &app,
+                &saved.path,
+                handle.bytes.as_ref(),
+                sidecar,
+            ) {
+                eprintln!("annotation alias update failed after PDF commit: {error}");
+            }
+        }
+    }
     state.cache.purge_doc(&doc_id);
     state.text.invalidate(&doc_id);
     state.ocr.invalidate(&doc_id);
-    let _ = load_sidecar_into_cache(&state.ocr, &doc_id, &saved.path);
+    if let Ok(handle) = state.registry.get_at_revision(&doc_id, saved.revision) {
+        let _ = load_sidecar_into_cache(&state.ocr, &doc_id, &handle);
+    }
     Ok(OpenedDocument {
         id: doc_id,
+        revision: saved.revision,
         path: saved.path,
         page_count: saved.page_count,
         pages: saved.pages,
@@ -226,6 +328,7 @@ async fn pdf_save_document(
 async fn pdf_capture_region(
     state: State<'_, AppState>,
     doc_id: String,
+    expected_revision: u64,
     page_index: usize,
     x: f32,
     y: f32,
@@ -233,80 +336,63 @@ async fn pdf_capture_region(
     h: f32,
     scale: f32,
 ) -> Result<tauri::ipc::Response, PdfError> {
-    let bytes = capture_region(&state.registry, &doc_id, page_index, x, y, w, h, scale)?;
+    let bytes = capture_region(
+        &state.registry,
+        &doc_id,
+        expected_revision,
+        page_index,
+        x,
+        y,
+        w,
+        h,
+        scale,
+    )?;
     Ok(tauri::ipc::Response::new(bytes))
-}
-
-/// Legacy sidecar location: `<pdf_path>.notes.json`. Older installs of the app
-/// wrote here; we still read it as a one-shot fallback so existing notes
-/// migrate forward the next time the user saves.
-fn legacy_sidecar_path(path: &str) -> PathBuf {
-    PathBuf::from(format!("{path}.notes.json"))
-}
-
-/// Stable 64-bit hash of an absolute PDF path used as the sidecar filename.
-/// FNV-1a — small, deterministic across runs/platforms, no extra dep.
-fn fnv1a_64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// `<app_local_data>/annotations/<hash>.notes.json` — keeps annotations inside
-/// the app instead of cluttering the user's PDF folder. The hash is derived
-/// from the absolute PDF path; moving/renaming the PDF orphans the sidecar
-/// (acceptable trade-off vs. content-hashing every file open).
-fn sidecar_path(app: &tauri::AppHandle, pdf_path: &str) -> Result<PathBuf, PdfError> {
-    let base = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| PdfError::Io(std::io::Error::other(e.to_string())))?;
-    let hash = format!("{:016x}", fnv1a_64(pdf_path));
-    Ok(base.join("annotations").join(format!("{hash}.notes.json")))
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn annotations_load(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    doc_id: String,
+    expected_revision: u64,
     path: String,
-) -> Result<Option<Value>, PdfError> {
-    let target = sidecar_path(&app, &path)?;
-    if target.exists() {
-        let text = std::fs::read_to_string(target)?;
-        return Ok(Some(serde_json::from_str(&text)?));
+) -> Result<annotation_store::AnnotationLoadResult, PdfError> {
+    let mutation_lock = state.registry.mutation_lock(&doc_id)?;
+    let _mutation_guard = mutation_lock.lock();
+    let handle = state.registry.get_at_revision(&doc_id, expected_revision)?;
+    if handle.path != path {
+        return Err(PdfError::Pdfium(
+            "annotation source path no longer matches the open document".into(),
+        ));
     }
-    let legacy = legacy_sidecar_path(&path);
-    if legacy.exists() {
-        let text = std::fs::read_to_string(legacy)?;
-        return Ok(Some(serde_json::from_str(&text)?));
-    }
-    Ok(None)
+    annotation_store::load_for_pdf_bytes(&app, &path, handle.bytes.as_ref())
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn annotations_save(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    doc_id: String,
+    expected_revision: u64,
     path: String,
     data: Value,
 ) -> Result<(), PdfError> {
-    let target = sidecar_path(&app, &path)?;
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+    let mutation_lock = state.registry.mutation_lock(&doc_id)?;
+    let _mutation_guard = mutation_lock.lock();
+    let handle = state.registry.get_at_revision(&doc_id, expected_revision)?;
+    if handle.path != path {
+        return Err(PdfError::Pdfium(
+            "annotation target path no longer matches the open document".into(),
+        ));
     }
-    let bytes = serde_json::to_vec_pretty(&data)?;
-    std::fs::write(&target, bytes)?;
-
-    // Once we've successfully written the new-location sidecar, clean up the
-    // legacy `<pdf>.notes.json` next to the PDF so it doesn't keep shadowing
-    // future loads (and so the user actually sees their PDF folder cleaned).
-    let legacy = legacy_sidecar_path(&path);
-    if legacy.exists() {
-        let _ = std::fs::remove_file(legacy);
+    let disk_bytes = std::fs::read(&path)?;
+    if storage::sha256_hex(&disk_bytes) != storage::sha256_hex(handle.bytes.as_ref()) {
+        return Err(PdfError::Pdfium(
+            "PDF changed on disk; annotations were not attached to different contents".into(),
+        ));
     }
-    Ok(())
+    annotation_store::save_for_pdf_bytes(&app, &path, handle.bytes.as_ref(), data)
 }
 
 /// PDF paths passed via command-line at launch (e.g. "Open With" from Finder
@@ -428,9 +514,7 @@ fn note_recent_document_native(path: &str) {
     }
 
     unsafe {
-        let s = |s: &str| -> std::ffi::CString {
-            std::ffi::CString::new(s).unwrap()
-        };
+        let s = |s: &str| -> std::ffi::CString { std::ffi::CString::new(s).unwrap() };
 
         // Build NSURL.fileURLWithPath:NSString
         let ns_string_class = objc_getClass(s("NSString").as_ptr());
@@ -526,14 +610,14 @@ mod dock_menu {
     extern "C" {
         fn sel_registerName(name: *const c_char) -> Sel;
         fn objc_getClass(name: *const c_char) -> Class;
-        fn objc_allocateClassPair(superclass: Class, name: *const c_char, extra_bytes: usize) -> Class;
+        fn objc_allocateClassPair(
+            superclass: Class,
+            name: *const c_char,
+            extra_bytes: usize,
+        ) -> Class;
         fn objc_registerClassPair(cls: Class);
-        fn class_addMethod(
-            cls: Class,
-            name: Sel,
-            imp: *const c_void,
-            types: *const c_char,
-        ) -> bool;
+        fn class_addMethod(cls: Class, name: Sel, imp: *const c_void, types: *const c_char)
+            -> bool;
         fn object_getClass(obj: Object) -> Class;
         fn objc_msgSend();
     }
@@ -635,11 +719,7 @@ mod dock_menu {
         let cls = if !existing.is_null() {
             existing
         } else {
-            let cls = objc_allocateClassPair(
-                ns_object,
-                CLASS_NAME.as_ptr() as *const c_char,
-                0,
-            );
+            let cls = objc_allocateClassPair(ns_object, CLASS_NAME.as_ptr() as *const c_char, 0);
             if cls.is_null() {
                 // Couldn't create the class — bail without crashing.
                 return std::ptr::null();
@@ -754,8 +834,7 @@ mod dock_menu {
         unsafe {
             let send0: MsgSend0 = std::mem::transmute(objc_msgSend as *const ());
             let send1: MsgSend1 = std::mem::transmute(objc_msgSend as *const ());
-            let send3: MsgSend3StringSelString =
-                std::mem::transmute(objc_msgSend as *const ());
+            let send3: MsgSend3StringSelString = std::mem::transmute(objc_msgSend as *const ());
 
             // [[NSMenu alloc] init]
             let ns_menu_class = objc_getClass(cstr("NSMenu").as_ptr());
@@ -776,9 +855,7 @@ mod dock_menu {
             if ns_menu_item_class.is_null() {
                 return std::ptr::null_mut();
             }
-            let init_with = sel_registerName(
-                cstr("initWithTitle:action:keyEquivalent:").as_ptr(),
-            );
+            let init_with = sel_registerName(cstr("initWithTitle:action:keyEquivalent:").as_ptr());
             let set_target = sel_registerName(cstr("setTarget:").as_ptr());
             let set_represented = sel_registerName(cstr("setRepresentedObject:").as_ptr());
             let add_item = sel_registerName(cstr("addItem:").as_ptr());
@@ -838,12 +915,22 @@ fn set_dock_recents_native(_app: &tauri::AppHandle, _paths: &[String], _names: &
 
 #[tauri::command(rename_all = "camelCase")]
 async fn export_annotated_pdf(
-    source_path: String,
+    state: State<'_, AppState>,
+    doc_id: String,
+    expected_revision: u64,
     target_path: String,
     data: Value,
 ) -> Result<(), PdfError> {
-    export_flattened_pdf(&source_path, &target_path, data)?;
-    Ok(())
+    // Export from the in-memory handle so unsaved page edits (especially
+    // `/Rotate`) are included. Reading `source_path` from disk here used to
+    // silently export the pre-edit document.
+    export_doc_with_annotations(
+        &state.registry,
+        &doc_id,
+        expected_revision,
+        &target_path,
+        data,
+    )
 }
 
 fn collect_pdf_paths<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
@@ -891,7 +978,7 @@ pub fn run() {
             pdf_copy_pages,
             pdf_paste_pages,
             pdf_duplicate_pages,
-            pdf_save_as,
+            pdf_rotate_pages,
             pdf_save_document,
             pdf_capture_region,
             pdf_ocr_page,
