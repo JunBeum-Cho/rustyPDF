@@ -237,12 +237,12 @@ export function TextFormatToolbar() {
           <span>크기</span>
           <input
             type="number"
-            min="8"
+            min="4"
             max="120"
             value={annotationStore.fontSize}
             onInput={(event) => {
               const px = Number(event.currentTarget.value);
-              if (Number.isFinite(px) && px >= 6) applyFontSize(px);
+              if (Number.isFinite(px) && px >= 4) applyFontSize(px);
               scheduleFormatSync();
             }}
           />
