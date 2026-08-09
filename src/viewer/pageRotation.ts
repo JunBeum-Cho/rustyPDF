@@ -1,4 +1,8 @@
-import { pagePointToDisplay, rectToDisplayBox } from "../annotations/coords";
+import {
+  addQuarterTurn,
+  pagePointToDisplay,
+  rectToDisplayBox,
+} from "../annotations/coords";
 import { rotatePdfPages } from "../ipc/pdf";
 import { enqueueDocumentMutation } from "../ipc/documentMutations";
 import { invalidateOcrForDocument } from "../ocr/ocr";
@@ -67,6 +71,17 @@ async function performRotation(tabId: string, direction: 1 | -1): Promise<void> 
       if (annotation.points) {
         annotation.points = annotation.points.map((point) =>
           pagePointToDisplay(point, oldPage, 1, geometryRotation),
+        );
+      }
+      // Turning the bounding box is enough for shapes — a rotated rectangle
+      // is still a rectangle, and pen/line geometry is carried point by
+      // point. Text and images have an orientation of their own, so without
+      // this they'd be squashed into the transposed box instead of rotating
+      // with the page.
+      if (annotation.type === "text" || annotation.type === "image") {
+        annotation.rotation = addQuarterTurn(
+          annotation.rotation,
+          geometryRotation,
         );
       }
     }

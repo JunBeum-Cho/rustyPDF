@@ -78,6 +78,29 @@ export const rectToDisplayBox = (
   };
 };
 
+/**
+ * Box an annotation's content occupies *before* its own quarter-turn is
+ * applied. `rect` is the axis-aligned box the content covers once rotated,
+ * so for 90°/270° the pre-rotation box is `rect` transposed about the same
+ * centre — rotating it back lands exactly on `rect`.
+ *
+ * The viewer and the PDF exporter both lay content out in this box and then
+ * rotate about the shared centre, which is what keeps the two in agreement.
+ */
+export const contentBox = (rect: Rect, rotation: Rotation = 0): Rect => {
+  if (rotation !== 90 && rotation !== 270) {
+    return rect;
+  }
+  const cx = rect.x + rect.w / 2;
+  const cy = rect.y + rect.h / 2;
+  return { x: cx - rect.h / 2, y: cy - rect.w / 2, w: rect.h, h: rect.w };
+};
+
+export const addQuarterTurn = (
+  rotation: Rotation | undefined,
+  delta: Rotation,
+): Rotation => (((rotation ?? 0) + delta) % 360) as Rotation;
+
 export const normalizeRect = (a: Point, b: Point): Rect => {
   const x = Math.min(a.x, b.x);
   const y = Math.min(a.y, b.y);

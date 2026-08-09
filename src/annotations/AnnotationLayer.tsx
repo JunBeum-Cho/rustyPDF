@@ -1,7 +1,8 @@
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import type { JSX } from "solid-js";
 import type { PageMeta } from "../state/document";
 import {
+  contentBox,
   displayPointToPage,
   displayedPageSize,
   movePoints,
@@ -35,6 +36,7 @@ import {
   unregisterEditor,
   type TextStylePatch,
 } from "./textFormat";
+import { annotationHtml } from "./textLayout";
 import {
   captureRegion,
   copyPngToClipboard,
@@ -194,18 +196,13 @@ const displayPath = (
     .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
     .join(" ");
 
-const annotationHtml = (annotation: Annotation) => {
-  const html = annotation.payload?.html;
-  if (html != null) return html;
-  // Legacy fallback: plain text → escape and use as innerHTML.
-  const text = annotation.payload?.text ?? "";
-  if (!text) return "";
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\n/g, "<br>");
-};
+/**
+ * Extra room, in CSS pixels, left around the <foreignObject> beyond its
+ * measured content. Covers the edit ring and sub-pixel rounding so no paint
+ * can land outside the geometry the browser invalidates when the annotation
+ * moves.
+ */
+const TEXT_OBJECT_BLEED = 4;
 
 const htmlIsEmpty = (html: string) => {
   const tmp = document.createElement("div");
@@ -991,15 +988,27 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     const box = () =>
       rectToDisplayBox(annotation.rect!, props.page, props.zoom, props.rotation);
+    // Content keeps its own orientation inside the box: page rotation turns
+    // the box, and this turns what is drawn in it. Without the pair, a photo
+    // on a rotated page would be squashed into the transposed box instead of
+    // rotating with the page — and the export would bake that in.
+    const contentRotation = () => annotation.rotation ?? 0;
+    const layoutBox = () => contentBox(box(), contentRotation());
+    const contentTransform = () =>
+      contentRotation() === 0
+        ? undefined
+        : `rotate(${contentRotation()} ${box().x + box().w / 2} ${box().y + box().h / 2})`;
+
     if (annotation.type === "image") {
       return (
         <image
           class="annotation-shape annotation-image"
           classList={{ selected: selected() }}
-          x={box().x}
-          y={box().y}
-          width={box().w}
-          height={box().h}
+          x={layoutBox().x}
+          y={layoutBox().y}
+          width={layoutBox().w}
+          height={layoutBox().h}
+          transform={contentTransform()}
           href={annotation.payload?.imageSrc ?? ""}
           preserveAspectRatio="none"
           onPointerDown={(event) => startMove(event, annotation)}
@@ -1021,14 +1030,42 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       );
     }
     if (annotation.type === "text") {
+      // Text taller than its box overflows on purpose (the exporter doesn't
+      // clip either), but a <foreignObject> only gets its own rect
+      // invalidated when it moves — anything painted past that is left
+      // behind as a ghost. Tracking the real content size and growing the
+      // object to match keeps every painted pixel inside the invalidated
+      // area. Note the inner box gets explicit pixel dimensions rather than
+      // percentages, so its height never depends on the object's height.
+      const [contentSize, setContentSize] = createSignal({ w: 0, h: 0 });
+      const trackContentSize = (el: HTMLElement) => {
+        // offsetWidth/Height, not getBoundingClientRect: the object may carry
+        // a rotate() transform, and we need the untransformed layout box in
+        // the object's own user units.
+        const update = () => {
+          setContentSize({ w: el.offsetWidth, h: el.offsetHeight });
+        };
+        update();
+        const observer = new ResizeObserver(update);
+        observer.observe(el);
+        onCleanup(() => observer.disconnect());
+      };
+      const innerWidth = () => Math.max(24, layoutBox().w);
+      const innerHeight = () => Math.max(20, layoutBox().h);
+      const objectWidth = () =>
+        Math.max(innerWidth(), contentSize().w) + TEXT_OBJECT_BLEED;
+      const objectHeight = () =>
+        Math.max(innerHeight(), contentSize().h) + TEXT_OBJECT_BLEED;
+
       return (
         <foreignObject
           class="annotation-text-object"
           classList={{ selected: selected(), editing: isEditing() }}
-          x={box().x}
-          y={box().y}
-          width={Math.max(24, box().w)}
-          height={Math.max(20, box().h)}
+          x={layoutBox().x}
+          y={layoutBox().y}
+          width={objectWidth()}
+          height={objectHeight()}
+          transform={contentTransform()}
           onPointerDown={(event) => {
             if (isEditing()) {
               // Allow normal text-selection / caret placement inside the
@@ -1045,7 +1082,10 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
             fallback={
               <div
                 class="annotation-text"
+                ref={trackContentSize}
                 style={{
+                  width: `${innerWidth()}px`,
+                  "min-height": `${innerHeight()}px`,
                   color: annotation.style.color,
                   "font-size": `${fontSize()}px`,
                   padding: textPadding(),
@@ -1067,6 +1107,8 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
             <div
               class="annotation-text-edit"
               style={{
+                width: `${innerWidth()}px`,
+                "min-height": `${innerHeight()}px`,
                 color: annotation.style.color,
                 "font-size": `${fontSize()}px`,
                 padding: textPadding(),
@@ -1080,6 +1122,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               attr:data-annotation-zoom={props.zoom}
               ref={(el) => {
                 if (!el) return;
+                trackContentSize(el);
                 // Uncontrolled by design — we seed innerHTML once and let
                 // execCommand / Selection drive subsequent edits. Re-binding
                 // innerHTML on every keystroke would blow away the caret.

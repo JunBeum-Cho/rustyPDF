@@ -22,9 +22,14 @@
   vector-effect: non-scaling-stroke;
 }
 
+/*
+ * `.annotation-text-object` is deliberately absent: the <foreignObject> is
+ * grown past the annotation's box to contain overspilling text, so letting it
+ * take hits would make blank page area act like the annotation. Its text
+ * children keep their own `pointer-events: auto`.
+ */
 .annotation-layer.passes-through .annotation-shape,
 .annotation-layer.passes-through .annotation-handle,
-.annotation-layer.passes-through .annotation-text-object,
 .annotation-layer.passes-through .annotation-image,
 .annotation-layer.passes-through .annotation-hit-area {
   pointer-events: auto;
@@ -56,15 +61,21 @@
   stroke-dasharray: 6 4;
 }
 
+/*
+ * `overflow: visible` lets text longer than its box stay readable, matching
+ * the exporter (which never clips either). The <foreignObject> is grown to
+ * the measured content size in AnnotationLayer so nothing actually paints
+ * outside its geometry — Chromium/WebKit only invalidate the object's own
+ * rect when it moves, so any overspill would smear across the page as the
+ * annotation is dragged.
+ */
 .annotation-text-object {
   cursor: grab;
   overflow: visible;
-  pointer-events: all;
+  pointer-events: none;
 }
 
 .annotation-text {
-  min-width: 100%;
-  min-height: 100%;
   padding: 4px 6px;
   /* outline (not border) for the selection frame so it never insets the text
      content — the inset must stay padding-only to match the PDF exporter. */
@@ -74,7 +85,14 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.25;
+  /* The app-wide -0.005em tracking would make on-screen runs narrower than
+     the same runs drawn into the PDF, which has no tracking. */
+  letter-spacing: normal;
   user-select: none;
+  /* The object itself takes no hits (it is intentionally oversized), so the
+     grab affordance lives on the content. */
+  pointer-events: auto;
+  cursor: grab;
 }
 
 .annotation-text[data-empty]::before {
@@ -90,26 +108,29 @@
 
 .annotation-text-edit {
   display: block;
-  width: 100%;
-  height: 100%;
   margin: 0;
   padding: 4px 6px;
-  /* No layout border: the box-shadow ring below is the edit indicator and
-     doesn't inset the text, so the caret/text stay aligned with the display
-     view and the exported PDF (inset is padding-only). */
+  /* No layout border: the inset ring below is the edit indicator and doesn't
+     inset the text, so the caret/text stay aligned with the display view and
+     the exported PDF (inset is padding-only). The ring must stay *inside* the
+     element — an outward box-shadow paints past the <foreignObject> and gets
+     left behind as a smear when the annotation is dragged. */
   background: transparent;
   font-family: inherit;
   font-weight: inherit;
-  letter-spacing: inherit;
+  letter-spacing: normal;
   line-height: 1.25;
   outline: none;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  overflow: auto;
+  /* Height follows the content (see AnnotationLayer), so there is nothing to
+     scroll and the edit view wraps identically to the display view. */
+  overflow: visible;
   user-select: text;
   -webkit-user-select: text;
   caret-color: currentColor;
-  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 25%, transparent);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, currentColor 25%, transparent);
+  pointer-events: auto;
 }
 
 .annotation-text-edit:empty::before {
@@ -118,7 +139,8 @@
   pointer-events: none;
 }
 
-.annotation-text-object.editing {
+.annotation-text-object.editing,
+.annotation-text-object.editing .annotation-text-edit {
   cursor: text;
 }
 

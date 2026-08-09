@@ -439,10 +439,68 @@ struct AnnotationData {
     rect: Option<AnnotationRect>,
     #[serde(default)]
     points: Vec<AnnotationPoint>,
+    /// Quarter-turn (clockwise degrees) the annotation's own content carries
+    /// inside `rect`. Page rotation accumulates here for text and images so
+    /// they turn with the page instead of being squashed into the transposed
+    /// bounding box; shapes stay at 0 because their geometry already encodes
+    /// the turn.
+    #[serde(default)]
+    rotation: f32,
     #[serde(default)]
     style: AnnotationStyle,
     #[serde(default)]
     payload: AnnotationPayload,
+}
+
+impl AnnotationData {
+    /// `rotation` normalized to one of 0 / 90 / 180 / 270.
+    fn content_rotation(&self) -> u16 {
+        if !self.rotation.is_finite() {
+            return 0;
+        }
+        let quarter = (self.rotation / 90.0).round() as i32;
+        (quarter.rem_euclid(4) as u16) * 90
+    }
+
+    /// Box the content is laid out in *before* its own quarter-turn. For
+    /// 90°/270° that is `rect` transposed about the same centre, so rotating
+    /// it back lands exactly on `rect` — the same construction the viewer
+    /// uses, which is what keeps screen and export in agreement.
+    fn layout_rect(&self) -> Option<AnnotationRect> {
+        let rect = self.rect?;
+        Some(match self.content_rotation() {
+            90 | 270 => AnnotationRect {
+                x: rect.x + rect.w / 2.0 - rect.h / 2.0,
+                y: rect.y + rect.h / 2.0 - rect.w / 2.0,
+                w: rect.h,
+                h: rect.w,
+            },
+            _ => rect,
+        })
+    }
+
+    /// Matrix that turns the drawn content about the annotation's centre,
+    /// expressed in the bottom-left display space the draw helpers emit into.
+    /// Screen-clockwise is PDF-counter-clockwise because the y axis flips.
+    fn content_rotation_matrix(&self, page_height: f32) -> Option<[f32; 6]> {
+        let rect = self.rect?;
+        let (a, b, c, d) = match self.content_rotation() {
+            90 => (0.0, -1.0, 1.0, 0.0),
+            180 => (-1.0, 0.0, 0.0, -1.0),
+            270 => (0.0, 1.0, -1.0, 0.0),
+            _ => return None,
+        };
+        let cx = rect.x + rect.w / 2.0;
+        let cy = page_height - (rect.y + rect.h / 2.0);
+        Some([
+            a,
+            b,
+            c,
+            d,
+            cx - (a * cx + c * cy),
+            cy - (b * cx + d * cy),
+        ])
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +583,44 @@ struct AnnotationPayload {
     html: Option<String>,
     #[serde(default, rename = "imageSrc")]
     image_src: Option<String>,
+    /// Line layout measured in the editor at export time. When present it is
+    /// authoritative: reproducing the browser's wrapping, alignment and
+    /// baselines here would mean two implementations agreeing on a formula,
+    /// and they never quite did. Absent (older sidecars, or measurement
+    /// failed) we fall back to laying the text out from scratch.
+    #[serde(default)]
+    layout: Vec<TextLayoutLine>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextLayoutLine {
+    /// Distance from the top of the content box down to this line's
+    /// baseline, in points.
+    baseline: f32,
+    #[serde(default)]
+    fragments: Vec<TextLayoutFragment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextLayoutFragment {
+    #[serde(default)]
+    text: String,
+    /// Offset from the left edge of the content box, in points.
+    x: f32,
+    #[serde(default = "default_font_size")]
+    font_size: f32,
+    #[serde(default = "default_color")]
+    color: String,
+    #[serde(default)]
+    font_family: Option<String>,
+    #[serde(default)]
+    bold: bool,
+    #[serde(default)]
+    italic: bool,
+    #[serde(default)]
+    underline: bool,
 }
 
 fn default_color() -> String {
@@ -622,7 +718,25 @@ pub fn flatten_pdf_bytes(source_bytes: &[u8], data: Value) -> Result<Vec<u8>, Pd
         let first_annotation_object = page.objects().len();
 
         for annotation in annotations {
+            // Each annotation's own quarter-turn is applied to just the
+            // objects it produced, before the page-wide `/Rotate`
+            // compensation below composes on top.
+            let first_object = page.objects().len();
             draw_annotation(&mut page, &annotation, display_height, &fonts)?;
+            if let Some([a, b, c, d, e, f]) =
+                annotation.content_rotation_matrix(display_height)
+            {
+                let last_object = page.objects().len();
+                let objects = page.objects();
+                for index in first_object..last_object {
+                    let mut object = objects
+                        .get(index)
+                        .map_err(|error| PdfError::Pdfium(error.to_string()))?;
+                    object
+                        .transform(a, b, c, d, e, f)
+                        .map_err(|error| PdfError::Pdfium(error.to_string()))?;
+                }
+            }
         }
 
         if let Some([a, b, c, d, e, f]) =
@@ -669,17 +783,20 @@ fn draw_annotation(
     page_height: f32,
     fonts: &ExportFonts,
 ) -> Result<(), PdfError> {
+    // Rect-shaped kinds are drawn into the *pre-rotation* box; the caller
+    // turns the resulting objects about the annotation's centre.
+    let rect = annotation.layout_rect();
     match annotation.kind {
-        AnnotationKind::Text => draw_text(page, annotation, page_height, fonts),
-        AnnotationKind::Rect => draw_rect(page, annotation, page_height),
-        AnnotationKind::Ellipse => draw_ellipse(page, annotation, page_height),
+        AnnotationKind::Text => draw_text(page, annotation, rect, page_height, fonts),
+        AnnotationKind::Rect => draw_rect(page, annotation, rect, page_height),
+        AnnotationKind::Ellipse => draw_ellipse(page, annotation, rect, page_height),
         AnnotationKind::Line => draw_line_annotation(page, annotation, page_height, false),
         AnnotationKind::Arrow => draw_line_annotation(page, annotation, page_height, true),
         AnnotationKind::Pen => {
             draw_polyline(page, &annotation.points, &annotation.style, page_height)
         }
-        AnnotationKind::Highlight => draw_highlight(page, annotation, page_height),
-        AnnotationKind::Image => draw_image(page, annotation, page_height),
+        AnnotationKind::Highlight => draw_highlight(page, annotation, rect, page_height),
+        AnnotationKind::Image => draw_image(page, annotation, rect, page_height),
     }
 }
 
@@ -738,10 +855,11 @@ fn align_kind(style: &AnnotationStyle) -> &'static str {
 fn draw_text(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
+    rect: Option<AnnotationRect>,
     page_height: f32,
     fonts: &ExportFonts,
 ) -> Result<(), PdfError> {
-    let Some(rect) = annotation.rect else {
+    let Some(rect) = rect else {
         return Ok(());
     };
     let style = &annotation.style;
@@ -752,6 +870,10 @@ fn draw_text(
         page.objects_mut()
             .create_path_object_rect(rect_to_pdf(rect, page_height), None, None, Some(fill))
             .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+    }
+
+    if !annotation.payload.layout.is_empty() {
+        return draw_measured_text(page, annotation, rect, page_height, fonts);
     }
 
     let base = RunStyle {
@@ -915,6 +1037,96 @@ fn draw_text(
     Ok(())
 }
 
+/// Draw a text annotation from the layout the editor measured for it. Every
+/// run already carries the x it was painted at and the baseline of its line,
+/// relative to the content box's top-left, so there is nothing left to
+/// derive — wrapping, alignment, padding and leading all come along for free
+/// and agree with the screen exactly.
+fn draw_measured_text(
+    page: &mut PdfPage<'_>,
+    annotation: &AnnotationData,
+    rect: AnnotationRect,
+    page_height: f32,
+    fonts: &ExportFonts,
+) -> Result<(), PdfError> {
+    // Font choice stays annotation-wide, matching the from-scratch path:
+    // mixing Helvetica with an embedded CJK face inside one annotation makes
+    // visually adjacent runs sit at different heights.
+    let annotation_has_cjk = annotation
+        .payload
+        .layout
+        .iter()
+        .flat_map(|line| line.fragments.iter())
+        .any(|fragment| fragment.text.chars().any(|c| (c as u32) > 127));
+    let opacity = annotation.style.opacity;
+
+    for line in &annotation.payload.layout {
+        let baseline_y = page_height - rect.y - line.baseline;
+        let mut underline_specs: Vec<(f32, f32, f32, f32, PdfColor)> = Vec::new();
+
+        for fragment in &line.fragments {
+            if fragment.text.is_empty() {
+                continue;
+            }
+            let font_size = fragment.font_size.max(1.0);
+            let token = fonts.pick(
+                fragment.font_family.as_deref(),
+                fragment.bold,
+                fragment.italic,
+                annotation_has_cjk,
+            );
+            let mut object = page
+                .objects_mut()
+                .create_text_object(
+                    PdfPoints::ZERO,
+                    PdfPoints::ZERO,
+                    &fragment.text,
+                    token,
+                    PdfPoints::new(font_size),
+                )
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+            object
+                .set_fill_color(color_from_hex(&fragment.color, opacity))
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+            let width = object
+                .width()
+                .map(|w| w.value)
+                .unwrap_or_else(|_| font_size * 0.55 * fragment.text.chars().count() as f32);
+            let x = rect.x + fragment.x;
+            object
+                .translate(PdfPoints::new(x), PdfPoints::new(baseline_y))
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+
+            if fragment.underline {
+                underline_specs.push((
+                    x,
+                    x + width,
+                    baseline_y - font_size * 0.12,
+                    (font_size * 0.06).max(0.5),
+                    color_from_hex(&fragment.color, opacity),
+                ));
+            }
+        }
+
+        // Stroked after the text loop so the page.objects_mut() borrow is
+        // fresh — same shape as the from-scratch path.
+        for (x1, x2, y, thickness, color) in underline_specs {
+            page.objects_mut()
+                .create_path_object_line(
+                    PdfPoints::new(x1),
+                    PdfPoints::new(y),
+                    PdfPoints::new(x2),
+                    PdfPoints::new(y),
+                    color,
+                    PdfPoints::new(thickness),
+                )
+                .map_err(|e| PdfError::Pdfium(e.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn fallback_lines_from_text(text: &str, base: &RunStyle) -> Vec<TextLine> {
     text.split('\n')
         .map(|line| TextLine {
@@ -929,9 +1141,10 @@ fn fallback_lines_from_text(text: &str, base: &RunStyle) -> Vec<TextLine> {
 fn draw_rect(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
+    rect: Option<AnnotationRect>,
     page_height: f32,
 ) -> Result<(), PdfError> {
-    let Some(rect) = annotation.rect else {
+    let Some(rect) = rect else {
         return Ok(());
     };
     let stroke = color_from_hex(&annotation.style.color, annotation.style.opacity);
@@ -951,9 +1164,10 @@ fn draw_rect(
 fn draw_ellipse(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
+    rect: Option<AnnotationRect>,
     page_height: f32,
 ) -> Result<(), PdfError> {
-    let Some(rect) = annotation.rect else {
+    let Some(rect) = rect else {
         return Ok(());
     };
     let stroke = color_from_hex(&annotation.style.color, annotation.style.opacity);
@@ -973,9 +1187,10 @@ fn draw_ellipse(
 fn draw_highlight(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
+    rect: Option<AnnotationRect>,
     page_height: f32,
 ) -> Result<(), PdfError> {
-    let Some(rect) = annotation.rect else {
+    let Some(rect) = rect else {
         return Ok(());
     };
     let fill = annotation
@@ -999,9 +1214,10 @@ fn draw_highlight(
 fn draw_image(
     page: &mut PdfPage<'_>,
     annotation: &AnnotationData,
+    rect: Option<AnnotationRect>,
     page_height: f32,
 ) -> Result<(), PdfError> {
-    let Some(rect) = annotation.rect else {
+    let Some(rect) = rect else {
         return Ok(());
     };
     if rect.w <= 0.0 || rect.h <= 0.0 {
@@ -1494,6 +1710,84 @@ mod tests {
         let output = apply_image_opacity(source, 0.5).to_rgba8();
 
         assert_eq!(output.get_pixel(0, 0).0, [1, 2, 3, 100]);
+    }
+
+    #[test]
+    /// An annotation's own quarter-turn has to be the exact inverse of the
+    /// box transpose the viewer applies when the page rotates. If the two
+    /// disagree, rotating a page with a photo on it drifts a little further
+    /// every turn — which is what "rotate, add, rotate, add, export" was
+    /// surfacing.
+    #[test]
+    fn content_rotation_maps_the_layout_box_back_onto_the_stored_rect() {
+        let annotation: AnnotationData = serde_json::from_value(json!({
+            "page": 0,
+            "type": "image",
+            "rect": { "x": 100.0, "y": 50.0, "w": 60.0, "h": 200.0 },
+            "rotation": 90,
+        }))
+        .expect("annotation deserializes");
+
+        assert_eq!(annotation.content_rotation(), 90);
+
+        // Content is laid out in the transpose about the shared centre.
+        let layout = annotation.layout_rect().expect("layout rect");
+        assert!((layout.w - 200.0).abs() < 0.001, "width was {}", layout.w);
+        assert!((layout.h - 60.0).abs() < 0.001, "height was {}", layout.h);
+        assert!((layout.x + layout.w / 2.0 - 130.0).abs() < 0.001);
+        assert!((layout.y + layout.h / 2.0 - 150.0).abs() < 0.001);
+
+        // Rotating that box must land exactly on the stored rect.
+        let page_height = 800.0_f32;
+        let [a, b, c, d, e, f] = annotation
+            .content_rotation_matrix(page_height)
+            .expect("rotation matrix");
+        let apply = |x: f32, y: f32| (a * x + c * y + e, b * x + d * y + f);
+        let (x0, y0) = apply(layout.x, page_height - layout.y);
+        let (x1, y1) = apply(
+            layout.x + layout.w,
+            page_height - (layout.y + layout.h),
+        );
+
+        assert!((x0.min(x1) - 100.0).abs() < 0.001, "left was {}", x0.min(x1));
+        assert!((x0.max(x1) - 160.0).abs() < 0.001, "right was {}", x0.max(x1));
+        assert!((y0.min(y1) - (page_height - 250.0)).abs() < 0.001);
+        assert!((y0.max(y1) - (page_height - 50.0)).abs() < 0.001);
+    }
+
+    /// A measured layout is authoritative — the from-scratch line walker must
+    /// not also run, or every glyph would be drawn twice.
+    #[test]
+    fn measured_layout_is_parsed_from_the_export_payload() {
+        let annotation: AnnotationData = serde_json::from_value(json!({
+            "page": 0,
+            "type": "text",
+            "rect": { "x": 10.0, "y": 20.0, "w": 220.0, "h": 56.0 },
+            "payload": {
+                "text": "안녕 world",
+                "html": "<div>안녕 world</div>",
+                "layout": [{
+                    "baseline": 16.5,
+                    "fragments": [
+                        { "text": "안녕 ", "x": 6.0, "fontSize": 16.0, "color": "#112233",
+                          "bold": true, "italic": false, "underline": false },
+                        { "text": "world", "x": 42.25, "fontSize": 16.0, "color": "#112233",
+                          "bold": false, "italic": false, "underline": true }
+                    ]
+                }]
+            }
+        }))
+        .expect("annotation deserializes");
+
+        assert_eq!(annotation.payload.layout.len(), 1);
+        let line = &annotation.payload.layout[0];
+        assert!((line.baseline - 16.5).abs() < 0.001);
+        assert_eq!(line.fragments.len(), 2);
+        assert!(line.fragments[0].bold);
+        assert!(line.fragments[1].underline);
+        assert!((line.fragments[1].x - 42.25).abs() < 0.001);
+        // Defaults still apply to fields the measurement omits.
+        assert_eq!(line.fragments[0].font_family, None);
     }
 
     #[test]

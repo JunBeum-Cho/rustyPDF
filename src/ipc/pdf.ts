@@ -5,6 +5,7 @@ import {
   markAnnotationSaveErrorForTab,
   setAnnotationSaveStatusForTab,
 } from "../annotations/store";
+import { measureTextLayout } from "../annotations/textLayout";
 import type { Annotation, AnnotationSidecar } from "../annotations/types";
 import {
   activeTab,
@@ -28,9 +29,23 @@ const makeSidecar = (
   annotations: Annotation[],
   documentRevision = tab.revision,
   documentKey = tab.annotationDocumentKey,
+  /**
+   * Attach each text annotation's measured line layout. Only for the export
+   * payload — the measurement describes the current DOM, so persisting it in
+   * the sidecar would leave a stale copy behind the next edit.
+   */
+  measureText = false,
 ): AnnotationSidecar => {
   // Deep-copy/unwrap Solid.js Store proxies before crossing the Tauri bridge
-  const cleanAnnotations = JSON.parse(JSON.stringify(annotations));
+  const cleanAnnotations: Annotation[] = JSON.parse(JSON.stringify(annotations));
+  if (measureText) {
+    for (const annotation of cleanAnnotations) {
+      if (annotation.type !== "text") continue;
+      const layout = measureTextLayout(annotation);
+      if (!layout || layout.length === 0) continue;
+      annotation.payload = { ...(annotation.payload ?? {}), layout };
+    }
+  }
   return {
     version: 2,
     documentKey,
@@ -444,7 +459,14 @@ export async function exportAnnotatedPdfFile(): Promise<void> {
         (candidate) => candidate.tabId === tabId,
       );
       if (!tab) return;
-      const data = makeSidecar(tab, tab.path, tab.annotations.items);
+      const data = makeSidecar(
+        tab,
+        tab.path,
+        tab.annotations.items,
+        tab.revision,
+        tab.annotationDocumentKey,
+        true,
+      );
       await invoke("export_annotated_pdf", {
         docId: tab.docId,
         expectedRevision: tab.revision,
