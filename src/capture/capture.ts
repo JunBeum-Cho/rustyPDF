@@ -12,7 +12,9 @@ interface CaptureRegionArgs {
   scale?: number;
 }
 
-const DEFAULT_SCALE = 2.0; // retina-quality by default
+// The backend scale is based on 96 dpi. Capture at 600 dpi so pasted/saved
+// regions do not inherit the viewer's zoom or display-resolution bitmap.
+const DEFAULT_SCALE = 600 / 96;
 
 export async function captureRegion(
   args: CaptureRegionArgs,

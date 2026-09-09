@@ -10,6 +10,7 @@ import {
   type SaveStatus,
 } from "../state/document";
 import type { Annotation, AnnotationTool } from "./types";
+import { sanitizeAnnotationHtml } from "./sanitize";
 
 const HISTORY_LIMIT = 80;
 
@@ -180,7 +181,7 @@ const stripTextStyleOverrides = (
   if (!html || typeof document === "undefined") return html;
 
   const template = document.createElement("template");
-  template.innerHTML = html;
+  template.innerHTML = sanitizeAnnotationHtml(html);
   template.content.querySelectorAll<HTMLElement>("*").forEach((element) => {
     if (patch.color !== undefined) {
       element.style.removeProperty("color");
@@ -428,7 +429,7 @@ export const updateAnnotationTextLive = (
     const item = state.items.find((a) => a.id === id);
     if (!item) return;
     if (!item.payload) item.payload = {};
-    item.payload.html = html;
+    item.payload.html = sanitizeAnnotationHtml(html);
     item.payload.text = text;
     state.dirty = true;
     state.saveStatus = "idle";
@@ -454,7 +455,7 @@ export const finalizeAnnotationText = (
     if (!item) return;
     item.style = { ...item.style, ...stylePatch };
     if (!item.payload) item.payload = {};
-    item.payload.html = html;
+    item.payload.html = sanitizeAnnotationHtml(html);
     item.payload.text = text;
     state.dirty = true;
     state.saveStatus = "idle";

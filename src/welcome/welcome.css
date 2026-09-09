@@ -1,8 +1,6 @@
 .welcome {
   flex: 1;
   display: flex;
-  align-items: center;
-  justify-content: center;
   padding: 48px 24px;
   overflow: auto;
   background: var(--bg);
@@ -11,6 +9,14 @@
 .welcome-inner {
   width: 100%;
   max-width: 520px;
+  /* Centered with auto margins rather than `align-items` / `justify-content`
+     on the scroll container. Both center the column while there's room, but
+     alignment-based centering also pushes the overflow *above* the scroll
+     origin once the recents list grows past the viewport — content up there
+     is clipped and unreachable, because a scroll container can't scroll past
+     scrollTop: 0. Auto margins collapse to 0 when free space goes negative,
+     so a long list simply starts at the top and scrolls normally. */
+  margin: auto;
   display: flex;
   flex-direction: column;
   align-items: stretch;

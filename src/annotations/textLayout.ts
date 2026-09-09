@@ -1,5 +1,6 @@
 import { contentBox } from "./coords";
 import type { Annotation, TextLayoutFragment, TextLayoutLine } from "./types";
+import { escapeAnnotationText, sanitizeAnnotationHtml } from "./sanitize";
 // Measurement boxes are styled by `.annotation-text`, so the stylesheet has
 // to be loaded even if the viewer never mounted.
 import "./annotations.css";
@@ -11,14 +12,10 @@ import "./annotations.css";
  */
 export const annotationHtml = (annotation: Annotation): string => {
   const html = annotation.payload?.html;
-  if (html != null) return html;
+  if (html != null) return typeof html === "string" ? sanitizeAnnotationHtml(html) : "";
   const text = annotation.payload?.text ?? "";
   if (!text) return "";
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\n/g, "<br>");
+  return escapeAnnotationText(text);
 };
 
 /**

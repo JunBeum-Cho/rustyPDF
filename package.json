@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "tsx --test tests/*.test.ts",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -22,11 +23,14 @@
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-dialog": "^2.0.1",
     "@tauri-apps/plugin-fs": "^2.0.3",
+    "dompurify": "^3.4.15",
     "lucide-solid": "^1.11.0",
     "solid-js": "^1.9.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
+    "@types/jsdom": "^21.1.7",
+    "jsdom": "^26.1.0",
     "tsx": "^4.21.0",
     "typescript": "~5.6.3",
     "vite": "^6.0.3",

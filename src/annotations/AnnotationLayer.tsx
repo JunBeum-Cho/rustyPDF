@@ -37,6 +37,7 @@ import {
   type TextStylePatch,
 } from "./textFormat";
 import { annotationHtml } from "./textLayout";
+import { insertSafeEditorTransfer, sanitizeAnnotationHtml } from "./sanitize";
 import {
   captureRegion,
   copyPngToClipboard,
@@ -206,7 +207,7 @@ const TEXT_OBJECT_BLEED = 4;
 
 const htmlIsEmpty = (html: string) => {
   const tmp = document.createElement("div");
-  tmp.innerHTML = html;
+  tmp.innerHTML = sanitizeAnnotationHtml(html);
   return tmp.textContent?.trim() === "";
 };
 
@@ -219,7 +220,7 @@ const htmlIsEmpty = (html: string) => {
  */
 const htmlToPlainText = (html: string): string => {
   const root = document.createElement("div");
-  root.innerHTML = html;
+  root.innerHTML = sanitizeAnnotationHtml(html);
   let out = "";
   const walk = (node: Node) => {
     if (node.nodeType === Node.TEXT_NODE) {
@@ -1150,6 +1151,14 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
               }}
               contenteditable
               spellcheck={false}
+              onPaste={(event) => {
+                event.preventDefault();
+                if (event.clipboardData) insertSafeEditorTransfer(event.clipboardData);
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                if (event.dataTransfer) insertSafeEditorTransfer(event.dataTransfer);
+              }}
               onPointerDown={(event) => event.stopPropagation()}
               onFocus={(event) => registerEditor(event.currentTarget)}
               onInput={(event) => {

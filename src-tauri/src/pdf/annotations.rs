@@ -669,6 +669,11 @@ fn display_to_raw_page_matrix(
 
 pub fn flatten_pdf_bytes(source_bytes: &[u8], data: Value) -> Result<Vec<u8>, PdfError> {
     let sidecar: AnnotationSidecar = serde_json::from_value(data)?;
+    // Export without overlays is an exact copy, including the original image
+    // streams, color profiles, fonts, and vector content.
+    if sidecar.annotations.is_empty() {
+        return Ok(source_bytes.to_vec());
+    }
     let pdfium = create_pdfium()?;
     let mut document = pdfium
         .load_pdf_from_byte_slice(source_bytes, None)
@@ -1227,7 +1232,9 @@ fn draw_image(
         return Ok(());
     };
 
-    let image = apply_image_opacity(decode_annotation_image(src)?, annotation.style.opacity);
+    // Keep raster images at their original pixel dimensions. Only SVG needs
+    // rasterization, at print resolution based on its size on the PDF page.
+    let image = apply_image_opacity(decode_annotation_image(src, Some(rect))?, annotation.style.opacity);
     page.objects_mut()
         .create_image_object(
             PdfPoints::new(rect.x),
@@ -1359,10 +1366,10 @@ fn annotation_fill_color(style: &AnnotationStyle) -> Option<PdfColor> {
         .map(|value| color_from_hex(value, style.opacity))
 }
 
-fn decode_annotation_image(src: &str) -> Result<DynamicImage, PdfError> {
+fn decode_annotation_image(src: &str, rect: Option<AnnotationRect>) -> Result<DynamicImage, PdfError> {
     let (mime, bytes) = decode_image_data_url(src)?;
     if is_svg_payload(mime.as_deref(), &bytes) {
-        return rasterize_svg(&bytes);
+        return rasterize_svg(&bytes, rect);
     }
 
     decode_raster_image(&bytes)
@@ -1429,16 +1436,36 @@ fn is_svg_payload(mime: Option<&str>, bytes: &[u8]) -> bool {
     prefix.contains("<svg")
 }
 
-fn rasterize_svg(bytes: &[u8]) -> Result<DynamicImage, PdfError> {
+fn rasterize_svg(bytes: &[u8], rect: Option<AnnotationRect>) -> Result<DynamicImage, PdfError> {
     let mut options = usvg::Options::default();
     options.fontdb_mut().load_system_fonts();
 
     let tree = usvg::Tree::from_data(bytes, &options)
         .map_err(|e| PdfError::Image(format!("invalid svg image: {e}")))?;
-    let size = tree.size().to_int_size();
-    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())
+    let size = tree.size();
+    // Small intrinsic SVG sizes (e.g. a 24px icon) must not dictate PDF quality.
+    // Preserve at least the intrinsic resolution and render at >= 600 dpi in
+    // both displayed dimensions, including stretched/rotated annotations.
+    const EXPORT_DPI: f32 = 600.0;
+    const MAX_SVG_PIXELS: f64 = 64_000_000.0;
+    let scale = rect.map_or(1.0, |rect| {
+        (rect.w * EXPORT_DPI / 72.0 / size.width())
+            .max(rect.h * EXPORT_DPI / 72.0 / size.height())
+            .max(1.0)
+    });
+    let width = (size.width() * scale).ceil();
+    let height = (size.height() * scale).ceil();
+    if !width.is_finite() || !height.is_finite()
+        || width <= 0.0 || height <= 0.0
+        || width as f64 * height as f64 > MAX_SVG_PIXELS
+    {
+        return Err(PdfError::Image(
+            "SVG가 너무 커서 고화질로 내보낼 수 없습니다. 이미지의 배치 크기를 줄여 주세요.".into(),
+        ));
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width as u32, height as u32)
         .ok_or_else(|| PdfError::Image("invalid svg image size".into()))?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
 
     let mut rgba = pixmap.data().to_vec();
     for pixel in rgba.chunks_exact_mut(4) {
@@ -1687,7 +1714,7 @@ mod tests {
             BASE64_STANDARD.encode(bytes.into_inner())
         );
 
-        let decoded = decode_annotation_image(&src).unwrap();
+        let decoded = decode_annotation_image(&src, None).unwrap();
         assert_eq!(decoded.width(), 1);
         assert_eq!(decoded.height(), 1);
         assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [10, 20, 30, 255]);
@@ -1698,10 +1725,152 @@ mod tests {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="2" height="1" fill="#ff0000"/></svg>"##;
         let src = format!("data:image/svg+xml;base64,{}", BASE64_STANDARD.encode(svg));
 
-        let decoded = decode_annotation_image(&src).unwrap();
+        let decoded = decode_annotation_image(&src, None).unwrap();
         assert_eq!(decoded.width(), 2);
         assert_eq!(decoded.height(), 1);
         assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn svg_export_uses_placement_resolution_and_rejects_excessive_allocations() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"><rect width="24" height="12" fill="red"/></svg>"#;
+        let rect = AnnotationRect {
+            x: 0.0,
+            y: 0.0,
+            w: 144.0,
+            h: 72.0,
+        };
+        let image = rasterize_svg(svg, Some(rect)).unwrap();
+        assert_eq!((image.width(), image.height()), (1200, 600));
+        assert_eq!(image.to_rgba8().get_pixel(600, 300).0, [255, 0, 0, 255]);
+        let huge = AnnotationRect {
+            w: 100_000.0,
+            h: 100_000.0,
+            ..rect
+        };
+        assert!(rasterize_svg(svg, Some(huge)).is_err());
+    }
+
+    #[test]
+    fn exported_pdf_preserves_vectors_original_pixels_and_high_resolution_overlays() {
+        let stamp = RgbaImage::from_fn(1440, 720, |x, y| {
+            if (x / 12 + y / 12) % 2 == 0 {
+                Rgba([20, 70, 160, 255])
+            } else {
+                Rgba([240, 200, 30, 255])
+            }
+        });
+        let source_bytes = {
+            let pdfium = create_pdfium().unwrap();
+            let mut source = pdfium.create_new_pdf().unwrap();
+            let font = source.fonts_mut().helvetica();
+            let mut page = source
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .unwrap();
+            page.objects_mut()
+                .create_text_object(
+                    PdfPoints::new(72.0),
+                    PdfPoints::new(780.0),
+                    "Original vector text - preserved",
+                    font,
+                    PdfPoints::new(18.0),
+                )
+                .unwrap();
+            page.objects_mut()
+                .create_image_object(
+                    PdfPoints::new(72.0),
+                    PdfPoints::new(700.0),
+                    &DynamicImage::ImageRgba8(stamp.clone()),
+                    Some(PdfPoints::new(144.0)),
+                    Some(PdfPoints::new(72.0)),
+                )
+                .unwrap();
+            drop(page);
+            source.save_to_bytes().unwrap()
+        };
+        assert_eq!(
+            flatten_pdf_bytes(&source_bytes, json!({"annotations": []})).unwrap(),
+            source_bytes
+        );
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(stamp.clone())
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let raster_src = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(png.into_inner())
+        );
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#fff"/><circle cx="12" cy="12" r="10" fill="none" stroke="#123456" stroke-width="0.25"/><path d="M4 4L20 20M20 4L4 20" stroke="#123456" stroke-width="0.25"/></svg>"##;
+        let svg_src = format!("data:image/svg+xml;base64,{}", BASE64_STANDARD.encode(svg));
+        let exported = flatten_pdf_bytes(
+            &source_bytes,
+            json!({"annotations": [
+                {"page":0,"type":"text","rect":{"x":72,"y":220,"w":400,"h":40},
+                 "style":{"fontSize":18},"payload":{"text":"Exported text stays vector"}},
+                {"page":0,"type":"image","rect":{"x":72,"y":280,"w":144,"h":72},
+                 "payload":{"imageSrc":raster_src}},
+                {"page":0,"type":"image","rect":{"x":72,"y":390,"w":144,"h":144},
+                 "payload":{"imageSrc":svg_src}},
+                {"page":0,"type":"rect","rect":{"x":260,"y":390,"w":144,"h":144},
+                 "style":{"color":"#123456","width":0.5}}
+            ]}),
+        )
+        .unwrap();
+        let pdfium = create_pdfium().unwrap();
+        let doc = pdfium.load_pdf_from_byte_slice(&exported, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        assert!(
+            page.objects()
+                .iter()
+                .filter(|o| o.as_text_object().is_some())
+                .count()
+                >= 2
+        );
+        assert!(page.objects().iter().any(|o| o.as_path_object().is_some()));
+        let images: Vec<_> = page
+            .objects()
+            .iter()
+            .filter_map(|o| {
+                o.as_image_object()
+                    .map(|image| image.get_raw_image().unwrap().to_rgba8())
+            })
+            .collect();
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0], stamp, "original PDF image must keep every pixel");
+        assert_eq!(
+            images[1], stamp,
+            "inserted raster must not be downsampled or JPEG-compressed"
+        );
+        assert_eq!((images[2].width(), images[2].height()), (1200, 1200));
+        let render = page
+            .render_with_config(&PdfRenderConfig::new().set_target_width(1190))
+            .unwrap()
+            .as_image()
+            .to_rgba8();
+        let original_doc = pdfium
+            .load_pdf_from_byte_slice(&source_bytes, None)
+            .unwrap();
+        let original_render = original_doc
+            .pages()
+            .get(0)
+            .unwrap()
+            .render_with_config(&PdfRenderConfig::new().set_target_width(1190))
+            .unwrap()
+            .as_image()
+            .to_rgba8();
+        assert_eq!(
+            image::imageops::crop_imm(&render, 0, 0, 1190, 360).to_image(),
+            image::imageops::crop_imm(&original_render, 0, 0, 1190, 360).to_image(),
+            "export must not change the rendering of original page content"
+        );
+        if let Ok(directory) = std::env::var("RUSTYPDF_EXPORT_QA_DIR") {
+            let directory = std::path::Path::new(&directory);
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("source.pdf"), &source_bytes).unwrap();
+            std::fs::write(directory.join("export.pdf"), &exported).unwrap();
+            render.save(directory.join("export.png")).unwrap();
+        }
     }
 
     #[test]

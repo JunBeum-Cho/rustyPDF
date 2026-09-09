@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 use uuid::Uuid;
 
+// Claiming a moved document and publishing its aliases must not race another
+// load/save in a different Tauri worker. Individual files are replaced atomically.
+static STORE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationLoadResult {
@@ -109,8 +113,19 @@ fn write_stable(root: &Path, sidecar: &Value) -> Result<(), PdfError> {
         .ok_or_else(|| PdfError::Pdfium("annotation sidecar has no PDF fingerprint".into()))?;
     let document_key = value_string(sidecar, "documentKey")
         .ok_or_else(|| PdfError::Pdfium("annotation sidecar has no document key".into()))?;
+    let path = stable_path(root, fingerprint, document_key);
+    if let Ok(existing) = read_json(&path) {
+        if sidecar_source(&existing).is_some_and(|source| {
+            Some(source) != sidecar_source(sidecar) && Path::new(source).exists()
+        }) {
+            return Err(PdfError::Pdfium(
+                "다른 PDF가 사용 중인 주석 저장소에는 저장할 수 없습니다. 문서를 다시 열어 주세요."
+                    .into(),
+            ));
+        }
+    }
     let bytes = serde_json::to_vec_pretty(sidecar)?;
-    atomic_write(stable_path(root, fingerprint, document_key), &bytes)?;
+    atomic_write(path, &bytes)?;
     Ok(())
 }
 
@@ -130,7 +145,7 @@ fn authoritative_exact_sidecar(
     pdf_bytes: &[u8],
     fingerprint: &str,
     alias: Value,
-) -> Value {
+) -> Result<Option<Value>, PdfError> {
     if let Some(document_key) =
         value_string(&alias, "documentKey").filter(|key| valid_document_key(key))
     {
@@ -139,11 +154,27 @@ fn authoritative_exact_sidecar(
             let stable_matches = sidecar_fingerprint(&stable) == Some(fingerprint)
                 && value_string(&stable, "documentKey") == Some(document_key);
             if stable_matches {
-                return enrich_sidecar(pdf_path, pdf_bytes, stable);
+                // Opening an already-owned record is read-only; only a changed
+                // owner needs a durable claim before we return the annotations.
+                if sidecar_source(&stable) == Some(pdf_path) {
+                    return Ok(Some(stable));
+                }
+                // An old alias can survive a move (or a previous buggy recovery).
+                // Never let it claim notes now owned by another existing PDF.
+                if sidecar_source(&stable)
+                    .is_some_and(|source| source != pdf_path && Path::new(source).exists())
+                {
+                    return Ok(None);
+                }
+                let claimed = enrich_sidecar(pdf_path, pdf_bytes, stable);
+                write_stable(root, &claimed)?;
+                return Ok(Some(claimed));
             }
         }
     }
-    enrich_sidecar(pdf_path, pdf_bytes, alias)
+    let claimed = enrich_sidecar(pdf_path, pdf_bytes, alias);
+    write_stable(root, &claimed)?;
+    Ok(Some(claimed))
 }
 
 /// Stage the fingerprint-addressed sidecar for bytes that are about to
@@ -154,6 +185,7 @@ pub fn stage_for_pdf_bytes(
     pdf_bytes: &[u8],
     data: Value,
 ) -> Result<(), PdfError> {
+    let _guard = STORE_LOCK.lock();
     let root = annotation_root(app)?;
     let sidecar = enrich_sidecar(pdf_path, pdf_bytes, data);
     write_stable(&root, &sidecar)
@@ -168,6 +200,7 @@ pub fn save_for_pdf_bytes(
     pdf_bytes: &[u8],
     data: Value,
 ) -> Result<(), PdfError> {
+    let _guard = STORE_LOCK.lock();
     let root = annotation_root(app)?;
     let sidecar = enrich_sidecar(pdf_path, pdf_bytes, data);
     write_stable(&root, &sidecar)?;
@@ -224,9 +257,12 @@ fn load_from_root(
         match read_json(&alias) {
             Ok(exact) => match sidecar_fingerprint(&exact) {
                 Some(stored) if stored == fingerprint => {
-                    let exact =
-                        authoritative_exact_sidecar(root, pdf_path, pdf_bytes, &fingerprint, exact);
-                    return Ok(result(Some(exact), "exact", None));
+                    if let Some(exact) =
+                        authoritative_exact_sidecar(root, pdf_path, pdf_bytes, &fingerprint, exact)?
+                    {
+                        return Ok(result(Some(exact), "exact", None));
+                    }
+                    alias_mismatch = true;
                 }
                 None => {
                     // A path-keyed v1 record is safe at its exact original path.
@@ -272,8 +308,10 @@ fn load_from_root(
         .collect();
     if moved.len() == 1 {
         let recovered = enrich_sidecar(pdf_path, pdf_bytes, moved[0].clone());
-        // Best-effort alias repair. Recovery itself remains usable through
-        // the fingerprint record if this write fails.
+        // Publish the new owner BEFORE returning notes or repairing the alias.
+        // Otherwise another identical PDF still sees the missing old source and
+        // recovers the same key. A failed durable claim must fail the recovery.
+        write_stable(root, &recovered)?;
         let _ = write_alias(root, pdf_path, &recovered);
         return Ok(result(
             Some(recovered),
@@ -320,6 +358,7 @@ pub fn load_for_pdf_bytes(
     pdf_path: &str,
     pdf_bytes: &[u8],
 ) -> Result<AnnotationLoadResult, PdfError> {
+    let _guard = STORE_LOCK.lock();
     load_from_root(&annotation_root(app)?, pdf_path, pdf_bytes)
 }
 
@@ -382,6 +421,116 @@ mod tests {
         let loaded = load_from_root(&root, copy.to_str().unwrap(), bytes).unwrap();
         assert_eq!(loaded.status, "ambiguous");
         assert!(loaded.sidecar.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_document_does_not_share_notes_with_a_later_copy() {
+        let root = temp_root("move-then-copy");
+        let old = root.join("a.pdf");
+        let moved = root.join("b.pdf");
+        let copy = root.join("c.pdf");
+        let bytes = b"same-pdf";
+        std::fs::write(&old, bytes).unwrap();
+        let original = sample(old.to_str().unwrap(), bytes, "doc-a");
+        write_stable(&root, &original).unwrap();
+        write_alias(&root, old.to_str().unwrap(), &original).unwrap();
+        std::fs::rename(&old, &moved).unwrap();
+
+        let recovered = load_from_root(&root, moved.to_str().unwrap(), bytes).unwrap();
+        assert_eq!(recovered.status, "recovered");
+        std::fs::copy(&moved, &copy).unwrap();
+        let copied = load_from_root(&root, copy.to_str().unwrap(), bytes).unwrap();
+        assert!(copied.sidecar.is_none());
+
+        // Reusing the old filename must not bypass ownership via its old alias.
+        std::fs::copy(&moved, &old).unwrap();
+        let recreated = load_from_root(&root, old.to_str().unwrap(), bytes).unwrap();
+        assert!(recreated.sidecar.is_none());
+        assert!(write_stable(&root, &original).is_err());
+
+        // A newly saved copy gets independent notes and cannot affect the owner.
+        let independent = sample(copy.to_str().unwrap(), bytes, "doc-c");
+        write_stable(&root, &independent).unwrap();
+        write_alias(&root, copy.to_str().unwrap(), &independent).unwrap();
+        let reopened = load_from_root(&root, moved.to_str().unwrap(), bytes).unwrap();
+        assert_eq!(reopened.sidecar.unwrap()["annotations"][0]["id"], "doc-a");
+        assert_eq!(
+            load_from_root(&root, copy.to_str().unwrap(), bytes)
+                .unwrap()
+                .sidecar
+                .unwrap()["annotations"][0]["id"],
+            "doc-c"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_claim_survives_alias_write_failure_and_another_move() {
+        let root = temp_root("move-alias-failure");
+        let old = root.join("a.pdf");
+        let moved = root.join("b.pdf");
+        let next = root.join("c.pdf");
+        let copy = root.join("copy.pdf");
+        let bytes = b"same-pdf";
+        std::fs::write(&old, bytes).unwrap();
+        write_stable(&root, &sample(old.to_str().unwrap(), bytes, "doc-a")).unwrap();
+        std::fs::rename(&old, &moved).unwrap();
+        std::fs::create_dir(alias_path(&root, moved.to_str().unwrap())).unwrap();
+        assert_eq!(
+            load_from_root(&root, moved.to_str().unwrap(), bytes)
+                .unwrap()
+                .status,
+            "recovered"
+        );
+        std::fs::copy(&moved, &copy).unwrap();
+        assert!(load_from_root(&root, copy.to_str().unwrap(), bytes)
+            .unwrap()
+            .sidecar
+            .is_none());
+        std::fs::rename(&moved, &next).unwrap();
+        assert_eq!(
+            load_from_root(&root, next.to_str().unwrap(), bytes)
+                .unwrap()
+                .status,
+            "recovered"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repairs_legacy_recovery_alias_without_sharing_its_key() {
+        let root = temp_root("old-recovery");
+        let old = root.join("missing.pdf");
+        let moved = root.join("b.pdf");
+        let copy = root.join("c.pdf");
+        let bytes = b"same-pdf";
+        std::fs::write(&moved, bytes).unwrap();
+        std::fs::write(&copy, bytes).unwrap();
+        // Reproduce the disk layout left behind by the previous implementation.
+        write_stable(&root, &sample(old.to_str().unwrap(), bytes, "doc-a")).unwrap();
+        write_alias(
+            &root,
+            moved.to_str().unwrap(),
+            &sample(moved.to_str().unwrap(), bytes, "doc-a"),
+        )
+        .unwrap();
+        write_alias(
+            &root,
+            copy.to_str().unwrap(),
+            &sample(copy.to_str().unwrap(), bytes, "doc-a"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_from_root(&root, moved.to_str().unwrap(), bytes)
+                .unwrap()
+                .status,
+            "exact"
+        );
+        assert!(load_from_root(&root, copy.to_str().unwrap(), bytes)
+            .unwrap()
+            .sidecar
+            .is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

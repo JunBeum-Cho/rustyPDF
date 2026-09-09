@@ -7,6 +7,7 @@ import {
   setAnnotationSaveStatusForTab,
 } from "./store";
 import type { Annotation, AnnotationSidecar } from "./types";
+import { sanitizeAnnotation } from "./sanitize";
 
 export const buildAnnotationSidecar = (
   tab: Tab,
@@ -22,7 +23,7 @@ export const buildAnnotationSidecar = (
     rotation,
   })),
   updatedAt: new Date().toISOString(),
-  annotations,
+  annotations: annotations.map(sanitizeAnnotation),
 });
 
 /**

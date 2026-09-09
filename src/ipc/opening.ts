@@ -2,6 +2,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { onCleanup, onMount } from "solid-js";
 import { initialOpenPaths, openPdf, requestOpenPdf } from "./pdf";
+import { physicalDropToClient } from "./dropPosition";
 
 const isPdfPath = (path: string) => path.toLowerCase().endsWith(".pdf");
 const isImagePath = (path: string) =>
@@ -49,10 +50,12 @@ export function installFileOpenHandlers() {
               void requestOpenPdf(p);
             }
             if (images.length > 0 && imageDropHandler) {
-              imageDropHandler(images, {
-                x: event.payload.position.x,
-                y: event.payload.position.y,
-              });
+              // Read the current WebView ratio for every drop, including after
+              // moving between monitors. No async gap before the page hit test.
+              imageDropHandler(images, physicalDropToClient(
+                event.payload.position,
+                window.devicePixelRatio,
+              ));
             }
           },
         );

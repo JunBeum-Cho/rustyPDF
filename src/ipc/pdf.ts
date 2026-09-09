@@ -6,6 +6,7 @@ import {
   setAnnotationSaveStatusForTab,
 } from "../annotations/store";
 import { measureTextLayout } from "../annotations/textLayout";
+import { sanitizeAnnotation } from "../annotations/sanitize";
 import type { Annotation, AnnotationSidecar } from "../annotations/types";
 import {
   activeTab,
@@ -37,7 +38,7 @@ const makeSidecar = (
   measureText = false,
 ): AnnotationSidecar => {
   // Deep-copy/unwrap Solid.js Store proxies before crossing the Tauri bridge
-  const cleanAnnotations: Annotation[] = JSON.parse(JSON.stringify(annotations));
+  const cleanAnnotations: Annotation[] = JSON.parse(JSON.stringify(annotations)).map(sanitizeAnnotation);
   if (measureText) {
     for (const annotation of cleanAnnotations) {
       if (annotation.type !== "text") continue;
@@ -216,9 +217,9 @@ async function performOpenPdf(path: string): Promise<void> {
       // Finish sidecar loading before publishing the tab. Otherwise a user
       // can create an annotation while this IPC is in flight and have the
       // late load response silently replace that new work.
-      tab.annotations.items = JSON.parse(
-        JSON.stringify(loaded.sidecar?.annotations ?? []),
-      );
+      const items = loaded.sidecar?.annotations ?? [];
+      if (!Array.isArray(items)) throw new Error("주석 목록 형식이 올바르지 않습니다.");
+      tab.annotations.items = JSON.parse(JSON.stringify(items)).map(sanitizeAnnotation);
       if (loaded.sidecar?.documentKey) {
         tab.annotationDocumentKey = loaded.sidecar.documentKey;
       }
