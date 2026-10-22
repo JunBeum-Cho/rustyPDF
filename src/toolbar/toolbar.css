@@ -134,3 +134,9 @@
   border-color: var(--accent);
   opacity: 0.92;
 }
+
+.navigation-input { width: 40px; height: 28px; padding: 0 2px; text-align: center; font: inherit; font-variant-numeric: tabular-nums; color: var(--text-dim); background: transparent; border: 1px solid transparent; border-radius: 4px; }
+.navigation-input:hover, .navigation-input:focus { border-color: var(--border); background: var(--surface); color: var(--text); }
+.zoom-entry { width: 58px; }
+.toolbar-group { flex-shrink: 0; }
+@media (max-width: 760px) { .toolbar { gap: 6px; padding: 6px; } .toolbar-spacer { display: none; } }

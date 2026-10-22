@@ -30,3 +30,9 @@
 .ocr-btn.busy svg {
   animation: ocr-pulse 1.2s ease-in-out infinite;
 }
+
+.ocr-popover {
+  box-sizing: border-box;
+  width: min(260px, calc(100vw - 16px));
+  overflow-wrap: anywhere;
+}

@@ -1,5 +1,5 @@
+import { invoke } from "../platform/desktop";
 import { createStore } from "solid-js/store";
-import { ocrPdfPage, ocrPdfStatus } from "../ipc/pdf";
 
 export type OcrPageStatus = "idle" | "queued" | "running" | "done" | "error";
 
@@ -14,6 +14,7 @@ interface DocOcrState {
   current: number | null;
   /** last error message if any */
   error: string | null;
+  failures: Record<number, string>;
   /** total pages in this doc */
   total: number;
 }
@@ -34,6 +35,7 @@ const initDoc = (docId: string, revision: number, total: number) => {
       queued: new Set(),
       current: null,
       error: null,
+      failures: {},
       total,
     });
   } else {
@@ -48,9 +50,15 @@ export async function refreshOcrStatus(
 ): Promise<void> {
   initDoc(docId, revision, total);
   try {
+    const { ocrPdfStatus } = await import("../ipc/pdf");
     const indices = await ocrPdfStatus(docId, revision);
     if (ocrState.byDoc[docId]?.revision !== revision) return;
-    setOcrState("byDoc", docId, "done", new Set(indices));
+    setOcrState(
+      "byDoc",
+      docId,
+      "done",
+      new Set([...ocrState.byDoc[docId].done, ...indices]),
+    );
   } catch (error) {
     console.error("ocr status failed", error);
   }
@@ -94,19 +102,52 @@ export function invalidateOcrForDocument(
     queued: new Set(),
     current: null,
     error: null,
+    failures: {},
     total,
   });
 }
 
 /**
  * Run OCR over all pages that don't have a result yet. One page at a time —
- * the platform helpers (Vision / Windows.Media.Ocr) are themselves serial,
- * and serial dispatch keeps the system responsive.
+ * serial dispatch keeps worker memory bounded and progress predictable.
  */
+interface OcrBackend {
+  recognize(docId: string, revision: number, page: number): Promise<unknown>;
+  flush(docId: string, revision: number): Promise<unknown>;
+}
+const backend: OcrBackend = {
+  recognize: async (...args) =>
+    (await import("../ipc/pdf")).ocrPdfPage(...args),
+  flush: (docId, expectedRevision) =>
+    invoke("pdf_ocr_flush", { docId, expectedRevision }),
+};
+
 export async function runOcrAll(
   docId: string,
   expectedRevision: number,
   totalPages: number,
+  service: OcrBackend = backend,
+): Promise<void> {
+  return runOcrTargets(docId, expectedRevision, totalPages, null, service);
+}
+
+export async function runOcrPage(
+  docId: string,
+  revision: number,
+  total: number,
+  page: number,
+  service: OcrBackend = backend,
+): Promise<void> {
+  if (!Number.isInteger(page) || page < 0 || page >= total) return;
+  return runOcrTargets(docId, revision, total, page, service);
+}
+
+async function runOcrTargets(
+  docId: string,
+  expectedRevision: number,
+  totalPages: number,
+  page: number | null,
+  service: OcrBackend,
 ): Promise<void> {
   initDoc(docId, expectedRevision, totalPages);
   // Only one whole-document run owns the UI at a time. Starting another run
@@ -118,44 +159,58 @@ export async function runOcrAll(
 
   const targets: number[] = [];
   for (let i = 0; i < totalPages; i++) {
-    if (!ocrState.byDoc[docId]?.done.has(i)) targets.push(i);
+    if ((page === null || i === page) && !ocrState.byDoc[docId]?.done.has(i))
+      targets.push(i);
   }
   setOcrState("byDoc", docId, "queued", new Set(targets));
   setOcrState("byDoc", docId, "error", null);
 
-  for (const idx of targets) {
-    if (
-      !isActiveRun(docId, runId) ||
-      ocrState.byDoc[docId]?.revision !== expectedRevision
-    ) return; // cancelled or superseded by another document generation
-    setOcrState("byDoc", docId, "current", idx);
+  try {
+    for (const idx of targets) {
+      if (
+        !isActiveRun(docId, runId) ||
+        ocrState.byDoc[docId]?.revision !== expectedRevision
+      )
+        return; // cancelled or superseded by another document generation
+      setOcrState("byDoc", docId, "current", idx);
+      try {
+        await service.recognize(docId, expectedRevision, idx);
+        // A structural page edit (including rotation) cancels the run while
+        // the platform OCR request may still be finishing. Do not advertise
+        // that now-stale result as valid in the UI.
+        if (
+          !isActiveRun(docId, runId) ||
+          ocrState.byDoc[docId]?.revision !== expectedRevision
+        )
+          return;
+        setOcrState("byDoc", docId, "failures", idx, undefined!);
+        setOcrState("byDoc", docId, (s) => ({
+          ...s,
+          done: new Set([...s.done, idx]),
+          queued: new Set([...s.queued].filter((q) => q !== idx)),
+        }));
+      } catch (error) {
+        if (
+          !isActiveRun(docId, runId) ||
+          ocrState.byDoc[docId]?.revision !== expectedRevision
+        )
+          return;
+        const msg = error instanceof Error ? error.message : String(error);
+        setOcrState("byDoc", docId, "error", msg);
+        setOcrState("byDoc", docId, "failures", idx, msg);
+        console.error("ocr page failed", idx, error);
+        // Keep going — one bad page shouldn't abort the whole document.
+        setOcrState("byDoc", docId, (s) => ({
+          ...s,
+          queued: new Set([...s.queued].filter((q) => q !== idx)),
+        }));
+      }
+    }
+  } finally {
     try {
-      await ocrPdfPage(docId, expectedRevision, idx);
-      // A structural page edit (including rotation) cancels the run while
-      // the platform OCR request may still be finishing. Do not advertise
-      // that now-stale result as valid in the UI.
-      if (
-        !isActiveRun(docId, runId) ||
-        ocrState.byDoc[docId]?.revision !== expectedRevision
-      ) return;
-      setOcrState("byDoc", docId, (s) => ({
-        ...s,
-        done: new Set([...s.done, idx]),
-        queued: new Set([...s.queued].filter((q) => q !== idx)),
-      }));
+      await service.flush(docId, expectedRevision);
     } catch (error) {
-      if (
-        !isActiveRun(docId, runId) ||
-        ocrState.byDoc[docId]?.revision !== expectedRevision
-      ) return;
-      const msg = error instanceof Error ? error.message : String(error);
-      setOcrState("byDoc", docId, "error", msg);
-      console.error("ocr page failed", idx, error);
-      // Keep going — one bad page shouldn't abort the whole document.
-      setOcrState("byDoc", docId, (s) => ({
-        ...s,
-        queued: new Set([...s.queued].filter((q) => q !== idx)),
-      }));
+      console.error("OCR flush failed", error);
     }
   }
 
@@ -169,9 +224,13 @@ export function cancelOcr() {
   supersedeActiveRun();
 }
 
-export function getDocProgress(
-  docId: string,
-): { done: number; total: number; current: number | null; error: string | null } | null {
+export function getDocProgress(docId: string): {
+  done: number;
+  total: number;
+  current: number | null;
+  error: string | null;
+  failures: Record<number, string>;
+} | null {
   const s = ocrState.byDoc[docId];
   if (!s) return null;
   return {
@@ -179,5 +238,6 @@ export function getDocProgress(
     total: s.total,
     current: s.current,
     error: s.error,
+    failures: s.failures,
   };
 }

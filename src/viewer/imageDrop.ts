@@ -1,8 +1,10 @@
-import { readFile } from "@tauri-apps/plugin-fs";
-import { addAnnotation, createAnnotationId } from "../annotations/store";
+import { emitToast } from "../capture/capture";
+import { normalizeImageSource } from "../images/normalize";
+import { readFile } from "../platform/desktop";
+import { createAnnotationId } from "../annotations/store";
 import type { Annotation } from "../annotations/types";
 import { displayPointToPage } from "../annotations/coords";
-import { activeTab } from "../state/document";
+import { activeTab, documentStore, updateTabById } from "../state/document";
 
 const EXT_MIME: Record<string, string> = {
   png: "image/png",
@@ -26,7 +28,10 @@ const bytesToBase64 = (bytes: Uint8Array): string => {
   let out = "";
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {
-    out += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+    out += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + CHUNK)),
+    );
   }
   return btoa(out);
 };
@@ -80,10 +85,11 @@ export async function handleImageDrop(
 ): Promise<void> {
   const tab = activeTab();
   if (!tab) return;
+  const { tabId, docId, revision } = tab;
 
   const hit = findPageHit(position.x, position.y);
   if (!hit) {
-    console.warn("image drop: no page under cursor");
+    emitToast("이미지를 넣을 페이지 위에 다시 놓아 주세요.", "error");
     return;
   }
   const pageMeta = tab.pages[hit.pageIndex];
@@ -101,6 +107,8 @@ export async function handleImageDrop(
   // on the same spot.
   let stackOffset = 0;
 
+  let reportedFailure = false;
+  const reportFailure = (message: string) => { if (!reportedFailure) { reportedFailure = true; emitToast(message, "error"); } };
   for (const path of paths) {
     try {
       const bytes = await readFile(path);
@@ -109,12 +117,18 @@ export async function handleImageDrop(
       // the raw size so a huge file can't freeze the UI / bloat the sidecar.
       const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
       if (bytes.length > MAX_IMAGE_BYTES) {
-        console.warn("image drop: file too large, skipping", path, bytes.length);
-        window.alert("이미지가 너무 커서 추가할 수 없습니다 (최대 20MB).");
+        console.warn(
+          "image drop: file too large, skipping",
+          path,
+          bytes.length,
+        );
+        reportFailure("이미지가 너무 큽니다. 20MB 이하 파일로 다시 시도하세요.");
         continue;
       }
       const mime = mimeFromPath(path);
-      const dataUrl = `data:${mime};base64,${bytesToBase64(bytes)}`;
+      const dataUrl = await normalizeImageSource(
+        `data:${mime};base64,${bytesToBase64(bytes)}`,
+      );
       const { w, h } = await measureImage(dataUrl);
 
       // Default size: 40% of the page width, preserve aspect ratio. The user
@@ -145,10 +159,30 @@ export async function handleImageDrop(
           imageNaturalHeight: h,
         },
       };
-      addAnnotation(annotation);
+      const live = documentStore.tabs.find(
+        (candidate) => candidate.tabId === tabId,
+      );
+      if (!live || live.docId !== docId || live.revision !== revision) return;
+      updateTabById(tabId, (target) => {
+        target.annotations.history.push(
+          target.annotations.items.map((item) =>
+            JSON.parse(JSON.stringify(item)),
+          ),
+        );
+        if (target.annotations.history.length > 80)
+          target.annotations.history.shift();
+        target.annotations.future = [];
+        target.annotations.items.push(annotation);
+        target.annotations.selectedIds = [annotation.id];
+        target.annotations.editVersion += 1;
+        target.annotations.dirty = true;
+        target.annotations.saveStatus = "idle";
+        target.annotations.saveError = null;
+      });
       stackOffset += 18;
     } catch (error) {
       console.error("image drop failed for", path, error);
+      reportFailure("이미지를 추가하지 못했습니다. 파일을 확인하고 다시 놓아 주세요.");
     }
   }
 }

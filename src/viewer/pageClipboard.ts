@@ -1,3 +1,5 @@
+import { snapshotPageEdit, commitPageEditHistory } from "./documentHistoryState";
+import { emitToast } from "../capture/capture";
 import { onCleanup, onMount } from "solid-js";
 import { createStore } from "solid-js/store";
 import { produce } from "solid-js/store";
@@ -110,6 +112,8 @@ const applyEditResult = (
     pages: PageMeta[];
     fileSize: number;
     pageMapping: Array<number | null>;
+    historyToken?: string;
+    retainedHistoryTokens?: string[];
   },
   newSelection: number[],
   newCurrentPage: number,
@@ -133,6 +137,7 @@ const applyEditResult = (
       "문서가 편집 응답을 기다리는 동안 변경되어 결과를 적용하지 않았습니다.",
     );
   }
+  const before = snapshotPageEdit(live);
   updateTabById(tabId, (t) => {
     t.docId = result.id;
     t.revision = result.revision;
@@ -144,12 +149,11 @@ const applyEditResult = (
     t.pageDirty = true;
     t.selectedPageIndices = newSelection;
     t.pageAnchor = newSelection.length > 0 ? newSelection[0] : null;
-    t.currentPage = Math.max(
-      0,
-      Math.min(result.pageCount - 1, newCurrentPage),
-    );
+    t.navigationVersion = (t.navigationVersion ?? 0) + 1;
+    t.currentPage = Math.max(0, Math.min(result.pageCount - 1, newCurrentPage));
   });
   remapAnnotationsForTab(tabId, result.pageMapping, insertedAnnotations);
+  commitPageEditHistory(tabId, before, result);
   invalidateOcrForDocument(result.id, result.revision, result.pageCount);
 };
 
@@ -174,6 +178,7 @@ async function performCopySelectedPages(
     return true;
   } catch (error) {
     console.error("copy pages failed", error);
+    emitToast(`페이지 복사 실패: ${error instanceof Error ? error.message : String(error)}`, "error");
     return false;
   }
 }
@@ -195,7 +200,7 @@ async function performDeleteSelectedPages(
   const indices = selectedIndices ?? sortedSelection(tab);
   if (indices.length === 0) return;
   if (indices.length >= tab.pageCount) {
-    window.alert("모든 페이지를 삭제할 수는 없습니다.");
+    emitToast("모든 페이지를 삭제할 수는 없습니다.");
     return;
   }
   try {
@@ -218,7 +223,7 @@ async function performDeleteSelectedPages(
     );
   } catch (error) {
     console.error("delete pages failed", error);
-    window.alert(
+    emitToast(
       `페이지 삭제 실패: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
@@ -237,7 +242,7 @@ async function performCutSelectedPages(tabId: string): Promise<void> {
   if (!tab) return;
   if (tab.selectedPageIndices.length === 0) return;
   if (tab.selectedPageIndices.length >= tab.pageCount) {
-    window.alert("모든 페이지를 잘라낼 수는 없습니다.");
+    emitToast("모든 페이지를 잘라낼 수는 없습니다.");
     return;
   }
   const indices = sortedSelection(tab);
@@ -245,7 +250,7 @@ async function performCutSelectedPages(tabId: string): Promise<void> {
   // failed copy followed by a successful delete silently destroys the pages.
   const copied = await performCopySelectedPages(tabId, indices);
   if (!copied) {
-    window.alert("페이지 복사에 실패하여 잘라내기를 취소했습니다.");
+    emitToast("페이지 복사에 실패하여 잘라내기를 취소했습니다.");
     return;
   }
   await performDeleteSelectedPages(tabId, indices);
@@ -270,7 +275,7 @@ export function pastePagesAfter(afterIndex?: number): Promise<void> {
   const tabId = tab.tabId;
   const token = pageClipboard.token;
   if (!token) {
-    window.alert("클립보드에 페이지가 없습니다.");
+    emitToast("클립보드에 페이지가 없습니다.");
     return Promise.resolve();
   }
   // Capture the annotation payload alongside the token before any await. A
@@ -298,10 +303,7 @@ export function pastePagesAfter(afterIndex?: number): Promise<void> {
       );
       // The backend clamps an out-of-range afterIndex to the document bounds.
       // Mirror that exact insertion point for selection and annotation pages.
-      const insertedStart = Math.max(
-        0,
-        Math.min(current.pageCount, after + 1),
-      );
+      const insertedStart = Math.max(0, Math.min(current.pageCount, after + 1));
       const actualInsertedCount = result.pageCount - current.pageCount;
       const newSelection: number[] = [];
       for (let i = 0; i < actualInsertedCount; i++) {
@@ -318,7 +320,7 @@ export function pastePagesAfter(afterIndex?: number): Promise<void> {
       );
     } catch (error) {
       console.error("paste pages failed", error);
-      window.alert(
+      emitToast(
         `페이지 붙여넣기 실패: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
@@ -361,7 +363,7 @@ export function duplicateSelectedPages(): Promise<void> {
       );
     } catch (error) {
       console.error("duplicate pages failed", error);
-      window.alert(
+      emitToast(
         `페이지 복제 실패: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
@@ -377,6 +379,7 @@ export const togglePageSelection = (index: number) => {
     else set.add(index);
     tab.selectedPageIndices = [...set].sort((a, b) => a - b);
     tab.pageAnchor = index;
+    tab.navigationVersion = (tab.navigationVersion ?? 0) + 1;
     tab.currentPage = index;
   });
 };
@@ -385,6 +388,7 @@ export const setSinglePageSelection = (index: number) => {
   updateActiveTab((tab) => {
     tab.selectedPageIndices = [index];
     tab.pageAnchor = index;
+    tab.navigationVersion = (tab.navigationVersion ?? 0) + 1;
     tab.currentPage = index;
   });
 };
@@ -397,6 +401,7 @@ export const extendPageSelection = (index: number) => {
     const range: number[] = [];
     for (let i = lo; i <= hi; i++) range.push(i);
     tab.selectedPageIndices = range;
+    tab.navigationVersion = (tab.navigationVersion ?? 0) + 1;
     tab.currentPage = index;
   });
 };
@@ -404,9 +409,7 @@ export const extendPageSelection = (index: number) => {
 export const clearPageSelection = () => {
   setDocumentStore(
     "tabs",
-    documentStore.tabs.findIndex(
-      (t) => t.tabId === documentStore.activeTabId,
-    ),
+    documentStore.tabs.findIndex((t) => t.tabId === documentStore.activeTabId),
     produce((tab: Tab) => {
       tab.selectedPageIndices = [];
       tab.pageAnchor = null;

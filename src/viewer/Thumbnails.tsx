@@ -1,4 +1,11 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import {
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+} from "solid-js";
 import { renderPage } from "../ipc/pdf";
 import { activeTab, type PageMeta } from "../state/document";
 import { clampSidebarWidth, setUiStore, uiStore } from "../state/ui";
@@ -13,6 +20,8 @@ import {
   setSinglePageSelection,
   togglePageSelection,
 } from "./pageClipboard";
+
+import { shortcutLabel } from "../platform/shortcuts";
 
 interface ThumbnailCanvasProps {
   page: PageMeta;
@@ -32,7 +41,8 @@ const thumbnailScale = (
   rotation: 0 | 90 | 180 | 270,
   thumbWidth: number,
 ) => {
-  const displayWidth = rotation === 90 || rotation === 270 ? page.height : page.width;
+  const displayWidth =
+    rotation === 90 || rotation === 270 ? page.height : page.width;
   return thumbWidth / displayWidth;
 };
 
@@ -41,7 +51,8 @@ const thumbnailHeight = (
   rotation: 0 | 90 | 180 | 270,
   thumbWidth: number,
 ) => {
-  const displayHeight = rotation === 90 || rotation === 270 ? page.width : page.height;
+  const displayHeight =
+    rotation === 90 || rotation === 270 ? page.width : page.height;
   return displayHeight * thumbnailScale(page, rotation, thumbWidth);
 };
 
@@ -57,8 +68,31 @@ function paintRgba(canvas: HTMLCanvasElement, buf: ArrayBuffer) {
   ctx.putImageData(new ImageData(pixels, w, h), 0, 0);
 }
 
+let thumbnailObserver: IntersectionObserver | null = null;
+const thumbnailVisibility = new WeakMap<Element, (visible: boolean) => void>();
+function observeThumbnail(
+  canvas: HTMLCanvasElement,
+  handler: (visible: boolean) => void,
+) {
+  thumbnailObserver ??= new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries)
+        thumbnailVisibility.get(entry.target)?.(entry.isIntersecting);
+    },
+    { rootMargin: "480px 0px", threshold: 0 },
+  );
+  thumbnailVisibility.set(canvas, handler);
+  thumbnailObserver.observe(canvas);
+  return () => {
+    thumbnailObserver?.unobserve(canvas);
+    thumbnailVisibility.delete(canvas);
+  };
+}
+
 function ThumbnailCanvas(props: ThumbnailCanvasProps) {
   let canvas!: HTMLCanvasElement;
+  const [error, setError] = createSignal(false);
+  const [retry, setRetry] = createSignal(0);
   const [visible, setVisible] = createSignal(false);
   const scale = createMemo(() =>
     thumbnailScale(props.page, props.rotation, props.thumbWidth),
@@ -68,16 +102,16 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
   );
 
   createEffect(() => {
-    const observer = new IntersectionObserver(
-      ([entry]) => setVisible(Boolean(entry?.isIntersecting)),
-      { rootMargin: "480px 0px", threshold: 0 },
-    );
-    observer.observe(canvas);
-    onCleanup(() => observer.disconnect());
+    onCleanup(observeThumbnail(canvas, setVisible));
   });
 
   createEffect(() => {
-    if (!visible()) return;
+    if (!visible()) {
+      canvas.width = canvas.height = 0;
+      return;
+    }
+    retry();
+    setError(false);
     // Same docId can point at new bytes after overwrite-save.
     props.contentVersion;
     const currentScale = scale();
@@ -96,7 +130,7 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
         );
         if (!cancelled) paintRgba(canvas, buf);
       } catch (error) {
-        if (!cancelled) console.error("render thumbnail failed", idx, error);
+        if (!cancelled) { setError(true); console.error("render thumbnail failed", idx, error); }
       }
     })();
     onCleanup(() => {
@@ -105,11 +139,14 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
   });
 
   return (
+    <div class="thumbnail-preview" onKeyDown={event => { if (error() && (event.key === "Enter" || event.key === " ")) { event.stopPropagation(); event.preventDefault(); setRetry(value => value + 1); } }}>
     <canvas
       ref={canvas}
       class="thumbnail-canvas"
       style={{ width: `${props.thumbWidth}px`, height: `${height()}px` }}
     />
+    <Show when={error()}><span class="thumbnail-error" role="alert" onClick={event => { event.stopPropagation(); setRetry(value => value + 1); }}>표시 실패 · 클릭해서 재시도</span></Show>
+    </div>
   );
 }
 
@@ -217,7 +254,11 @@ export function Thumbnails() {
                 active: tab().currentPage === index(),
                 selected: selectedSet().has(index()),
               }}
-              onClick={(event) => handleClick(event, index())}
+              onClick={(event) => {
+                const retry = event.currentTarget.querySelector<HTMLElement>(".thumbnail-error");
+                if (retry) { retry.click(); return; }
+                handleClick(event, index());
+              }}
               onContextMenu={(event) => handleContextMenu(event, index())}
             >
               <ThumbnailCanvas
@@ -251,33 +292,33 @@ export function Thumbnails() {
             onPointerDown={(e) => e.stopPropagation()}
           >
             <li>
-              <button
-                onClick={() => runMenuAction(copySelectedPages)}
-              >
+              <button onClick={() => runMenuAction(copySelectedPages)}>
                 복사 ({tab().selectedPageIndices.length})
-                <span class="kbd">⌘C</span>
+                <span class="kbd">{shortcutLabel("C")}</span>
               </button>
             </li>
             <li>
               <button onClick={() => runMenuAction(cutSelectedPages)}>
                 잘라내기
-                <span class="kbd">⌘X</span>
+                <span class="kbd">{shortcutLabel("X")}</span>
               </button>
             </li>
             <li>
               <button
                 disabled={!pageClipboard.token}
-                onClick={() => runMenuAction(() => pastePagesAfter(state().pageIndex))}
+                onClick={() =>
+                  runMenuAction(() => pastePagesAfter(state().pageIndex))
+                }
               >
                 붙여넣기
                 {pageClipboard.token ? ` (${pageClipboard.count})` : ""}
-                <span class="kbd">⌘V</span>
+                <span class="kbd">{shortcutLabel("V")}</span>
               </button>
             </li>
             <li>
               <button onClick={() => runMenuAction(duplicateSelectedPages)}>
                 복제
-                <span class="kbd">⌘D</span>
+                <span class="kbd">{shortcutLabel("D")}</span>
               </button>
             </li>
             <li class="separator" />

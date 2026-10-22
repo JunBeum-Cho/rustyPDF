@@ -1,3 +1,4 @@
+import { normalizeFontFamily } from "./fonts";
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import type { JSX } from "solid-js";
 import type { PageMeta } from "../state/document";
@@ -168,6 +169,7 @@ const styleForTool = (type: AnnotationKind) => {
   if (type === "text") {
     return {
       ...common,
+      color: annotationStore.textColor,
       width: 1,
       fill: "transparent",
     };
@@ -940,7 +942,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     const fontSize = () => (annotation.style.fontSize ?? 16) * props.zoom;
     // Scale the text box's padding with zoom so its page-space inset stays a
     // constant 6px (x) / 4px (y) at every zoom level. The PDF exporter assumes
-    // exactly those insets (see draw_text in src-tauri), so keeping them
+    // exactly those insets in its measured text layout, so keeping them
     // zoom-invariant here is what makes on-screen and exported positions agree.
     const textPadding = () => `${4 * props.zoom}px ${6 * props.zoom}px`;
     const strokeWidth = () => Math.max(1, annotation.style.width * props.zoom);
@@ -1090,9 +1092,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                   color: annotation.style.color,
                   "font-size": `${fontSize()}px`,
                   padding: textPadding(),
-                  "font-family": annotation.style.fontFamily ?? "inherit",
+                  "font-family": normalizeFontFamily(annotation.style.fontFamily),
                   "font-weight": annotation.style.fontWeight ?? "normal",
-                  "font-style": annotation.style.fontStyle ?? "normal",
+                  "font-style": annotation.style.fontStyle === "italic" ? "oblique 12deg" : annotation.style.fontStyle ?? "normal",
                   "text-decoration": annotation.style.textDecoration ?? "none",
                   "text-align": annotation.style.textAlign ?? "left",
                   "background-color": annotation.style.fill ?? "transparent",
@@ -1113,9 +1115,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                 color: annotation.style.color,
                 "font-size": `${fontSize()}px`,
                 padding: textPadding(),
-                "font-family": annotation.style.fontFamily ?? "inherit",
+                "font-family": normalizeFontFamily(annotation.style.fontFamily),
                 "font-weight": annotation.style.fontWeight ?? "normal",
-                "font-style": annotation.style.fontStyle ?? "normal",
+                "font-style": annotation.style.fontStyle === "italic" ? "oblique 12deg" : annotation.style.fontStyle ?? "normal",
                 "text-decoration": annotation.style.textDecoration ?? "none",
                 "text-align": annotation.style.textAlign ?? "left",
                 "background-color": annotation.style.fill ?? "transparent",
@@ -1131,7 +1133,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
                 el.dataset.annotationColor = annotation.style.color;
                 el.dataset.annotationFontSize = String(annotation.style.fontSize ?? 16);
                 if (annotation.style.fontFamily) {
-                  el.dataset.annotationFontFamily = annotation.style.fontFamily;
+                  el.dataset.annotationFontFamily = normalizeFontFamily(annotation.style.fontFamily);
                 } else {
                   delete el.dataset.annotationFontFamily;
                 }

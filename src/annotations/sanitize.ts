@@ -1,3 +1,4 @@
+import { normalizeFontFamily } from "./fonts";
 import DOMPurify from "dompurify";
 import type { Annotation } from "./types";
 
@@ -10,6 +11,7 @@ const TEXT_STYLES = new Set([
 ]);
 
 DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
+  if (data.attrName === "face") { data.attrValue = normalizeFontFamily(data.attrValue); return; }
   if (data.attrName !== "style") return;
   const source = (node as HTMLElement).style;
   if (!source) {
@@ -20,7 +22,7 @@ DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
   for (const property of Array.from(source)) {
     const value = source.getPropertyValue(property);
     if (TEXT_STYLES.has(property) && !/url\s*\(|expression\s*\(|var\s*\(|[\\@]/i.test(value)) {
-      clean.setProperty(property, value);
+      clean.setProperty(property, property === "font-family" ? normalizeFontFamily(value) : property === "font-style" && /^(italic|oblique)/.test(value) ? "oblique 12deg" : value);
     }
   }
   data.attrValue = clean.cssText;
@@ -46,14 +48,15 @@ export const escapeAnnotationText = (text: string): string => text
   .replace(/\r?\n/g, "<br>");
 
 export const sanitizeAnnotation = (annotation: Annotation): Annotation => {
-  if (annotation.payload?.html == null) return annotation;
+  if (annotation.type !== "text") return annotation;
   return {
     ...annotation,
+    style: { ...annotation.style, fontFamily: normalizeFontFamily(annotation.style.fontFamily) },
     payload: {
       ...annotation.payload,
-      html: typeof annotation.payload.html === "string"
+      ...(annotation.payload?.html == null ? {} : { html: typeof annotation.payload.html === "string"
         ? sanitizeAnnotationHtml(annotation.payload.html)
-        : "",
+        : "" }),
     },
   };
 };
@@ -61,8 +64,23 @@ export const sanitizeAnnotation = (annotation: Annotation): Annotation => {
 /** Prevent browser paste/drop from inserting unsafe markup before onInput runs. */
 export const insertSafeEditorTransfer = (transfer: DataTransfer): void => {
   const html = transfer.getData("text/html");
-  const safe = html
-    ? sanitizeAnnotationHtml(html)
+  const template = document.createElement("template");
+  template.innerHTML = sanitizeAnnotationHtml(html);
+  // Match the destination's typography. In particular, copied PDF/OCR
+  // overlays carry invisible colors and page-sized font metrics.
+  template.content.querySelectorAll<HTMLElement>("*").forEach((element) => {
+    element.removeAttribute("color");
+    element.removeAttribute("face");
+    element.removeAttribute("size");
+    for (const property of Array.from(element.style)) {
+      if (!["font-weight", "font-style", "text-decoration", "text-decoration-line", "vertical-align"].includes(property)) {
+        element.style.removeProperty(property);
+      }
+    }
+    if (!element.style.cssText) element.removeAttribute("style");
+  });
+  const safe = template.content.textContent?.trim()
+    ? template.innerHTML
     : escapeAnnotationText(transfer.getData("text/plain"));
   if (safe) document.execCommand("insertHTML", false, safe);
 };

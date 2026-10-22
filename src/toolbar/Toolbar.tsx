@@ -10,15 +10,21 @@ import {
   Plus,
   RotateCw,
   Save,
+  SaveAll,
+  MoveHorizontal,
+  Maximize,
+  Search,
   Sun,
 } from "lucide-solid";
 import { activeTab, updateActiveTab } from "../state/document";
 import { applyTheme, setUiStore, uiStore } from "../state/ui";
 import { requestOpenPdfDialog, saveActivePdf } from "../ipc/pdf";
-import { AnnotationToolbar } from "../annotations/AnnotationToolbar";
 import { OcrButton } from "../ocr/OcrButton";
+import { AnnotationToolbar } from "../annotations/AnnotationToolbar";
 import { rotateDocument } from "../viewer/pageRotation";
 import "./toolbar.css";
+import { shortcutLabel } from "../platform/shortcuts";
+import { navigateToPage, navigationMode, parsePageEntry, parseZoomEntry, setManualZoom, setNavigationMode } from "../viewer/navigation";
 
 function cycleTheme() {
   const next =
@@ -36,15 +42,19 @@ const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 function zoomIn() {
   const tab = activeTab();
   if (!tab) return;
+  setNavigationMode("manual");
   const next = ZOOM_STEPS.find((z) => z > tab.zoom);
-  if (next) updateActiveTab((t) => { t.zoom = next; });
+  if (next)
+    setManualZoom(next);
 }
 
 function zoomOut() {
   const tab = activeTab();
   if (!tab) return;
+  setNavigationMode("manual");
   const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
-  if (prev) updateActiveTab((t) => { t.zoom = prev; });
+  if (prev)
+    setManualZoom(prev);
 }
 
 const ICON_SIZE = 16;
@@ -62,7 +72,7 @@ export function Toolbar() {
         <button
           class="toolbar-btn"
           onClick={requestOpenPdfDialog}
-          title="PDF 열기 (Ctrl+O)"
+          title={`PDF 열기 (${shortcutLabel("O")})`}
         >
           <FolderOpen size={ICON_SIZE} />
           <span>열기</span>
@@ -75,23 +85,24 @@ export function Toolbar() {
             <button
               class="toolbar-btn icon-only"
               onClick={() => setUiStore("sidebarOpen", (open) => !open)}
-              title="썸네일 (Ctrl+\\)"
+              title={`썸네일 (${shortcutLabel("\\")})`}
               classList={{ active: uiStore.sidebarOpen }}
             >
               <PanelLeft size={ICON_SIZE} />
             </button>
             <button
               class="toolbar-btn icon-only"
-              classList={{ "save-dirty": tab().pageDirty || tab().annotations.dirty }}
+              classList={{
+                "save-dirty": tab().pageDirty || tab().annotations.dirty,
+              }}
               onClick={(event) => void saveActivePdf(event.shiftKey)}
-              title={
-                (tab().pageDirty || tab().annotations.dirty)
-                  ? "변경사항 저장 (Cmd+S, Shift+클릭=다른 이름)"
-                  : "다른 이름으로 저장 (Cmd+Shift+S)"
-              }
+              title={`저장 — 다음에도 주석을 편집할 수 있습니다 (${shortcutLabel("S")})`}
+              aria-label="저장"
             >
               <Save size={ICON_SIZE} />
             </button>
+            <button class="toolbar-btn icon-only" onClick={() => void saveActivePdf(true)} aria-label="다른 이름으로 저장" title={`다른 이름으로 저장 (${shortcutLabel("S", true)})`}><SaveAll size={ICON_SIZE} /></button>
+            <button class="toolbar-btn icon-only" onClick={() => setUiStore("searchOpen", v => !v)} aria-label="문서 검색" aria-pressed={uiStore.searchOpen} title={`검색 (${shortcutLabel("F")})`}><Search size={ICON_SIZE} /></button>
           </div>
         )}
       </Show>
@@ -116,6 +127,7 @@ export function Toolbar() {
                 disabled={tab().currentPage <= 0}
                 onClick={() =>
                   updateActiveTab((t) => {
+                    t.navigationVersion = (t.navigationVersion ?? 0) + 1;
                     t.currentPage = Math.max(0, t.currentPage - 1);
                   })
                 }
@@ -123,14 +135,17 @@ export function Toolbar() {
               >
                 <ChevronLeft size={ICON_SIZE} />
               </button>
-              <span class="page-indicator">
-                {tab().currentPage + 1} / {tab().pageCount}
-              </span>
+              <label class="page-indicator">
+                <input class="navigation-input" aria-label="페이지 번호" inputmode="numeric" value={tab().currentPage + 1}
+                  onChange={event => { const page = parsePageEntry(event.currentTarget.value, tab().pageCount); if (page !== null) navigateToPage(page); event.currentTarget.value = String((page ?? tab().currentPage) + 1); }}
+                  onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} /> / {tab().pageCount}
+              </label>
               <button
                 class="toolbar-btn icon-only"
                 disabled={tab().currentPage >= tab().pageCount - 1}
                 onClick={() =>
                   updateActiveTab((t) => {
+                    t.navigationVersion = (t.navigationVersion ?? 0) + 1;
                     t.currentPage = Math.min(
                       t.pageCount - 1,
                       t.currentPage + 1,
@@ -144,15 +159,25 @@ export function Toolbar() {
             </div>
 
             <div class="toolbar-group">
-              <button class="toolbar-btn icon-only" onClick={zoomOut} title="축소">
+              <button
+                class="toolbar-btn icon-only"
+                onClick={zoomOut}
+                title="축소"
+              >
                 <Minus size={ICON_SIZE} />
               </button>
-              <span class="zoom-indicator">
-                {Math.round(tab().zoom * 100)}%
-              </span>
-              <button class="toolbar-btn icon-only" onClick={zoomIn} title="확대">
+              <input class="navigation-input zoom-entry" aria-label="확대 비율 (%)" inputmode="decimal" value={`${Math.round(tab().zoom * 100)}%`}
+                onChange={event => { const zoom = parseZoomEntry(event.currentTarget.value); if (zoom !== null) setManualZoom(zoom); event.currentTarget.value = `${Math.round(tab().zoom * 100)}%`; }}
+                onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+              <button
+                class="toolbar-btn icon-only"
+                onClick={zoomIn}
+                title="확대"
+              >
                 <Plus size={ICON_SIZE} />
               </button>
+              <button class="toolbar-btn icon-only" aria-pressed={navigationMode() === "width"} onClick={() => setNavigationMode("width")} aria-label="너비 맞춤" title="너비 맞춤"><MoveHorizontal size={ICON_SIZE} /></button>
+              <button class="toolbar-btn icon-only" aria-pressed={navigationMode() === "page"} onClick={() => setNavigationMode("page")} aria-label="페이지 맞춤" title="페이지 맞춤"><Maximize size={ICON_SIZE} /></button>
               <button
                 class="toolbar-btn icon-only"
                 onClick={() => void rotateDocument(1)}

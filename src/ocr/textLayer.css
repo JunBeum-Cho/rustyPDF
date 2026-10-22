@@ -50,3 +50,20 @@
   background: rgba(56, 132, 255, 0.32);
   color: transparent;
 }
+
+.search-mark-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  pointer-events: none;
+  user-select: none;
+  transform-origin: top left;
+}
+.search-location-mark {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(255, 183, 0, 0.38);
+  outline: 2px solid rgba(216, 131, 0, 0.8);
+  border-radius: 2px;
+}

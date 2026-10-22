@@ -7,6 +7,7 @@ import {
 } from "../state/document";
 import { closeTab, requestOpenPdfDialog } from "../ipc/pdf";
 import "./tabs.css";
+import { shortcutLabel } from "../platform/shortcuts";
 
 export function TabStrip() {
   return (
@@ -18,6 +19,7 @@ export function TabStrip() {
           return (
             <div
               role="tab"
+              aria-selected={active()}
               tabindex="0"
               class="tab-item"
               classList={{ active: active(), dirty: dirty() }}
@@ -46,7 +48,8 @@ export function TabStrip() {
               <button
                 type="button"
                 class="tab-close"
-                title="탭 닫기 (Cmd+W)"
+                title={`탭 닫기 (${shortcutLabel("W")})`}
+                aria-label="탭 닫기"
                 onPointerDown={(event) => event.stopPropagation()}
                 onClick={(event) => {
                   event.stopPropagation();
@@ -62,7 +65,7 @@ export function TabStrip() {
       <button
         type="button"
         class="tab-new"
-        title="새 PDF 열기 (Cmd+O)"
+        title={`새 PDF 열기 (${shortcutLabel("O")})`}
         onClick={requestOpenPdfDialog}
       >
         +

@@ -1,6 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
+import { invoke } from "../platform/desktop";
+import { save } from "../platform/desktop";
+import { writeFile } from "../platform/desktop";
 import { activeTab } from "../state/document";
 
 interface CaptureRegionArgs {
@@ -44,42 +44,16 @@ export async function captureRegion(
   return new Uint8Array(result).buffer;
 }
 
-/**
- * Copy a PNG byte buffer to the system clipboard. This works on WebKit
- * (Tauri's macOS webview) ONLY when the call runs synchronously inside the
- * triggering user gesture — otherwise WebKit treats the gesture as expired
- * and rejects the write. Since the caller almost always wants to await
- * async render work first, we keep `copyPngToClipboard` for already-resolved
- * data and expose `copyDeferredPngToClipboard` for the gesture-preserving
- * pattern below.
- */
+/** Write rendered PNG bytes through the native desktop clipboard. */
 export async function copyPngToClipboard(buf: ArrayBuffer): Promise<void> {
-  const blob = new Blob([buf], { type: "image/png" });
-  await navigator.clipboard.write([
-    new ClipboardItem({ "image/png": blob }),
-  ]);
+  await invoke("clipboard_write_png", { bytes: new Uint8Array(buf) });
 }
 
-/**
- * Gesture-preserving clipboard copy: invoke this synchronously from inside
- * the user-event handler (pointerup, click, etc.) and pass a Promise that
- * resolves to the PNG bytes. WebKit/Safari accepts a Promise inside
- * `ClipboardItem` and treats the write as belonging to the still-live
- * gesture — so async backend work doesn't blow up the permission check.
- */
+/** Wait for the capture before writing the native clipboard. */
 export async function copyDeferredPngToClipboard(
   pngPromise: Promise<ArrayBuffer>,
 ): Promise<void> {
-  // Build the ClipboardItem now (during the gesture). The browser holds
-  // onto the Promise<Blob> and resolves it later. If the Promise rejects
-  // the clipboard write fails, but we never lose the user-activation
-  // window.
-  const blobPromise = pngPromise.then(
-    (buf) => new Blob([buf], { type: "image/png" }),
-  );
-  await navigator.clipboard.write([
-    new ClipboardItem({ "image/png": blobPromise }),
-  ]);
+  await copyPngToClipboard(await pngPromise);
 }
 
 export async function saveCaptureAs(buf: ArrayBuffer): Promise<boolean> {

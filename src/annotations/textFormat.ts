@@ -1,3 +1,5 @@
+import { normalizeFontFamily } from "./fonts";
+export { COMMON_FONTS } from "./fonts";
 /**
  * Rich-text formatting helpers for the contenteditable text annotation editor.
  *
@@ -147,8 +149,8 @@ const applyEditorDefaultStyle = (
     editor.dataset.annotationFontSize = String(patch.fontSize);
   }
   if (patch.fontFamily !== undefined) {
-    editor.style.fontFamily = patch.fontFamily;
-    editor.dataset.annotationFontFamily = patch.fontFamily;
+    editor.style.fontFamily = normalizeFontFamily(patch.fontFamily);
+    editor.dataset.annotationFontFamily = normalizeFontFamily(patch.fontFamily);
   }
 };
 
@@ -201,6 +203,13 @@ const runCommandOnEditor = (
   // sidecar without surprises.
   document.execCommand("styleWithCSS", false, "true");
   document.execCommand(command, false, value);
+  if (command === "italic") {
+    // Chromium emits inline `italic` with its default synthesis angle. Keep
+    // the live selection/caret while matching the export's 12-degree shear.
+    for (const element of [editor, ...editor.querySelectorAll<HTMLElement>("[style]")]) {
+      if (element.style.fontStyle === "italic") element.style.fontStyle = "oblique 12deg";
+    }
+  }
   // Update savedRange to the result so subsequent commands stack on the
   // same selection instead of resetting back to the pre-command range.
   const sel = window.getSelection();
@@ -236,7 +245,7 @@ export const alignLeft = () => applyCommand("justifyLeft");
 export const alignCenter = () => applyCommand("justifyCenter");
 export const alignRight = () => applyCommand("justifyRight");
 
-export const setFontFamily = (font: string) => applyCommand("fontName", font);
+export const setFontFamily = (font: string) => applyCommand("fontName", normalizeFontFamily(font));
 
 const wrapSelectionWithFontSize = (editor: HTMLElement, px: number) => {
   restoreSelectionInto(editor);
@@ -293,6 +302,7 @@ export interface TextFormatState {
   align: "left" | "center" | "right" | "justify" | null;
   fontFamily: string | null;
   fontSizePx: number | null;
+  color: string | null;
 }
 
 export const queryTextFormatState = (): TextFormatState | null => {
@@ -306,9 +316,11 @@ export const queryTextFormatState = (): TextFormatState | null => {
   })();
   let fontFamily: string | null = null;
   let fontSizePx: number | null = null;
+  let color: string | null = null;
+  let italic = document.queryCommandState("italic");
   try {
     const fam = document.queryCommandValue("fontName");
-    if (fam) fontFamily = fam.replace(/^['"]+|['"]+$/g, "");
+    if (fam) fontFamily = normalizeFontFamily(fam);
   } catch { /* ignore */ }
   try {
     // Read the computed style of the focus node's parent element for an
@@ -318,29 +330,23 @@ export const queryTextFormatState = (): TextFormatState | null => {
       sel?.focusNode?.nodeType === Node.ELEMENT_NODE
         ? (sel.focusNode as HTMLElement)
         : sel?.focusNode?.parentElement ?? null;
-    if (node) {
-      const sz = window.getComputedStyle(node).fontSize;
+    if (node && editor.contains(node)) {
+      const computed = window.getComputedStyle(node);
+      italic = computed.fontStyle === "italic" || computed.fontStyle.startsWith("oblique");
+      const sz = computed.fontSize;
       const m = /^(\d+(?:\.\d+)?)px$/.exec(sz);
-      if (m) fontSizePx = Math.round(parseFloat(m[1]));
+      if (m) fontSizePx = Math.round(parseFloat(m[1]) / editorZoom(editor));
+      const rgb = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/.exec(computed.color);
+      if (rgb) color = "#" + rgb.slice(1).map((value) => Number(value).toString(16).padStart(2, "0")).join("");
     }
   } catch { /* ignore */ }
   return {
     bold: document.queryCommandState("bold"),
-    italic: document.queryCommandState("italic"),
+    italic,
     underline: document.queryCommandState("underline"),
     align,
     fontFamily,
     fontSizePx,
+    color,
   };
 };
-
-export const COMMON_FONTS = [
-  "Pretendard Variable",
-  "system-ui",
-  "Helvetica",
-  "Arial",
-  "Times New Roman",
-  "Georgia",
-  "Courier New",
-  "ui-monospace",
-];

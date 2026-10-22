@@ -141,3 +141,11 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Electron generated outputs and offline dependency assets
+dist-electron/
+release/
+resources/assets/
+public/pdfjs/
+public/fonts/
+.superlite/

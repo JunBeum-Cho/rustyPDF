@@ -1,3 +1,4 @@
+import { normalizeFontFamily } from "./fonts";
 import { contentBox } from "./coords";
 import type { Annotation, TextLayoutFragment, TextLayoutLine } from "./types";
 import { escapeAnnotationText, sanitizeAnnotationHtml } from "./sanitize";
@@ -171,7 +172,7 @@ const collectLines = (box: HTMLElement, host: HTMLElement): TextLayoutLine[] => 
     if (text.length > 0 && parent) {
       const computed = window.getComputedStyle(parent);
       const fontSize = Number.parseFloat(computed.fontSize) || 16;
-      const fontFamily = computed.fontFamily;
+      const fontFamily = normalizeFontFamily(computed.fontFamily);
       const ascent = baselineOffset(host, computed, fontSize, baselines);
       const shared = {
         fontSize,
@@ -179,7 +180,7 @@ const collectLines = (box: HTMLElement, host: HTMLElement): TextLayoutLine[] => 
         fontFamily,
         bold: isBoldWeight(computed.fontWeight),
         italic:
-          computed.fontStyle === "italic" || computed.fontStyle === "oblique",
+          computed.fontStyle === "italic" || computed.fontStyle.startsWith("oblique"),
         underline: (computed.textDecorationLine || computed.textDecoration || "")
           .includes("underline"),
       };
@@ -261,9 +262,9 @@ export const measureTextLayout = (
   box.style.minHeight = `${Math.max(20, layoutRect.h)}px`;
   box.style.color = style.color;
   box.style.fontSize = `${style.fontSize ?? 16}px`;
-  box.style.fontFamily = style.fontFamily ?? "";
+  box.style.fontFamily = normalizeFontFamily(style.fontFamily);
   box.style.fontWeight = style.fontWeight ?? "normal";
-  box.style.fontStyle = style.fontStyle ?? "normal";
+  box.style.fontStyle = style.fontStyle === "italic" ? "oblique 12deg" : style.fontStyle ?? "normal";
   box.style.textDecoration = style.textDecoration ?? "none";
   box.style.textAlign = style.textAlign ?? "left";
   box.innerHTML = html;

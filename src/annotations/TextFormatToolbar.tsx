@@ -1,5 +1,6 @@
+import { ColorPalette } from "./ColorPalette";
+import { shortcutLabel } from "../platform/shortcuts";
 import {
-  Show,
   createEffect,
   createMemo,
   createSignal,
@@ -21,6 +22,8 @@ import {
   hasSelectedTextAnnotation,
   setAnnotationFontFamily,
   setAnnotationFontSize,
+  setAnnotationColor,
+  setAnnotationUiColor,
   setAnnotationUiFontFamily,
   setAnnotationUiFontSize,
   toggleSelectedTextBold,
@@ -36,6 +39,7 @@ import {
   queryTextFormatState,
   setFontFamily,
   setFontSizePx,
+  setFontColor,
   type TextFormatState,
   toggleBold,
   toggleItalic,
@@ -50,10 +54,7 @@ const sameValueOrNull = <T,>(values: T[]): T | null => {
   return values.every((value) => value === first) ? first : null;
 };
 
-/**
- * Visible only when a text annotation has the user's attention — either
- * selected or actively being edited.
- */
+/** Text controls inside the floating annotation menu. */
 export function TextFormatToolbar() {
   const [editorFormatState, setEditorFormatState] =
     createSignal<TextFormatState | null>(null);
@@ -68,24 +69,6 @@ export function TextFormatToolbar() {
     if (pendingFormatSync) cancelAnimationFrame(pendingFormatSync);
     pendingFormatSync = requestAnimationFrame(syncFormatState);
   };
-
-  const isTextContext = createMemo(() => {
-    const tab = activeTab();
-    if (!tab) return false;
-    if (tab.annotations.editingId) {
-      const editing = tab.annotations.items.find(
-        (a) => a.id === tab.annotations.editingId,
-      );
-      if (editing?.type === "text") return true;
-    }
-    if (tab.annotations.selectedIds.length > 0) {
-      const selected = tab.annotations.items.filter((a) =>
-        tab.annotations.selectedIds.includes(a.id),
-      );
-      if (selected.some((a) => a.type === "text")) return true;
-    }
-    return false;
-  });
 
   const selectedAnnotationFormatState = createMemo<TextFormatState | null>(() => {
     const tab = activeTab();
@@ -109,6 +92,7 @@ export function TextFormatToolbar() {
       align: sameValueOrNull(aligns),
       fontFamily: sameValueOrNull(families),
       fontSizePx: sameValueOrNull(sizes),
+      color: sameValueOrNull(annotations.map((a) => a.style.color)),
     };
   });
 
@@ -138,6 +122,7 @@ export function TextFormatToolbar() {
     document.addEventListener("focusout", scheduleFormatSync);
     document.addEventListener("keyup", scheduleFormatSync);
     document.addEventListener("mouseup", scheduleFormatSync);
+    document.addEventListener("input", scheduleFormatSync);
   });
 
   onCleanup(() => {
@@ -147,6 +132,7 @@ export function TextFormatToolbar() {
     document.removeEventListener("focusout", scheduleFormatSync);
     document.removeEventListener("keyup", scheduleFormatSync);
     document.removeEventListener("mouseup", scheduleFormatSync);
+    document.removeEventListener("input", scheduleFormatSync);
   });
 
   // Formatting buttons must NOT steal focus from the contenteditable.
@@ -177,6 +163,19 @@ export function TextFormatToolbar() {
     }
     setAnnotationFontSize(fontSize);
   };
+
+  const applyColor = (color: string) => {
+    if (getActiveEditor()) {
+      setAnnotationUiColor(color);
+      setFontColor(color);
+    } else {
+      setAnnotationColor(color);
+    }
+    scheduleFormatSync();
+  };
+
+  const fontFamily = () => formatState()?.fontFamily ?? annotationStore.fontFamily;
+  const textColor = () => formatState()?.color ?? annotationStore.textColor;
 
   const applyBold = () => {
     if (getActiveEditor()) {
@@ -213,12 +212,14 @@ export function TextFormatToolbar() {
   };
 
   return (
-    <Show when={isTextContext()}>
-      <div class="text-format-toolbar" aria-label="text formatting">
+      <div class="text-format-toolbar" aria-label="텍스트 서식">
+        <div class="text-color-group" role="group" aria-label="글자색">
+          <ColorPalette label="글자색" value={textColor()} onChange={applyColor} />
+        </div>
         <select
           class="text-format-select"
-          title="폰트"
-          value={annotationStore.fontFamily}
+          title="오프라인 내장 글꼴 · 기존 글꼴은 Noto Sans KR 또는 Noto Serif KR로 대체됩니다."
+          value={fontFamily()}
           onChange={(event) => {
             const value = event.currentTarget.value;
             if (value) applyFontFamily(value);
@@ -226,6 +227,7 @@ export function TextFormatToolbar() {
           }}
         >
           <option value="">폰트</option>
+          {!(COMMON_FONTS as readonly string[]).includes(fontFamily()) && <option value={fontFamily()}>{fontFamily()}</option>}
           {COMMON_FONTS.map((font) => (
             <option value={font} style={{ "font-family": font }}>
               {font}
@@ -239,7 +241,7 @@ export function TextFormatToolbar() {
             type="number"
             min="4"
             max="120"
-            value={annotationStore.fontSize}
+            value={formatState()?.fontSizePx ?? annotationStore.fontSize}
             onInput={(event) => {
               const px = Number(event.currentTarget.value);
               if (Number.isFinite(px) && px >= 4) applyFontSize(px);
@@ -251,7 +253,7 @@ export function TextFormatToolbar() {
         <div class="text-format-group" role="group" aria-label="텍스트 스타일">
           <button
             type="button"
-            title="굵게 (Cmd+B)"
+            title={`굵게 (${shortcutLabel("B")})`}
             aria-pressed={formatState()?.bold ? "true" : "false"}
             classList={{ active: formatState()?.bold ?? false }}
             onMouseDown={guardFocus}
@@ -261,7 +263,7 @@ export function TextFormatToolbar() {
           </button>
           <button
             type="button"
-            title="기울임 (Cmd+I)"
+            title={`기울임 (${shortcutLabel("I")})`}
             aria-pressed={formatState()?.italic ? "true" : "false"}
             classList={{ active: formatState()?.italic ?? false }}
             onMouseDown={guardFocus}
@@ -271,7 +273,7 @@ export function TextFormatToolbar() {
           </button>
           <button
             type="button"
-            title="밑줄 (Cmd+U)"
+            title={`밑줄 (${shortcutLabel("U")})`}
             aria-pressed={formatState()?.underline ? "true" : "false"}
             classList={{ active: formatState()?.underline ?? false }}
             onMouseDown={guardFocus}
@@ -314,6 +316,5 @@ export function TextFormatToolbar() {
           </button>
         </div>
       </div>
-    </Show>
   );
 }

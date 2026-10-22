@@ -1,79 +1,36 @@
-# rustpdf
+# RustyPDF
 
-Lightweight cross-platform PDF viewer (macOS / Windows) with annotation tools.
+RustyPDF is a local PDF editor for macOS and Windows. The Solid interface uses PDF.js for viewing, text selection, search and capture. Electron runs PDF editing, annotation storage, export and Korean/English OCR in a separate Node worker.
 
-Inspired by macOS Preview and ALZip Viewer.
+## Development
 
-## Stack
+Install **Node.js 22.13 or newer**, then run:
 
-- **Tauri 2.x** — native shell, ~Rust backend + WebView UI
-- **pdfium-render** — Chromium's PDF engine via Rust bindings
-- **Solid.js + Vite + TypeScript** — frontend
-- **LRU bitmap cache + virtual scroll** — handles 100MB PDFs without buckling
-
-## First-time setup
-
-```bash
-npm install
-npm run setup-pdfium     # downloads libpdfium for your host into src-tauri/lib
+```sh
+npm ci
+npm run dev
 ```
 
-Required toolchains:
+The postinstall script downloads the Electron 45 binary after a clean install. Node 20 cannot run the supported Electron build tools. On machines with an older system Node, use `npx node@22` to run the scripts.
 
-- Node 18+
-- Rust stable (`rustup install stable`)
-- macOS: Xcode Command Line Tools (`xcode-select --install`)
-- Windows: Microsoft C++ Build Tools + WebView2 (preinstalled on Win11)
-
-## Develop
-
-```bash
-npm run tauri dev
+```sh
+npm test
+npm run build
+npm run smoke:electron
+npm run pack
 ```
 
-## Bundle
+`npm run build` prepares offline resources, typechecks the renderer, builds Vite assets and bundles the main process, sandboxed CommonJS preload and PDF service worker. The generated resources include PDF.js workers, cMaps, standard fonts and WASM; English and Korean Tesseract models and worker/core; and the licensed Noto Sans CJK Korean export font. No OCR network download is required at runtime.
 
-```bash
-npm run tauri build      # produces .dmg (macOS) or .msi (Windows)
+## Packaging
+
+```sh
+npm run build:mac
+npm run build:windows
 ```
 
-The pdfium dynamic library in `src-tauri/lib/` is bundled into the resulting
-app via the Tauri resources mechanism (configure in `tauri.conf.json` if you
-target additional platforms).
+The builder configuration targets macOS arm64/x64 and Windows x64/arm64. Outputs are written to `release/`. Local builds are unsigned; production signing and notarization require the distributor's credentials. CI runs tests, builds, an actual Electron startup smoke and an unpacked package on native macOS and Windows runners. macOS cannot establish Windows runtime behavior.
 
-## Architecture
+PDF files retain their editable annotations in sidecars. Normal Save updates the PDF document and its annotation metadata; annotated export creates a flattened PDF. Existing metadata in the previous `com.rustpdf.viewer` application data location remains discoverable for migration. Keep that directory when upgrading.
 
-```
-src/                  Solid frontend
-  viewer/             virtualized page list, per-page canvas
-  annotations/        SVG + canvas overlays for shapes/text/pen/markup
-  toolbar/            top toolbar (zoom, pages, rotation, tools)
-  ipc/                typed wrappers around Tauri commands
-  state/              Solid stores (document, annotations)
-
-src-tauri/src/        Rust backend
-  pdf/document.rs     open document, extract page metadata
-  pdf/render.rs       render a single page to PNG bytes
-  pdf/cache.rs        LRU bitmap cache with byte budget (default 256MB)
-  pdf/mod.rs          pdfium binding loader
-  ipc.rs              shared application state (registry + cache)
-  lib.rs              Tauri commands + plugin wiring
-```
-
-### Memory & performance
-
-- **Page virtualization**: only pages near the viewport are rendered; others
-  are placeholders. (`src/viewer/PdfViewer.tsx`)
-- **LRU cache**: rendered PNG bytes are keyed by
-  `(doc, page, scale_bucket, rotation)`; oldest are evicted when total
-  bytes exceed the budget. (`src-tauri/src/pdf/cache.rs`)
-- **Zoom bucketing**: zoom levels are quantized to 25% steps so small
-  changes don't trigger a re-render. (`src/viewer/PageCanvas.tsx`)
-- **Zero-copy bitmaps**: PNG bytes flow through Tauri IPC and are decoded
-  via `createImageBitmap` directly into a `<canvas>`.
-
-## Roadmap
-
-See `/Users/jb/.claude/plans/cuddly-conjuring-marble.md` for the full plan.
-Implemented so far: project skeleton, PDF render core, virtualized scroll,
-LRU cache, basic toolbar (open / page / zoom / rotate).
+The renderer has Node disabled and uses a sandboxed preload with a command/event allowlist. All document parsing, editing, disk persistence and OCR run outside Electron's main process. The legacy Rust/Tauri sources, build cache and PDFium setup tools have been removed; development and packaging use only the Electron codebase.

@@ -1,3 +1,5 @@
+import { snapshotPageEdit, commitPageEditHistory } from "./documentHistoryState";
+import { emitToast } from "../capture/capture";
 import {
   addQuarterTurn,
   pagePointToDisplay,
@@ -16,7 +18,10 @@ import {
 const clonePages = (pages: PageMeta[]): PageMeta[] =>
   pages.map((page) => ({ ...page }));
 
-async function performRotation(tabId: string, direction: 1 | -1): Promise<void> {
+async function performRotation(
+  tabId: string,
+  direction: 1 | -1,
+): Promise<void> {
   const tab = documentStore.tabs.find((candidate) => candidate.tabId === tabId);
   if (!tab || tab.pageCount === 0) return;
 
@@ -47,12 +52,9 @@ async function performRotation(tabId: string, direction: 1 | -1): Promise<void> 
       "문서가 회전 응답을 기다리는 동안 변경되어 결과를 적용하지 않았습니다.",
     );
   }
+  const before = snapshotPageEdit(live);
   const geometryRotation = direction === 1 ? 90 : 270;
-  invalidateOcrForDocument(
-    expectedDocId,
-    result.revision,
-    result.pageCount,
-  );
+  invalidateOcrForDocument(expectedDocId, result.revision, result.pageCount);
 
   updateTabById(tabId, (current) => {
     let transformedAnnotations = false;
@@ -103,11 +105,13 @@ async function performRotation(tabId: string, direction: 1 | -1): Promise<void> 
       current.annotations.history = [];
       current.annotations.future = [];
       current.annotations.editingId = null;
+      current.annotations.editVersion += 1;
       current.annotations.dirty = true;
       current.annotations.saveStatus = "idle";
       current.annotations.saveError = null;
     }
   });
+  commitPageEditHistory(tabId, before, result);
 }
 
 /** Persistently rotate every page in the active document one quarter-turn. */
@@ -116,11 +120,12 @@ export function rotateDocument(direction: 1 | -1): Promise<void> {
   if (!tab) return Promise.resolve();
 
   const tabId = tab.tabId;
-  return enqueueDocumentMutation(tabId, () => performRotation(tabId, direction))
-    .catch((error) => {
-      console.error("rotate pages failed", error);
-      window.alert(
-        `페이지 회전 실패: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
+  return enqueueDocumentMutation(tabId, () =>
+    performRotation(tabId, direction),
+  ).catch((error) => {
+    console.error("rotate pages failed", error);
+    emitToast(
+      `페이지 회전 실패: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
 }

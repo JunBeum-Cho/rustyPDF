@@ -1,4 +1,4 @@
-import { Show, createMemo } from "solid-js";
+import { createMemo } from "solid-js";
 import {
   ArrowUpRight,
   Camera,
@@ -22,21 +22,23 @@ import { exportAnnotatedPdfFile } from "../ipc/pdf";
 import { activeTab } from "../state/document";
 import {
   annotationStore,
-  redoAnnotations,
   setAnnotationColor,
   setAnnotationUiColor,
   setAnnotationStrokeWidth,
   setAnnotationTool,
-  undoAnnotations,
   bringToFront,
   sendToBack,
   bringForward,
   sendBackward,
   setAnnotationFillColor,
 } from "./store";
+import { ColorPalette } from "./ColorPalette";
 import { TextFormatToolbar } from "./TextFormatToolbar";
 import { getActiveEditor, setFontColor } from "./textFormat";
 import type { AnnotationTool } from "./types";
+
+import { undoDocumentEdit, redoDocumentEdit, canUndoDocumentEdit, canRedoDocumentEdit } from "../viewer/documentHistory";
+import { shortcutLabel } from "../platform/shortcuts";
 
 const ICON_SIZE = 16;
 
@@ -54,6 +56,21 @@ const tools: Array<{ tool: AnnotationTool; label: string; icon: () => JSX.Elemen
 
 export function AnnotationToolbar() {
   const canExport = createMemo(() => Boolean(activeTab()));
+  const context = createMemo(() => {
+    const annotations = activeTab()?.annotations;
+    const text = annotations?.items.some(
+      (item) => item.type === "text" &&
+        (item.id === annotations.editingId || annotations.selectedIds.includes(item.id)),
+    ) ?? false;
+    return { text, layer: annotationStore.selectedIds.length === 1 };
+  });
+  const textSettings = () => context().text || annotationStore.tool === "text";
+  const contextOpen = createMemo(() => context().text || context().layer);
+  // Keep the last controls mounted while the menu fades out.
+  const displayedContext = createMemo<{ text: boolean; layer: boolean }>(
+    (previous) => contextOpen() ? context() : previous,
+    { text: false, layer: false },
+  );
 
   return (
     <div class="annotation-toolbar" aria-label="annotation tools">
@@ -63,27 +80,20 @@ export function AnnotationToolbar() {
             type="button"
             classList={{ active: annotationStore.tool === tool }}
             onClick={() => setAnnotationTool(tool)}
-            title={label}
+            title={`${label}${({ select: " (V)", text: " (T)", highlight: " (H)", pen: " (P)" } as Record<string, string>)[tool] ?? ""}`}
+            aria-label={label}
+            aria-pressed={annotationStore.tool === tool}
           >
             {icon()}
           </button>
         ))}
       </div>
-      <label class="annotation-color" title="색상">
-        <input
-          type="color"
-          value={annotationStore.color}
-          onInput={(event) => {
-            const color = event.currentTarget.value;
-            if (getActiveEditor()) {
-              setAnnotationUiColor(color);
-              setFontColor(color);
-              return;
-            }
-            setAnnotationColor(color);
-          }}
-        />
-      </label>
+      <ColorPalette label={textSettings() ? "글자색" : "그리기 색상"}
+        value={textSettings() ? annotationStore.textColor : annotationStore.color}
+        onChange={(color) => {
+          if (getActiveEditor()) { setAnnotationUiColor(color); setFontColor(color); return; }
+          setAnnotationColor(color);
+        }} />
       <label class="annotation-checkbox" title="배경색 채우기" style={{ display: "inline-flex", "align-items": "center", gap: "4px", "font-size": "13px", "margin-left": "4px", cursor: "pointer", color: "var(--text-dim)" }}>
         <input
           type="checkbox"
@@ -95,17 +105,11 @@ export function AnnotationToolbar() {
         />
         <span>배경 채우기</span>
       </label>
-      <Show when={annotationStore.fill !== "transparent"}>
-        <label class="annotation-color" title="배경색" style={{ "margin-left": "4px" }}>
-          <input
-            type="color"
-            value={annotationStore.fill === "transparent" ? "#ffffff" : annotationStore.fill}
-            onInput={(event) => {
-              setAnnotationFillColor(event.currentTarget.value);
-            }}
-          />
-        </label>
-      </Show>
+      <span style={{ "margin-left": "4px", visibility: annotationStore.fill === "transparent" ? "hidden" : "visible" }}>
+        <ColorPalette label="배경색" disabled={annotationStore.fill === "transparent"}
+          value={annotationStore.fill === "transparent" ? "#ffffff" : annotationStore.fill}
+          onChange={setAnnotationFillColor} />
+      </span>
       <label class="annotation-number" title="선 두께">
         <span>두께</span>
         <input
@@ -116,9 +120,16 @@ export function AnnotationToolbar() {
           onInput={(event) => setAnnotationStrokeWidth(Number(event.currentTarget.value))}
         />
       </label>
-      <TextFormatToolbar />
-      <Show when={annotationStore.selectedIds.length === 1}>
-        <div class="annotation-tool-group" title="정렬 (레이어 순서)">
+      <div
+        class="annotation-context-menu"
+        classList={{ "is-open": contextOpen(), "has-text": displayedContext().text }}
+        role="toolbar"
+        aria-label="선택한 주석 편집"
+        aria-hidden={!contextOpen()}
+        inert={!contextOpen()}
+      >
+        <TextFormatToolbar />
+        <div class="annotation-tool-group" hidden={!displayedContext().layer} title="정렬 (레이어 순서)">
           <button
             type="button"
             onClick={() => bringToFront(annotationStore.selectedIds[0])}
@@ -148,22 +159,22 @@ export function AnnotationToolbar() {
             <SendToBack size={ICON_SIZE} />
           </button>
         </div>
-      </Show>
+      </div>
       <button
         type="button"
         class="toolbar-btn icon-only"
-        onClick={undoAnnotations}
-        disabled={annotationStore.history.length === 0}
-        title="실행 취소 (Ctrl+Z)"
+        onClick={() => void undoDocumentEdit()}
+        disabled={!canUndoDocumentEdit()}
+        title={`실행 취소 (${shortcutLabel("Z")})`}
       >
         <Undo2 size={ICON_SIZE} />
       </button>
       <button
         type="button"
         class="toolbar-btn icon-only"
-        onClick={redoAnnotations}
-        disabled={annotationStore.future.length === 0}
-        title="다시 실행 (Ctrl+Shift+Z)"
+        onClick={() => void redoDocumentEdit()}
+        disabled={!canRedoDocumentEdit()}
+        title={`다시 실행 (${shortcutLabel("Z", true)})`}
       >
         <Redo2 size={ICON_SIZE} />
       </button>
@@ -172,20 +183,23 @@ export function AnnotationToolbar() {
         class="toolbar-btn"
         onClick={exportAnnotatedPdfFile}
         disabled={!canExport()}
-        title="주석 포함 PDF 내보내기"
+        title="보이는 주석과 인식이 완료된 OCR 검색 텍스트를 PDF에 넣어 공유합니다"
       >
         <Download size={ICON_SIZE} />
         <span>내보내기</span>
       </button>
       <span
         class="annotation-save-status"
+        title="저장은 주석을 다시 편집할 수 있게 보관합니다. 주석 포함 PDF는 공유할 때 사용하세요."
         classList={{ error: annotationStore.saveStatus === "error" }}
       >
         {annotationStore.saveStatus === "saving"
           ? "저장 중"
           : annotationStore.saveStatus === "error"
             ? "저장 실패"
-            : annotationStore.dirty
+            : activeTab()?.isUnsaved
+              ? "저장 전 문서"
+              : annotationStore.dirty || activeTab()?.pageDirty
               ? "변경됨"
               : "저장됨"}
       </span>

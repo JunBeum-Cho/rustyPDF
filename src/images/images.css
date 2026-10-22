@@ -1,0 +1,35 @@
+.image-import {
+  width: min(660px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  overflow: auto;
+}
+.image-import::backdrop { background: rgba(0, 0, 0, 0.35); }
+.image-import-header, .image-import-footer { display: flex; align-items: center; gap: 12px; padding: 18px 22px; }
+.image-import-header { justify-content: space-between; border-bottom: 1px solid var(--border); }
+.image-import-header h2 { display: flex; align-items: center; gap: 10px; font-size: 17px; margin: 0; }
+.image-import-header > button { border: 0; padding: 4px; }
+.image-import-body { padding: 20px 22px 8px; }
+.image-import-help { margin: 0 0 16px; color: var(--text-dim); font-size: 13px; line-height: 1.75; }
+.image-import-drop { border: 2px dashed var(--border-strong); border-radius: 12px; padding: 22px 16px; text-align: center; color: var(--text-dim); background: var(--bg); }
+.image-import-drop > svg { margin: 0 auto; }
+.image-import-drop p { font-size: 14px; margin: 10px 0 14px; }
+.image-import-list-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 16px; color: var(--text-dim); font-size: 12px; }
+.image-import-list-header button { font-size: 12px; border: none; }
+.image-import-list { margin: 10px 0 20px; padding: 0; list-style: none; max-height: 200px; overflow: auto; }
+.image-import-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.image-import-list li > svg { flex-shrink: 0; color: var(--text-dim); }
+.image-import-list li button { padding: 6px; flex-shrink: 0; }
+.image-import-file { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.image-import-name { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-dim); margin-bottom: 12px; }
+.image-import-name input { width: 100%; padding: 11px 12px; border: 1px solid var(--border); border-radius: 9px; font: inherit; background: var(--surface-2); color: var(--text); }
+.image-import-error { color: #d33c3c; font-size: 13px; line-height: 1.6; margin: 8px 0; }
+.image-import-error:empty { display: none; }
+.image-import-footer { justify-content: flex-end; border-top: 1px solid var(--border); }
+.image-import-submit { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); padding: 9px 16px; }
+.image-import-submit:hover { background: var(--accent); opacity: 0.9; }

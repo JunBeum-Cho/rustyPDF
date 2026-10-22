@@ -1,5 +1,7 @@
-import { invoke } from "@tauri-apps/api/core";
-import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { ensureAnnotationFonts } from "../annotations/fonts";
+import { invoke } from "../platform/desktop";
+import { open, save, confirmUnsaved } from "../platform/desktop";
+import { normalizeImageSource } from "../images/normalize";
 import { emitToast } from "../capture/capture";
 import {
   markAnnotationSaveErrorForTab,
@@ -37,8 +39,10 @@ const makeSidecar = (
    */
   measureText = false,
 ): AnnotationSidecar => {
-  // Deep-copy/unwrap Solid.js Store proxies before crossing the Tauri bridge
-  const cleanAnnotations: Annotation[] = JSON.parse(JSON.stringify(annotations)).map(sanitizeAnnotation);
+  // Deep-copy/unwrap Solid.js Store proxies before crossing the desktop bridge
+  const cleanAnnotations: Annotation[] = JSON.parse(
+    JSON.stringify(annotations),
+  ).map(sanitizeAnnotation);
   if (measureText) {
     for (const annotation of cleanAnnotations) {
       if (annotation.type !== "text") continue;
@@ -71,19 +75,11 @@ interface OpenedDocPayload {
   fileSize: number;
 }
 
-const EAGER_PREFETCH_LIMIT_BYTES = 30 * 1024 * 1024;
-
 export type DirtyChoice = "save" | "discard" | "cancel";
 
 export interface AnnotationLoadResult {
   sidecar: AnnotationSidecar | null;
-  status:
-    | "none"
-    | "exact"
-    | "legacy"
-    | "recovered"
-    | "mismatch"
-    | "ambiguous";
+  status: "none" | "exact" | "legacy" | "recovered" | "mismatch" | "ambiguous";
   message: string | null;
 }
 
@@ -102,15 +98,11 @@ export async function flushAnnotationSaveForTab(tabId: string): Promise<void> {
       return;
     }
     setAnnotationSaveStatusForTab(tabId, "saving");
-    const snapshot = JSON.stringify(tab.annotations.items);
-    await saveAnnotationSidecar(
-      tab.docId,
-      tab.revision,
-      tab.path,
-      makeSidecar(tab, tab.path, JSON.parse(snapshot)),
-    );
+    const snapshotVersion = tab.annotations.editVersion;
+    const snapshot = makeSidecar(tab, tab.path, tab.annotations.items);
+    await saveAnnotationSidecar(tab.docId, tab.revision, tab.path, snapshot);
     updateTabById(tabId, (current) => {
-      if (JSON.stringify(current.annotations.items) === snapshot) {
+      if (current.annotations.editVersion === snapshotVersion) {
         current.annotations.dirty = false;
         current.annotations.saveStatus = "saved";
         current.annotations.lastSavedAt = new Date().toISOString();
@@ -135,21 +127,7 @@ export async function promptUnsavedChanges(
   if (!tab || (!tab.annotations.dirty && !tab.pageDirty)) {
     return "discard";
   }
-  try {
-    const result = await ask(message, {
-      title: "RustyPDF",
-      kind: "warning",
-      okLabel: "저장",
-      cancelLabel: "저장 안 함",
-    });
-    return result ? "save" : "discard";
-  } catch (error) {
-    console.error("dirty prompt failed", error);
-    const proceed = window.confirm(
-      `${message}\n\n확인 = 저장 / 취소 = 저장 안 함`,
-    );
-    return proceed ? "save" : "discard";
-  }
+  return confirmUnsaved(message);
 }
 
 export async function guardActiveTabUnsaved(): Promise<boolean> {
@@ -159,9 +137,7 @@ export async function guardActiveTabUnsaved(): Promise<boolean> {
     try {
       const saved = await saveActivePdf();
       if (!saved) {
-        return window.confirm(
-          "저장에 실패했습니다. 그래도 계속하시겠습니까?",
-        );
+        return window.confirm("저장에 실패했습니다. 그래도 계속하시겠습니까?");
       }
     } catch (error) {
       console.error("save before action failed", error);
@@ -181,16 +157,34 @@ const buildTabFromPayload = (payload: OpenedDocPayload): Tab => ({
   pages: payload.pages,
   fileSize: payload.fileSize,
   contentVersion: 0,
-  prefetchPolicy:
-    payload.fileSize <= EAGER_PREFETCH_LIMIT_BYTES ? "all" : "lazy",
   zoom: 1,
   rotation: 0,
   currentPage: 0,
+  navigationVersion: 0,
   selectedPageIndices: [],
   pageAnchor: null,
   pageDirty: false,
   annotations: emptyAnnotationTabState(),
 });
+
+export async function openImagesAsPdf(
+  paths: string[],
+  name: string,
+): Promise<void> {
+  const payload = await invoke<OpenedDocPayload>("pdf_create_from_images", {
+    paths,
+    name,
+  });
+  const tab = buildTabFromPayload(payload);
+  tab.isUnsaved = true;
+  tab.pageDirty = true;
+  setDocumentStore(
+    produce((state) => {
+      state.tabs.push(tab);
+      state.activeTabId = tab.tabId;
+    }),
+  );
+}
 
 async function performOpenPdf(path: string): Promise<void> {
   const existing = documentStore.tabs.find((t) => t.path === path);
@@ -218,18 +212,19 @@ async function performOpenPdf(path: string): Promise<void> {
       // can create an annotation while this IPC is in flight and have the
       // late load response silently replace that new work.
       const items = loaded.sidecar?.annotations ?? [];
-      if (!Array.isArray(items)) throw new Error("주석 목록 형식이 올바르지 않습니다.");
-      tab.annotations.items = JSON.parse(JSON.stringify(items)).map(sanitizeAnnotation);
+      if (!Array.isArray(items))
+        throw new Error("주석 목록 형식이 올바르지 않습니다.");
+      tab.annotations.items = JSON.parse(JSON.stringify(items)).map(
+        sanitizeAnnotation,
+      );
       if (loaded.sidecar?.documentKey) {
         tab.annotationDocumentKey = loaded.sidecar.documentKey;
       }
     } catch (error) {
       console.error("load annotation sidecar failed", error);
-      emitToast(
-        `주석 불러오기 실패: ${errorMessage(error)}`,
-        "error",
-        { timeoutMs: 9000 },
-      );
+      emitToast(`주석 불러오기 실패: ${errorMessage(error)}`, "error", {
+        timeoutMs: 9000,
+      });
     }
     setDocumentStore(
       produce((state) => {
@@ -316,26 +311,16 @@ async function performCloseTab(tabId: string): Promise<void> {
   const tab = documentStore.tabs[idx];
 
   if (tab.annotations.dirty || tab.pageDirty) {
-    let shouldSave = false;
-    try {
-      shouldSave = await ask(
-        `${fileNameFromPath(tab.path)}에 저장되지 않은 변경사항이 있습니다. 저장하시겠습니까?`,
-        {
-          title: "RustyPDF",
-          kind: "warning",
-          okLabel: "저장 후 닫기",
-          cancelLabel: "저장 안 함",
-        },
-      );
-    } catch {
-      shouldSave = window.confirm(
-        `${fileNameFromPath(tab.path)}에 저장되지 않은 변경사항이 있습니다. 저장하시겠습니까?`,
-      );
-    }
-    if (shouldSave) {
+    const choice = await confirmUnsaved(
+      `${fileNameFromPath(tab.path)}에 저장되지 않은 변경사항이 있습니다. 저장하시겠습니까?`,
+    );
+    if (choice === "cancel") return;
+    if (choice === "save") {
       const saved = await performSaveTabUntilClean(tab.tabId);
       if (!saved) {
-        const force = window.confirm("저장에 실패했습니다. 그래도 닫으시겠습니까?");
+        const force = window.confirm(
+          "저장에 실패했습니다. 그래도 닫으시겠습니까?",
+        );
         if (!force) return;
       }
     }
@@ -390,6 +375,8 @@ export interface SearchHit {
   start: number;
   length: number;
   snippet: string;
+  space?: "raw" | "display";
+  rectangles?: Array<{ x: number; y: number; w: number; h: number; space?: "raw" | "display" }>;
 }
 
 export async function searchPdf(
@@ -441,16 +428,16 @@ export async function exportAnnotatedPdfFile(): Promise<void> {
 
   const target = await save({
     filters: [{ name: "PDF", extensions: ["pdf"] }],
-    defaultPath: selectedTab.path.replace(/\.pdf$/i, ".annotated.pdf"),
+    defaultPath: selectedTab.isUnsaved
+      ? fileNameFromPath(selectedTab.path)
+      : selectedTab.path.replace(/\.pdf$/i, ".annotated.pdf"),
   });
   if (!target) return;
   const conflictingTab = documentStore.tabs.find(
     (candidate) => candidate.path === target,
   );
   if (conflictingTab) {
-    window.alert(
-      "열려 있는 PDF에는 내보낼 수 없습니다. 원본과 다른 경로를 선택해 주세요.",
-    );
+    emitToast("열려 있는 PDF에는 내보낼 수 없습니다. 원본과 다른 경로를 선택해 주세요.", "error");
     return;
   }
 
@@ -460,6 +447,7 @@ export async function exportAnnotatedPdfFile(): Promise<void> {
         (candidate) => candidate.tabId === tabId,
       );
       if (!tab) return;
+      await ensureAnnotationFonts();
       const data = makeSidecar(
         tab,
         tab.path,
@@ -468,6 +456,13 @@ export async function exportAnnotatedPdfFile(): Promise<void> {
         tab.annotationDocumentKey,
         true,
       );
+      for (const annotation of data.annotations) {
+        if (annotation.type === "image" && annotation.payload?.imageSrc) {
+          annotation.payload.imageSrc = await normalizeImageSource(
+            annotation.payload.imageSrc,
+          );
+        }
+      }
       await invoke("export_annotated_pdf", {
         docId: tab.docId,
         expectedRevision: tab.revision,
@@ -642,19 +637,19 @@ async function performSaveTabPdf(
 
   const currentTab = documentStore.tabs[idx];
   let target = currentTab.path;
-  if (asNew) {
+  if (asNew || currentTab.isUnsaved) {
     const chosen = await save({
       filters: [{ name: "PDF", extensions: ["pdf"] }],
-      defaultPath: currentTab.path,
+      defaultPath: currentTab.isUnsaved
+        ? fileNameFromPath(currentTab.path)
+        : currentTab.path,
     });
     if (!chosen) return false;
     const conflictingTab = documentStore.tabs.find(
       (candidate) => candidate.tabId !== tabId && candidate.path === chosen,
     );
     if (conflictingTab) {
-      window.alert(
-        "선택한 파일은 다른 탭에서 열려 있습니다. 데이터 충돌을 막기 위해 다른 경로를 선택해 주세요.",
-      );
+      emitToast("선택한 파일은 다른 탭에서 열려 있습니다. 다른 경로를 선택해 주세요.", "error");
       return false;
     }
     target = chosen;
@@ -683,11 +678,11 @@ async function performSaveTabPdf(
     // Capture the editable objects and their layout before the IPC. The
     // backend stages this fingerprint-addressed sidecar before atomically
     // replacing the PDF, closing the cross-file crash window.
-    const savedJson = JSON.stringify(tab.annotations.items);
+    const savedVersion = tab.annotations.editVersion;
     const sidecar = makeSidecar(
       tab,
       target,
-      JSON.parse(savedJson),
+      tab.annotations.items,
       tab.revision + 1,
       targetDocumentKey,
     );
@@ -723,6 +718,7 @@ async function performSaveTabPdf(
         target.revision = saved.revision;
         target.annotationDocumentKey = targetDocumentKey;
         target.path = saved.path;
+        target.isUnsaved = false;
         target.pageCount = saved.pageCount;
         if (layoutChanged) target.pages = saved.pages;
         target.fileSize = saved.fileSize;
@@ -730,12 +726,10 @@ async function performSaveTabPdf(
         // every save would refire the per-page render effect and produce a
         // brief flash, even though the bitmap content is unchanged.
         if (bytesChanged) target.contentVersion += 1;
-        target.prefetchPolicy =
-          saved.fileSize <= EAGER_PREFETCH_LIMIT_BYTES ? "all" : "lazy";
         target.pageDirty = false;
         target.annotations.saveError = null;
         target.annotations.lastSavedAt = savedAt;
-        if (JSON.stringify(target.annotations.items) === savedJson) {
+        if (target.annotations.editVersion === savedVersion) {
           target.annotations.dirty = false;
           target.annotations.saveStatus = "saved";
         } else {
@@ -752,19 +746,14 @@ async function performSaveTabPdf(
     if (failedTab?.annotations.dirty) {
       markAnnotationSaveErrorForTab(tabId, message);
     }
-    window.alert(`저장 실패: ${message}`);
+    emitToast(`저장 실패: ${message}. 저장 경로와 권한을 확인한 후 다시 시도해 주세요.`, "error");
     return false;
   }
   return true;
 }
 
-export function saveTabPdf(
-  tabId: string,
-  asNew = false,
-): Promise<boolean> {
-  return enqueueDocumentMutation(tabId, () =>
-    performSaveTabPdf(tabId, asNew),
-  );
+export function saveTabPdf(tabId: string, asNew = false): Promise<boolean> {
+  return enqueueDocumentMutation(tabId, () => performSaveTabPdf(tabId, asNew));
 }
 
 /**
@@ -788,14 +777,10 @@ async function performSaveTabUntilClean(
     if (!(await performSaveTabPdf(tabId, false))) return false;
   }
   const current = documentStore.tabs.find((tab) => tab.tabId === tabId);
-  return Boolean(
-    current && !current.pageDirty && !current.annotations.dirty,
-  );
+  return Boolean(current && !current.pageDirty && !current.annotations.dirty);
 }
 
 /** Save a tab and reflush edits that arrived during the previous round-trip. */
 export function saveTabPdfUntilClean(tabId: string): Promise<boolean> {
-  return enqueueDocumentMutation(tabId, () =>
-    performSaveTabUntilClean(tabId),
-  );
+  return enqueueDocumentMutation(tabId, () => performSaveTabUntilClean(tabId));
 }

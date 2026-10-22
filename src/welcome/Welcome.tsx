@@ -1,11 +1,12 @@
 import { For, Show } from "solid-js";
-import { FolderOpen, X } from "lucide-solid";
+import { FolderOpen, Images, X } from "lucide-solid";
+import { openImageImport } from "../images/importState";
 import { requestOpenPdfDialog, openPdf } from "../ipc/pdf";
 import { recentFiles, removeRecentFile } from "./recentFiles";
 // The welcome logo points at the same PNG that `npm run icon` regenerates
 // for the OS-level app icon, so the in-app branding stays in sync with
 // the taskbar / Dock icon without needing a separate asset.
-import logoUrl from "../../src-tauri/icons/128x128.png";
+import logoUrl from "../assets/logo.png";
 import "./welcome.css";
 
 const formatRelative = (iso: string): string => {
@@ -52,13 +53,17 @@ export function Welcome() {
             <FolderOpen size={18} />
             <span>PDF 열기</span>
           </button>
+          <button type="button" class="welcome-secondary" onClick={() => openImageImport()}>
+            <Images size={18} />
+            <span>이미지 → PDF 변환</span>
+          </button>
         </div>
 
         <Show
           when={recentFiles.entries.length > 0}
           fallback={
             <p class="welcome-hint">
-              파일을 열거나, 창에 PDF를 끌어다 놓으세요.
+              창에 PDF 또는 PNG · JPG 이미지를 끌어다 놓으세요.
             </p>
           }
         >

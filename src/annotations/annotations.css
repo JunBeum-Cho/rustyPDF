@@ -173,6 +173,7 @@
 
 .annotation-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -181,12 +182,75 @@
 
 .annotation-tool-group {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 2px;
   padding: 3px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface);
+}
+
+.annotation-context-menu {
+  position: absolute;
+  /* Leave the document tabs accessible above the floating controls. */
+  top: calc(100% + 48px);
+  left: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 14%), 0 2px 6px rgb(0 0 0 / 6%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, -8px) scale(0.97);
+  transform-origin: top center;
+  transition: opacity 160ms ease, transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0s 220ms;
+}
+
+.annotation-context-menu.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translate(-50%, 0) scale(1);
+  transition-delay: 0s;
+}
+
+.annotation-context-menu:not(.has-text) .text-format-toolbar,
+.annotation-context-menu [hidden] {
+  display: none;
+}
+
+.annotation-context-menu .text-format-toolbar {
+  flex-wrap: wrap;
+  justify-content: center;
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.text-color-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 8px;
+  border-right: 1px solid var(--border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .annotation-context-menu,
+  .annotation-context-menu.is-open {
+    transform: translateX(-50%);
+    transition: none;
+  }
 }
 
 .annotation-tool-group button {
@@ -216,21 +280,6 @@
   background: var(--accent);
   color: var(--accent-fg);
   border-color: var(--accent);
-}
-
-.annotation-color {
-  display: inline-flex;
-  align-items: center;
-}
-
-.annotation-color input {
-  width: 32px;
-  height: 32px;
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
-  cursor: pointer;
 }
 
 .annotation-number {

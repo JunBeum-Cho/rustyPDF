@@ -9,10 +9,13 @@ import { applyTheme, setUiStore, uiStore } from "./state/ui";
 import { closeTab, requestOpenPdfDialog, saveActivePdf } from "./ipc/pdf";
 import {
   deleteSelectedAnnotations,
-  redoAnnotations,
-  undoAnnotations,
+  setAnnotationTool,
 } from "./annotations/store";
 import { rotateDocument } from "./viewer/pageRotation";
+
+import { undoDocumentEdit, redoDocumentEdit } from "./viewer/documentHistory";
+import { setManualZoom, setNavigationMode } from "./viewer/navigation";
+import { blocksToolShortcut } from "./platform/shortcuts";
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 
@@ -38,13 +41,13 @@ function handleUndoRedo(e: KeyboardEvent): boolean {
   if (!mod) return false;
   if (e.key === "z" || e.key === "Z") {
     e.preventDefault();
-    if (e.shiftKey) redoAnnotations();
-    else undoAnnotations();
+    if (e.shiftKey) void redoDocumentEdit();
+    else void undoDocumentEdit();
     return true;
   }
   if (e.key === "y" || e.key === "Y") {
     e.preventDefault();
-    redoAnnotations();
+    void redoDocumentEdit();
     return true;
   }
   return false;
@@ -53,15 +56,19 @@ function handleUndoRedo(e: KeyboardEvent): boolean {
 function nextZoom() {
   const tab = activeTab();
   if (!tab) return;
+  setNavigationMode("manual");
   const next = ZOOM_STEPS.find((z) => z > tab.zoom);
-  if (next) updateActiveTab((t) => { t.zoom = next; });
+  if (next)
+    setManualZoom(next);
 }
 
 function prevZoom() {
   const tab = activeTab();
   if (!tab) return;
+  setNavigationMode("manual");
   const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
-  if (prev) updateActiveTab((t) => { t.zoom = prev; });
+  if (prev)
+    setManualZoom(prev);
 }
 
 function gotoPage(delta: number) {
@@ -69,19 +76,9 @@ function gotoPage(delta: number) {
   if (!tab) return;
   const max = tab.pageCount - 1;
   updateActiveTab((t) => {
+    t.navigationVersion = (t.navigationVersion ?? 0) + 1;
     t.currentPage = Math.max(0, Math.min(max, t.currentPage + delta));
   });
-}
-
-function toggleTheme() {
-  const next =
-    uiStore.theme === "auto"
-      ? "dark"
-      : uiStore.theme === "dark"
-        ? "light"
-        : "auto";
-  setUiStore("theme", next);
-  applyTheme(next);
 }
 
 function cycleTab(direction: 1 | -1) {
@@ -128,7 +125,7 @@ export function installKeyboardShortcuts() {
       }
       if (mod && e.key === "0") {
         e.preventDefault();
-        updateActiveTab((t) => { t.zoom = 1; });
+        setManualZoom(1);
         return;
       }
       if (mod && (e.key === "o" || e.key === "O")) {
@@ -158,7 +155,12 @@ export function installKeyboardShortcuts() {
       }
       if (handleUndoRedo(e)) return;
 
-      if (!mod) {
+      if (!mod && !e.altKey) {
+        const target = e.target instanceof HTMLElement ? e.target : null;
+        if (target && (blocksToolShortcut(target.tagName, target.isContentEditable, target.getAttribute("role")) || target.closest("button, a, select, [role=button], [role=tab]"))) return;
+        const tools = { v: "select", t: "text", h: "highlight", p: "pen" } as const;
+        const tool = tools[e.key.toLowerCase() as keyof typeof tools];
+        if (tool) { e.preventDefault(); setAnnotationTool(tool); return; }
         switch (e.key) {
           case "Backspace":
           case "Delete":
@@ -187,18 +189,20 @@ export function installKeyboardShortcuts() {
             e.preventDefault();
             void rotateDocument(e.shiftKey ? -1 : 1);
             break;
-          case "t":
-            e.preventDefault();
-            toggleTheme();
-            break;
           case "Home":
             e.preventDefault();
-            updateActiveTab((t) => { t.currentPage = 0; });
+            updateActiveTab((t) => {
+              t.navigationVersion = (t.navigationVersion ?? 0) + 1;
+              t.currentPage = 0;
+            });
             break;
           case "End":
             e.preventDefault();
             if (tab) {
-              updateActiveTab((t) => { t.currentPage = t.pageCount - 1; });
+              updateActiveTab((t) => {
+                t.navigationVersion = (t.navigationVersion ?? 0) + 1;
+                t.currentPage = t.pageCount - 1;
+              });
             }
             break;
         }

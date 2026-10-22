@@ -35,7 +35,7 @@ test("rich text keeps Korean, line breaks, font, alignment and emphasis", () => 
   assert.equal(host.querySelectorAll("i,u,br,font").length, 4);
   assert.equal(host.querySelector("div")?.style.textAlign, "center");
   assert.equal(host.querySelector("span")?.style.fontSize, "24px");
-  assert.equal(host.querySelector("font")?.getAttribute("face"), "Arial");
+  assert.equal(host.querySelector("font")?.getAttribute("face"), "Noto Sans KR");
 });
 
 test("sidecar normalization does not mutate the source or strip image annotations", () => {
@@ -60,6 +60,29 @@ test("paste sanitizes before inserting and escapes plain text", () => {
   assert.deepEqual(inserted, ["<b>safe</b>", "&lt;script&gt; &amp;<br>한글"]);
 });
 
+test("paste adopts the text box appearance instead of invisible OCR or white source styling", () => {
+  let inserted = "";
+  document.execCommand = (_command, _ui, value) => {
+    inserted = value ?? "";
+    return true;
+  };
+  const html = `<div style="color:white;background-color:black;font-family:Arial;font-size:80px;line-height:80px;letter-spacing:12px"><font color="#ffffff" face="Arial" size="7"><b>인식한 글자</b></font><br><span style="color:transparent;font-size:100px"><i>둘째 줄</i></span></div>`;
+  insertSafeEditorTransfer({ getData: (type: string) => type === "text/html" ? html : "인식한 글자\n둘째 줄" } as DataTransfer);
+  const host = document.createElement("div");
+  host.innerHTML = inserted;
+  assert.equal(host.querySelector("[style],[color],[face],[size]"), null);
+  assert.equal(host.querySelector("b")?.textContent, "인식한 글자");
+  assert.equal(host.querySelector("i")?.textContent, "둘째 줄");
+  assert.equal(host.querySelectorAll("br").length, 1);
+});
+
+test("paste falls back to plain text when rich clipboard content has no text", () => {
+  let inserted = "";
+  document.execCommand = (_command, _ui, value) => { inserted = value ?? ""; return true; };
+  insertSafeEditorTransfer({ getData: (type: string) => type === "text/html" ? '<img src="invalid">' : "복사한 글자\n다음 줄" } as DataTransfer);
+  assert.equal(inserted, "복사한 글자<br>다음 줄");
+});
+
 test("physical drop coordinates hit the same CSS point at different monitor scales", () => {
   for (const ratio of [1, 1.25, 1.5, 2, 3]) {
     const client = physicalDropToClient({ x: 400 * ratio, y: 300 * ratio }, ratio);
@@ -67,4 +90,59 @@ test("physical drop coordinates hit the same CSS point at different monitor scal
     // The actual page-relative hit remains independent of monitor scale.
     assert.deepEqual({ x: client.x - 100, y: client.y - 50 }, { x: 300, y: 250 });
   }
+});
+
+test("text color defaults to black and stays independent of drawing color", async () => {
+  const { annotationStore, setAnnotationTool, setAnnotationUiColor } = await import("../src/annotations/store");
+  const { documentStore, setDocumentStore } = await import("../src/state/document");
+  const previous = { ...documentStore.annotationUi };
+  try {
+    assert.equal(annotationStore.textColor, "#000000");
+    setAnnotationTool("pen");
+    setAnnotationUiColor("#2563eb");
+    setAnnotationTool("text");
+    assert.equal(annotationStore.color, "#000000");
+    setAnnotationUiColor("#64748b");
+    setAnnotationTool("pen");
+    assert.equal(annotationStore.color, "#2563eb");
+    setAnnotationTool("text");
+    assert.equal(annotationStore.color, "#64748b");
+  } finally { setDocumentStore("annotationUi", previous); }
+});
+
+test("PDF/OCR copy writes plain text while annotation copy retains rich formatting", async () => {
+  const { copyPageText } = await import("../src/ocr/copyText");
+  const host = document.createElement("div");
+  host.innerHTML = '<div class="ocr-text-layer"><span style="color:transparent">인식한 글자</span></div><div class="ocr-text-layer">둘째 페이지</div><div contenteditable="true"><b>강조한 주석</b></div>';
+  document.body.append(host);
+  const selection = window.getSelection()!;
+  try {
+    const range = document.createRange();
+    range.setStart(host.children[0].firstChild!.firstChild!, 0);
+    range.setEnd(host.children[1].firstChild!, 6);
+    selection.removeAllRanges(); selection.addRange(range);
+    const data = new Map<string, string>([["text/html", '<span style="color:transparent">bad</span>']]);
+    let prevented = false;
+    const event = {
+      defaultPrevented: false,
+      clipboardData: { clearData: () => data.clear(), setData: (type: string, value: string) => data.set(type, value) },
+      preventDefault: () => { prevented = true; },
+    } as unknown as ClipboardEvent;
+    const expected = selection.toString();
+    copyPageText(event);
+    assert.equal(prevented, true);
+    assert.deepEqual([...data], [["text/plain", expected]]);
+    prevented = false;
+    // A native input selection can leave the previous PDF DOM range intact.
+    const input = document.createElement("input");
+    copyPageText({ ...event, target: input } as unknown as ClipboardEvent);
+    assert.equal(prevented, false);
+    range.selectNodeContents(host.children[2]);
+    selection.removeAllRanges(); selection.addRange(range);
+    copyPageText(event);
+    assert.equal(prevented, false);
+    selection.collapseToStart();
+    copyPageText(event);
+    assert.equal(prevented, false);
+  } finally { selection.removeAllRanges(); host.remove(); }
 });

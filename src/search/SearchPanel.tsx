@@ -3,6 +3,9 @@ import { activeTab, updateActiveTab } from "../state/document";
 import { setUiStore, uiStore } from "../state/ui";
 import { searchPdf, type SearchHit } from "../ipc/pdf";
 import "./search.css";
+import { nextSearchIndex } from "./model";
+import { setActiveSearchMatch } from "./store";
+import { ocrState } from "../ocr/ocr";
 
 const DEBOUNCE_MS = 220;
 
@@ -11,10 +14,11 @@ export function SearchPanel() {
   const [hits, setHits] = createSignal<SearchHit[]>([]);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const [activeIndex, setActiveIndex] = createSignal(0);
+  const [activeIndex, setActiveIndex] = createSignal(-1);
 
   let inputEl: HTMLInputElement | undefined;
   let searchSequence = 0;
+  let pendingNavigation = false;
 
   createEffect(
     on(
@@ -33,7 +37,7 @@ export function SearchPanel() {
         setQuery("");
         setHits([]);
         setError(null);
-        setActiveIndex(0);
+        setActiveIndex(-1);
       },
     ),
   );
@@ -41,13 +45,22 @@ export function SearchPanel() {
   let timer: ReturnType<typeof setTimeout> | undefined;
   createEffect(() => {
     const sequence = ++searchSequence;
+    pendingNavigation = false;
+    setError(null);
+    setActiveSearchMatch(null);
+    setHits([]);
+    setActiveIndex(-1);
     const q = query().trim();
     const tab = activeTab();
+    const open = uiStore.searchOpen;
+    // OCR replaces this Set after each completed page. Track that property
+    // so the existing query refreshes even when PDF revision is unchanged.
+    if (tab) void ocrState.byDoc[tab.docId]?.done;
     if (timer) clearTimeout(timer);
     onCleanup(() => {
       if (timer) clearTimeout(timer);
     });
-    if (!tab || q.length === 0) {
+    if (!open || !tab || q.length === 0) {
       setHits([]);
       setError(null);
       setLoading(false);
@@ -68,9 +81,14 @@ export function SearchPanel() {
           sequence !== searchSequence ||
           live?.tabId !== tabId ||
           live.revision !== revision
-        ) return;
+        )
+          return;
         setHits(result);
-        setActiveIndex(0);
+        setActiveIndex(-1);
+        if (pendingNavigation) {
+          pendingNavigation = false;
+          jumpTo(0);
+        }
         setError(null);
       } catch (e) {
         const live = activeTab();
@@ -78,7 +96,8 @@ export function SearchPanel() {
           sequence !== searchSequence ||
           live?.tabId !== tabId ||
           live.revision !== revision
-        ) return;
+        )
+          return;
         setError(e instanceof Error ? e.message : String(e));
         setHits([]);
       } finally {
@@ -87,23 +106,36 @@ export function SearchPanel() {
           sequence === searchSequence &&
           live?.tabId === tabId &&
           live.revision === revision
-        ) setLoading(false);
+        )
+          setLoading(false);
       }
     }, DEBOUNCE_MS);
   });
+
+  onCleanup(() => setActiveSearchMatch(null));
 
   function jumpTo(i: number) {
     const list = hits();
     if (list.length === 0) return;
     const idx = ((i % list.length) + list.length) % list.length;
-    setActiveIndex(idx);
     const tab = activeTab();
     if (!tab) return;
+    setActiveIndex(idx);
+    setActiveSearchMatch({
+      tabId: tab.tabId,
+      revision: tab.revision,
+      query: query(),
+      hit: list[idx],
+      navigation: Date.now(),
+    });
     // Clamp: a hit can outlive the page it pointed at (e.g. pages deleted
     // after the search ran), and an out-of-range currentPage blanks the view.
     const max = Math.max(0, tab.pageCount - 1);
     const page = Math.max(0, Math.min(max, list[idx].page));
-    updateActiveTab((t) => { t.currentPage = page; });
+    updateActiveTab((t) => {
+      t.navigationVersion = (t.navigationVersion ?? 0) + 1;
+      t.currentPage = page;
+    });
   }
 
   function onKey(e: KeyboardEvent) {
@@ -112,13 +144,17 @@ export function SearchPanel() {
       setUiStore("searchOpen", false);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      jumpTo(activeIndex() + (e.shiftKey ? -1 : 1));
+      if (loading()) pendingNavigation = true;
+      else
+        jumpTo(
+          nextSearchIndex(activeIndex(), e.shiftKey ? -1 : 1, hits().length),
+        );
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      jumpTo(activeIndex() + 1);
+      jumpTo(nextSearchIndex(activeIndex(), 1, hits().length));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      jumpTo(activeIndex() - 1);
+      jumpTo(nextSearchIndex(activeIndex(), -1, hits().length));
     }
   }
 
@@ -147,7 +183,7 @@ export function SearchPanel() {
         <div class="search-meta">
           <Show when={loading()}>검색 중…</Show>
           <Show when={!loading() && hits().length > 0}>
-            {activeIndex() + 1} / {hits().length}
+            {Math.max(0, activeIndex() + 1)} / {hits().length}
           </Show>
           <Show when={!loading() && query() && hits().length === 0 && !error()}>
             결과 없음

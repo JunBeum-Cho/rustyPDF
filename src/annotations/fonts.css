@@ -1,0 +1,7 @@
+/* Identical full TrueType faces are served offline and embedded in exported PDFs. */
+@font-face { font-family: "Noto Sans KR"; src: url("/fonts/NotoSansKR-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; font-display: block; }
+@font-face { font-family: "Noto Sans KR"; src: url("/fonts/NotoSansKR-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; font-display: block; }
+@font-face { font-family: "Noto Serif KR"; src: url("/fonts/NotoSerifKR-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; font-display: block; }
+@font-face { font-family: "Noto Serif KR"; src: url("/fonts/NotoSerifKR-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; font-display: block; }
+.annotation-text, .annotation-text-edit { font-family: "Noto Sans KR"; font-kerning: none; font-variant-ligatures: none; font-feature-settings: "calt" 0, "locl" 0; }
+.annotation-text :is(i, em), .annotation-text-edit :is(i, em) { font-style: oblique 12deg; }

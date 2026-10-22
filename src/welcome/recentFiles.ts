@@ -1,6 +1,6 @@
 import { createEffect, createRoot, on } from "solid-js";
 import { createStore } from "solid-js/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../platform/desktop";
 import { documentStore, fileNameFromPath } from "../state/document";
 
 const STORAGE_KEY = "rustpdf.recents";
@@ -73,7 +73,7 @@ export const recordRecentFile = (path: string) => {
     /* ignore */
   });
   // Rebuild the dock-tile recents submenu — we have to do this manually for
-  // non-document-based apps (which Tauri is).
+  // non-document-based desktop apps.
   syncDockMenu();
 };
 
@@ -99,7 +99,7 @@ export function installRecentFilesTracking() {
     let known = new Set<string>();
     createEffect(
       on(
-        () => documentStore.tabs.map((t) => t.path),
+        () => documentStore.tabs.filter((t) => !t.isUnsaved).map((t) => t.path),
         (paths) => {
           const next = new Set(paths);
           for (const path of next) {

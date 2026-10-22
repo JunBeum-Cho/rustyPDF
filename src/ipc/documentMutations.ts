@@ -1,3 +1,4 @@
+import { recoverDocumentHistory } from "../viewer/documentHistoryRecovery";
 /**
  * One serialization lane per open tab. Every operation that reads and then
  * replaces PDF bytes (page edits, save, export, clipboard copy) goes through
@@ -10,7 +11,10 @@ export function enqueueDocumentMutation<T>(
   task: () => Promise<T>,
 ): Promise<T> {
   const previous = mutationTails.get(tabId) ?? Promise.resolve();
-  const operation = previous.then(task);
+  const operation = previous.then(async () => {
+    await recoverDocumentHistory(tabId);
+    return task();
+  });
   const tail = operation.then(
     () => undefined,
     () => undefined,

@@ -1,8 +1,9 @@
-import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { listen } from "@tauri-apps/api/event";
+import { onFileDrop } from "../platform/desktop";
+import { listen } from "../platform/desktop";
 import { onCleanup, onMount } from "solid-js";
 import { initialOpenPaths, openPdf, requestOpenPdf } from "./pdf";
-import { physicalDropToClient } from "./dropPosition";
+
+import { addImagePaths, imageImportOpen } from "../images/importState";
 
 const isPdfPath = (path: string) => path.toLowerCase().endsWith(".pdf");
 const isImagePath = (path: string) =>
@@ -13,8 +14,7 @@ export interface FileDropHandlers {
 }
 
 let imageDropHandler:
-  | ((paths: string[], event: { x: number; y: number }) => void)
-  | null = null;
+  ((paths: string[], event: { x: number; y: number }) => void) | null = null;
 
 export const setImageDropHandler = (
   handler: ((paths: string[], event: { x: number; y: number }) => void) | null,
@@ -35,30 +35,22 @@ export function installFileOpenHandlers() {
 
     (async () => {
       try {
-        const initial = await initialOpenPaths();
-        if (!disposed && initial.length > 0) {
-          await openMany(initial);
-        }
-
-        const dragUnlisten = await getCurrentWebview().onDragDropEvent(
-          (event) => {
-            if (event.payload.type !== "drop") return;
-            const paths = event.payload.paths;
-            const pdfs = paths.filter(isPdfPath);
-            const images = paths.filter(isImagePath);
-            for (const p of pdfs) {
-              void requestOpenPdf(p);
-            }
-            if (images.length > 0 && imageDropHandler) {
-              // Read the current WebView ratio for every drop, including after
-              // moving between monitors. No async gap before the page hit test.
-              imageDropHandler(images, physicalDropToClient(
-                event.payload.position,
-                window.devicePixelRatio,
-              ));
-            }
-          },
-        );
+        const dragUnlisten = onFileDrop((event) => {
+          const paths = event.paths;
+          if (imageImportOpen()) {
+            addImagePaths(paths);
+            return;
+          }
+          const pdfs = paths.filter(isPdfPath);
+          const images = paths.filter(isImagePath);
+          for (const p of pdfs) {
+            void requestOpenPdf(p);
+          }
+          if (images.length > 0 && imageDropHandler) {
+            // Desktop drop positions already use CSS client pixels.
+            imageDropHandler(images, event.position);
+          }
+        });
         cleanups.push(dragUnlisten);
 
         // Runtime "open-pdfs" event from second-instance forwarding (Windows
@@ -68,6 +60,10 @@ export function installFileOpenHandlers() {
           if (paths.length > 0) void openMany(paths);
         });
         cleanups.push(eventUnlisten);
+        const initial = await initialOpenPaths();
+        if (!disposed && initial.length > 0) {
+          await openMany(initial);
+        }
 
         if (disposed) {
           for (const c of cleanups) c();

@@ -1,3 +1,4 @@
+import { recordAnnotationDocumentHistory } from "../viewer/documentHistoryState";
 import {
   activeTab,
   documentStore,
@@ -13,6 +14,15 @@ import type { Annotation, AnnotationTool } from "./types";
 import { sanitizeAnnotationHtml } from "./sanitize";
 
 const HISTORY_LIMIT = 80;
+
+const isTextColorContext = () => {
+  if (documentStore.annotationUi.tool === "text") return true;
+  if (documentStore.annotationUi.tool !== "select") return false;
+  const annotations = activeTab()?.annotations;
+  if (annotations?.editingId) return true;
+  const selected = annotations?.items.filter((item) => annotations.selectedIds.includes(item.id)) ?? [];
+  return selected.length > 0 && selected.every((item) => item.type === "text");
+};
 
 const cloneAnnotations = (items: Annotation[]) =>
   items.map((item) => ({
@@ -60,7 +70,10 @@ export const annotationStore = {
     return documentStore.annotationUi.tool;
   },
   get color(): string {
-    return documentStore.annotationUi.color;
+    return isTextColorContext() ? documentStore.annotationUi.textColor : documentStore.annotationUi.color;
+  },
+  get textColor(): string {
+    return documentStore.annotationUi.textColor;
   },
   get fill(): string {
     return documentStore.annotationUi.fill;
@@ -83,13 +96,17 @@ export const createAnnotationId = () => {
   return `annotation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
-const mutateActiveAnnotations = (mutator: (state: AnnotationTabState) => void) => {
+const mutateActiveAnnotations = (
+  mutator: (state: AnnotationTabState) => void,
+) => {
   updateActiveTab((tab) => {
     mutator(tab.annotations);
   });
 };
 
 export const recordAnnotationHistory = () => {
+  const tab = activeTab();
+  if (tab) recordAnnotationDocumentHistory(tab.tabId);
   mutateActiveAnnotations((state) => {
     state.history.push(cloneAnnotations(state.items));
     if (state.history.length > HISTORY_LIMIT) {
@@ -100,7 +117,9 @@ export const recordAnnotationHistory = () => {
 };
 
 const markDirty = () => {
+  updateActiveTab(tab => { tab.editFuture = []; });
   mutateActiveAnnotations((state) => {
+    state.editVersion += 1;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;
@@ -112,7 +131,10 @@ const markDirty = () => {
  * reload. Pass `tabId` because the active tab may already have changed by the
  * time async loads resolve.
  */
-export const replaceAnnotationsForTab = (tabId: string, items: Annotation[]) => {
+export const replaceAnnotationsForTab = (
+  tabId: string,
+  items: Annotation[],
+) => {
   if (findTabIndex(tabId) < 0) return;
   updateTabById(tabId, (tab) => {
     tab.annotations = emptyAnnotationTabState();
@@ -145,9 +167,7 @@ export const removeAnnotation = (
     state.selectedIds = state.selectedIds.filter((sid) => sid !== id);
     if (state.editingId === id) state.editingId = null;
   });
-  if (record) {
-    markDirty();
-  }
+  markDirty();
 };
 
 export const setAnnotationTool = (tool: AnnotationTool) => {
@@ -261,12 +281,12 @@ const applyStyleToSelected = (patch: Partial<Annotation["style"]>) => {
 };
 
 export const setAnnotationColor = (color: string) => {
-  setDocumentStore("annotationUi", "color", color);
+  setAnnotationUiColor(color);
   applyStyleToSelected({ color });
 };
 
 export const setAnnotationUiColor = (color: string) => {
-  setDocumentStore("annotationUi", "color", color);
+  setDocumentStore("annotationUi", isTextColorContext() ? "textColor" : "color", color);
 };
 
 export const setAnnotationFillColor = (fill: string) => {
@@ -425,12 +445,14 @@ export const updateAnnotationTextLive = (
   html: string,
   text: string,
 ) => {
+  updateActiveTab(tab => { tab.editFuture = []; });
   mutateActiveAnnotations((state) => {
     const item = state.items.find((a) => a.id === id);
     if (!item) return;
     if (!item.payload) item.payload = {};
     item.payload.html = sanitizeAnnotationHtml(html);
     item.payload.text = text;
+    state.editVersion += 1;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;
@@ -450,6 +472,7 @@ export const finalizeAnnotationText = (
   text: string,
   stylePatch: Partial<Annotation["style"]> = {},
 ) => {
+  updateActiveTab(tab => { tab.editFuture = []; });
   mutateActiveAnnotations((state) => {
     const item = state.items.find((a) => a.id === id);
     if (!item) return;
@@ -457,6 +480,7 @@ export const finalizeAnnotationText = (
     if (!item.payload) item.payload = {};
     item.payload.html = sanitizeAnnotationHtml(html);
     item.payload.text = text;
+    state.editVersion += 1;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;
@@ -535,10 +559,17 @@ export const pasteAnnotations = (): boolean => {
     item.id = createAnnotationId();
     item.page = targetPage;
     if (item.rect) {
-      item.rect = { ...item.rect, x: item.rect.x + shift, y: item.rect.y + shift };
+      item.rect = {
+        ...item.rect,
+        x: item.rect.x + shift,
+        y: item.rect.y + shift,
+      };
     }
     if (item.points) {
-      item.points = item.points.map((p) => ({ x: p.x + shift, y: p.y + shift }));
+      item.points = item.points.map((p) => ({
+        x: p.x + shift,
+        y: p.y + shift,
+      }));
     }
     return item;
   });
@@ -558,32 +589,48 @@ export const duplicateSelectedAnnotations = (): boolean => {
   return pasteAnnotations();
 };
 
-export const undoAnnotations = () => {
-  const tab = activeTab();
-  if (!tab || tab.annotations.history.length === 0) return;
-  mutateActiveAnnotations((state) => {
+export const undoAnnotations = (tabId = activeTab()?.tabId) => {
+  const tab = documentStore.tabs.find(candidate => candidate.tabId === tabId);
+  if (!tab || tab.annotations.history.length === 0 || tab.editHistory?.at(-1)?.kind === "page") return;
+  updateTabById(tab.tabId, current => {
+    if (current.editHistory?.at(-1)?.kind === "annotation") {
+      current.editHistory.pop();
+      (current.editFuture ??= []).push({kind:"annotation"});
+    }
+  });
+  updateTabById(tab.tabId, current => {
+    const state = current.annotations;
     const previous = state.history.pop();
     if (!previous) return;
     state.future.push(cloneAnnotations(state.items));
     state.items = previous;
     state.selectedIds = [];
     state.editingId = null;
+    state.editVersion += 1;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;
   });
 };
 
-export const redoAnnotations = () => {
-  const tab = activeTab();
-  if (!tab || tab.annotations.future.length === 0) return;
-  mutateActiveAnnotations((state) => {
+export const redoAnnotations = (tabId = activeTab()?.tabId) => {
+  const tab = documentStore.tabs.find(candidate => candidate.tabId === tabId);
+  if (!tab || tab.annotations.future.length === 0 || tab.editFuture?.at(-1)?.kind === "page") return;
+  updateTabById(tab.tabId, current => {
+    if (current.editFuture?.at(-1)?.kind === "annotation") {
+      current.editFuture.pop();
+      (current.editHistory ??= []).push({kind:"annotation"});
+    }
+  });
+  updateTabById(tab.tabId, current => {
+    const state = current.annotations;
     const next = state.future.pop();
     if (!next) return;
     state.history.push(cloneAnnotations(state.items));
     state.items = next;
     state.selectedIds = [];
     state.editingId = null;
+    state.editVersion += 1;
     state.dirty = true;
     state.saveStatus = "idle";
     state.saveError = null;
@@ -608,7 +655,10 @@ export const markAnnotationsSavedForTab = (tabId: string) => {
   });
 };
 
-export const markAnnotationSaveErrorForTab = (tabId: string, message: string) => {
+export const markAnnotationSaveErrorForTab = (
+  tabId: string,
+  message: string,
+) => {
   updateTabById(tabId, (tab) => {
     tab.annotations.saveStatus = "error";
     tab.annotations.saveError = message;
@@ -643,6 +693,7 @@ export const remapAnnotationsForTab = (
     tab.annotations.future = [];
     tab.annotations.selectedIds = [];
     tab.annotations.editingId = null;
+    tab.annotations.editVersion += 1;
     tab.annotations.dirty = true;
     tab.annotations.saveStatus = "idle";
     tab.annotations.saveError = null;

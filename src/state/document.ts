@@ -10,10 +10,10 @@ export interface PageMeta {
   rotation: 0 | 90 | 180 | 270;
 }
 
-export type PrefetchPolicy = "all" | "lazy";
 export type SaveStatus = "idle" | "saving" | "saved" | "error";
 
 export interface AnnotationTabState {
+  editVersion: number;
   items: Annotation[];
   selectedIds: string[];
   editingId: string | null;
@@ -26,6 +26,7 @@ export interface AnnotationTabState {
 }
 
 export const emptyAnnotationTabState = (): AnnotationTabState => ({
+  editVersion: 0,
   items: [],
   selectedIds: [],
   editingId: null,
@@ -38,29 +39,33 @@ export const emptyAnnotationTabState = (): AnnotationTabState => ({
 });
 
 export interface Tab {
-  tabId: string;            // stable local id used for tab identity
-  docId: string;            // stable backend document handle
-  revision: number;         // backend generation; incremented by mutations/saves
+  editHistory?: import("../viewer/documentHistoryState").DocumentHistoryEntry[];
+  editFuture?: import("../viewer/documentHistoryState").DocumentHistoryEntry[];
+  tabId: string; // stable local id used for tab identity
+  docId: string; // stable backend document handle
+  revision: number; // backend generation; incremented by mutations/saves
   annotationDocumentKey: string; // distinguishes identical PDF copies
   path: string;
+  isUnsaved?: boolean; // generated in memory; first save asks for a path
   pageCount: number;
   pages: PageMeta[];
   fileSize: number;
-  contentVersion: number;   // bumps when saved bytes change without a new docId
-  prefetchPolicy: PrefetchPolicy;
+  contentVersion: number; // bumps when saved bytes change without a new docId
   zoom: number;
   /** Additional transient viewer rotation. Persistent editor rotation keeps this at zero. */
   rotation: 0 | 90 | 180 | 270;
   currentPage: number;
-  selectedPageIndices: number[];   // for thumbnail multi-select
-  pageAnchor: number | null;       // shift-click anchor
-  pageDirty: boolean;              // page-level edits not yet saved to disk
+  navigationVersion: number;
+  selectedPageIndices: number[]; // for thumbnail multi-select
+  pageAnchor: number | null; // shift-click anchor
+  pageDirty: boolean; // page-level edits not yet saved to disk
   annotations: AnnotationTabState;
 }
 
 export interface AnnotationUiState {
   tool: AnnotationTool;
   color: string;
+  textColor: string;
   fill: string;
   strokeWidth: number;
   fontSize: number;
@@ -83,10 +88,11 @@ const [documentStore, setDocumentStore] = createStore<DocumentState>({
   annotationUi: {
     tool: "select",
     color: "#e11d48",
+    textColor: "#000000",
     fill: "transparent",
     strokeWidth: 2,
     fontSize: 16,
-    fontFamily: "Pretendard Variable",
+    fontFamily: "Noto Sans KR",
   },
 });
 

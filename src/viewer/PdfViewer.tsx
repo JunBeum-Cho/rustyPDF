@@ -1,10 +1,21 @@
-import { For, Show, createEffect, createMemo, on, onCleanup, onMount } from "solid-js";
+import {
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { activeTab, updateActiveTab } from "../state/document";
 import { uiStore } from "../state/ui";
-import { renderPage } from "../ipc/pdf";
+
 import { PageCanvas } from "./PageCanvas";
 import { Thumbnails } from "./Thumbnails";
 import "./viewer.css";
+
+import { fitZoom, navigationMode, setManualZoom, setNavigationMode } from "./navigation";
 
 const PAGE_GAP = 16;
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
@@ -33,7 +44,14 @@ export function PdfViewer() {
     }));
   });
 
+  const scrollPositions = new Map<string, { top: number; left: number }>();
+  let displayedTabId = tab().tabId;
   function onScroll() {
+    if (displayedTabId !== tab().tabId) return;
+    scrollPositions.set(displayedTabId, {
+      top: scrollEl.scrollTop,
+      left: scrollEl.scrollLeft,
+    });
     const dims = renderedDims();
     let acc = 0;
     const center = scrollEl.scrollTop + scrollEl.clientHeight / 2;
@@ -41,7 +59,9 @@ export function PdfViewer() {
       const next = acc + dims[i].height + PAGE_GAP;
       if (center < next) {
         if (tab().currentPage !== i) {
-          updateActiveTab((t) => { t.currentPage = i; });
+          updateActiveTab((t) => {
+            t.currentPage = i;
+          });
         }
         return;
       }
@@ -50,29 +70,55 @@ export function PdfViewer() {
   }
 
   let suppressNextScroll = false;
-  function scrollToPage(i: number) {
+  function scrollToPage(i: number, tabId: string) {
+    if (tab().tabId !== tabId || displayedTabId !== tabId) return;
     const dims = renderedDims();
     let top = 0;
     for (let k = 0; k < i; k++) top += dims[k].height + PAGE_GAP;
     suppressNextScroll = true;
     scrollEl.scrollTo({ top, behavior: "auto" });
+    scrollPositions.set(tabId, {
+      top: scrollEl.scrollTop,
+      left: scrollEl.scrollLeft,
+    });
   }
 
-  // Reset scroll when active tab changes
+  // Restore each tab independently; reject work queued for an older tab.
   createEffect(
     on(
       () => tab().tabId,
-      () => {
+      (tabId) => {
         queueMicrotask(() => {
+          if (tab().tabId !== tabId) return;
           suppressNextScroll = true;
-          scrollEl.scrollTo({ top: 0, behavior: "auto" });
+          const saved = scrollPositions.get(tabId);
+          scrollEl.scrollTo({
+            top: saved?.top ?? 0,
+            left: saved?.left ?? 0,
+            behavior: "auto",
+          });
+          displayedTabId = tabId;
         });
       },
       { defer: true },
     ),
   );
 
+  const [viewport, setViewport] = createSignal({ width: 0, height: 0 });
+  createEffect(() => {
+    const t = tab();
+    const mode = navigationMode(t.tabId);
+    const size = viewport();
+    const page = t.pages[t.currentPage];
+    if (mode === "manual" || !page || !size.width || !size.height) return;
+    const zoom = fitZoom(mode, size.width, size.height, page.width, page.height, t.rotation);
+    if (Math.abs(t.zoom - zoom) > .0001) updateActiveTab(t => { t.zoom = zoom; });
+  });
+
   onMount(() => {
+    const resize = new ResizeObserver(() => setViewport({ width: scrollEl.clientWidth, height: scrollEl.clientHeight }));
+    resize.observe(scrollEl);
+    onCleanup(() => resize.disconnect());
     const handler = () => {
       if (suppressNextScroll) {
         suppressNextScroll = false;
@@ -89,6 +135,7 @@ export function PdfViewer() {
         const t = tab();
         const cur = t.zoom;
         const target = e.deltaY < 0 ? nextZoom(cur) : prevZoom(cur);
+        setNavigationMode("manual");
         if (target == null) return;
 
         const rect = scrollEl.getBoundingClientRect();
@@ -98,10 +145,16 @@ export function PdfViewer() {
         const docY = scrollEl.scrollTop + cy;
         const ratio = target / cur;
 
-        updateActiveTab((tt) => { tt.zoom = target; });
+        setManualZoom(target);
+        const zoomTabId = t.tabId;
         requestAnimationFrame(() => {
+          if (tab().tabId !== zoomTabId || displayedTabId !== zoomTabId) return;
           scrollEl.scrollLeft = docX * ratio - cx;
           scrollEl.scrollTop = docY * ratio - cy;
+          scrollPositions.set(zoomTabId, {
+            top: scrollEl.scrollTop,
+            left: scrollEl.scrollLeft,
+          });
         });
         return;
       }
@@ -117,74 +170,16 @@ export function PdfViewer() {
 
   createEffect(
     on(
-      () => [
-        tab().docId,
-        tab().revision,
-        tab().zoom,
-        tab().rotation,
-        tab().contentVersion,
-      ] as const,
-      ([docId, revision, zoom, rotation]) => {
-        if (tab().prefetchPolicy !== "all") return;
-
-        let aborted = false;
-        const bucket = Math.round(zoom * 4) / 4;
-        const concurrency = 3;
-
-        const total = tab().pageCount;
-        const start = tab().currentPage;
-        const order: number[] = [];
-        const seen = new Set<number>();
-        for (let r = 0; r < total; r++) {
-          for (const p of [start - r, start + r]) {
-            if (p >= 0 && p < total && !seen.has(p)) {
-              seen.add(p);
-              order.push(p);
-            }
-          }
-          if (seen.size >= total) break;
+      () => [tab().tabId, tab().navigationVersion] as const,
+      ([id], previous) => {
+        if (previous && previous[0] === id) {
+          const page = tab().currentPage;
+          queueMicrotask(() => scrollToPage(page, id));
         }
-
-        async function worker() {
-          while (!aborted) {
-            const idx = order.shift();
-            if (idx === undefined) return;
-            try {
-              await renderPage(docId, revision, idx, bucket, rotation);
-            } catch {
-              /* ignored */
-            }
-            await new Promise((r) => setTimeout(r, 0));
-          }
-        }
-
-        const workers = Array.from({ length: concurrency }, worker);
-        Promise.allSettled(workers).then(() => { /* done */ });
-
-        onCleanup(() => {
-          aborted = true;
-          order.length = 0;
-        });
       },
+      { defer: true },
     ),
   );
-
-  let lastPage = -1;
-  let lastTabId: string | null = null;
-  const _ = createMemo(() => {
-    const t = tab();
-    const p = t.currentPage;
-    if (t.tabId !== lastTabId) {
-      lastTabId = t.tabId;
-      lastPage = p;
-      return;
-    }
-    if (p !== lastPage) {
-      lastPage = p;
-      queueMicrotask(() => scrollToPage(p));
-    }
-  });
-  void _;
 
   return (
     <div class="viewer-shell">

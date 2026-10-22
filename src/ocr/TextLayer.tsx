@@ -1,10 +1,19 @@
-import { For, createEffect, createSignal, on, onMount } from "solid-js";
+import {
+  For,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onMount,
+} from "solid-js";
 import { ocrPdfLines, pdfNativeTextLines, type OcrLine } from "../ipc/pdf";
 import { activeTab } from "../state/document";
 import type { PageMeta } from "../state/document";
 import type { Rotation } from "../annotations/coords";
 import { ocrState } from "./ocr";
 import "./textLayer.css";
+import { activeSearchMatch } from "../search/store";
+import { highlightGeometry } from "../search/model";
 
 interface Props {
   pageIndex: number;
@@ -18,7 +27,7 @@ interface Props {
 /**
  * Invisible-but-selectable text overlay aligned with the rendered page
  * bitmap. Each line is positioned in normalized 0–1 coords from the OCR /
- * pdfium text extraction; we measure the rendered glyph width at the
+ * PDF.js text extraction; we measure the rendered glyph width at the
  * current zoom and apply `transform: scaleX(...)` so the system font's
  * natural width is squashed/stretched to exactly fill the original PDF
  * font's bbox width. Without this fix-up the selection highlight drifts
@@ -69,18 +78,23 @@ export function TextLayer(props: Props) {
     }
   };
 
+  const pageOcrDone = createMemo(() => {
+    const tab = activeTab();
+    return tab
+      ? (ocrState.byDoc[tab.docId]?.done.has(props.pageIndex) ?? false)
+      : false;
+  });
   let fetchSequence = 0;
   createEffect(
     on(
       () => {
         const tab = activeTab();
         if (!tab) return null;
-        const doc = ocrState.byDoc[tab.docId];
         return [
           tab.docId,
           props.revision,
           props.pageIndex,
-          doc?.done.size ?? 0,
+          pageOcrDone(),
           props.contentVersion,
         ] as const;
       },
@@ -107,25 +121,84 @@ export function TextLayer(props: Props) {
     ),
   );
 
+  const match = () => {
+    const selected = activeSearchMatch(),
+      tab = activeTab();
+    return selected &&
+      tab?.tabId === selected.tabId &&
+      tab.revision === selected.revision &&
+      props.revision === selected.revision &&
+      selected.hit.page === props.pageIndex
+      ? selected
+      : null;
+  };
+
   return (
-    <div
-      class="ocr-text-layer"
-      style={{
-        width: `${basePageWidth()}px`,
-        height: `${basePageHeight()}px`,
-        transform: rotationTransform(),
-      }}
-    >
-      <For each={layerData().lines}>
-        {(line) => (
-          <Line
-            line={line}
-            pageWidth={basePageWidth}
-            pageHeight={basePageHeight}
-          />
-        )}
+    <>
+      <For each={match()?.hit.rectangles ?? []}>
+        {(rect, index) => {
+          const geometry = () =>
+            highlightGeometry(
+              props.page,
+              props.zoom,
+              props.rotation,
+              rect.space ?? match()?.hit.space ?? "raw",
+            );
+          return (
+            <div
+              class="search-mark-layer"
+              aria-hidden="true"
+              style={{
+                width: `${geometry().width}px`,
+                height: `${geometry().height}px`,
+                transform: geometry().transform,
+              }}
+            >
+              <span
+                class="search-location-mark"
+                ref={(el) => {
+                  createEffect(() => {
+                    const selected = match();
+                    if (selected && index() === 0)
+                      requestAnimationFrame(() => {
+                        if (match() === selected)
+                          el.scrollIntoView({
+                            block: "nearest",
+                            inline: "nearest",
+                          });
+                      });
+                  });
+                }}
+                style={{
+                  left: `${rect.x * 100}%`,
+                  top: `${rect.y * 100}%`,
+                  width: `${rect.w * 100}%`,
+                  height: `${rect.h * 100}%`,
+                }}
+              />
+            </div>
+          );
+        }}
       </For>
-    </div>
+      <div
+        class="ocr-text-layer"
+        style={{
+          width: `${basePageWidth()}px`,
+          height: `${basePageHeight()}px`,
+          transform: rotationTransform(),
+        }}
+      >
+        <For each={layerData().lines}>
+          {(line) => (
+            <Line
+              line={line}
+              pageWidth={basePageWidth}
+              pageHeight={basePageHeight}
+            />
+          )}
+        </For>
+      </div>
+    </>
   );
 }
 

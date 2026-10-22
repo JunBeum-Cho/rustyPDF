@@ -1,78 +1,30 @@
-name: Build & Release
-
-on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
+name: Desktop builds
+on: [push, pull_request, workflow_dispatch]
 jobs:
-  build:
+  desktop:
     strategy:
-      fail-fast: false
       matrix:
         include:
-          - name: macos-arm64
-            os: macos-14
-            rust_target: aarch64-apple-darwin
-            tauri_args: --target aarch64-apple-darwin --bundles dmg,app
-          - name: windows-x64
-            os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            tauri_args: --target x86_64-pc-windows-msvc --bundles nsis
-
+          - os: macos-latest
+            target: mac
+          - os: windows-latest
+            target: win
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-          key: ${{ matrix.rust_target }}
-
-      - name: Install npm dependencies
-        run: npm install
-
-      - name: Download pdfium binary
-        run: node scripts/setup-pdfium.mjs
-
-      - name: Build & release with Tauri
-        uses: tauri-apps/tauri-action@v0
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run smoke:electron
+      - run: npx electron-builder --${{ matrix.target }} --arm64 --x64
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - run: node scripts/smoke-electron.mjs --packaged
+      - uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-{1}', github.run_number, github.sha) }}
-          releaseName: "RustyPDF ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}"
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.tauri_args }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustypdf-${{ matrix.name }}
-          path: |
-            src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
-            src-tauri/target/${{ matrix.rust_target }}/release/bundle/nsis/*-setup.exe
-          if-no-files-found: warn
+          name: RustyPDF-${{ matrix.os }}
+          path: release/
