@@ -37,11 +37,6 @@ await cp(
 );
 await rm(`${assets}/tesseract-core`, { recursive: true, force: true });
 await rm(`${assets}/fonts`, { recursive: true, force: true });
-await cp("resources/fonts", `${assets}/fonts`, { recursive: true }).catch(
-  (error) => {
-    if (error.code !== "ENOENT") throw error;
-  },
-);
 await writeFile(
   `${assets}/tesseract/package.json`,
   JSON.stringify({ type: "commonjs" }),

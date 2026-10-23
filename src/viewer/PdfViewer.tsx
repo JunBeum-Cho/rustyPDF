@@ -9,24 +9,17 @@ import {
   onMount,
 } from "solid-js";
 import { activeTab, updateActiveTab } from "../state/document";
-import { uiStore } from "../state/ui";
+import { setUiStore, uiStore } from "../state/ui";
 
 import { PageCanvas } from "./PageCanvas";
 import { Thumbnails } from "./Thumbnails";
+import { Outline } from "./Outline";
+import { clearPageSelection } from "./pageClipboard";
 import "./viewer.css";
 
-import { fitZoom, navigationMode, setManualZoom, setNavigationMode } from "./navigation";
+import { fitZoom, navigationMode, pxPerPt, setManualZoom } from "./navigation";
 
 const PAGE_GAP = 16;
-const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
-
-function nextZoom(cur: number): number | null {
-  return ZOOM_STEPS.find((z) => z > cur) ?? null;
-}
-
-function prevZoom(cur: number): number | null {
-  return [...ZOOM_STEPS].reverse().find((z) => z < cur) ?? null;
-}
 
 export function PdfViewer() {
   let scrollEl!: HTMLDivElement;
@@ -35,13 +28,8 @@ export function PdfViewer() {
 
   const renderedDims = createMemo(() => {
     const t = tab();
-    const z = t.zoom;
-    const rot = t.rotation;
-    const swap = rot === 90 || rot === 270;
-    return t.pages.map((p) => ({
-      width: (swap ? p.height : p.width) * z,
-      height: (swap ? p.width : p.height) * z,
-    }));
+    const k = pxPerPt(t.zoom);
+    return t.pages.map((p) => ({ width: p.width * k, height: p.height * k }));
   });
 
   const scrollPositions = new Map<string, { top: number; left: number }>();
@@ -109,9 +97,11 @@ export function PdfViewer() {
     const t = tab();
     const mode = navigationMode(t.tabId);
     const size = viewport();
-    const page = t.pages[t.currentPage];
-    if (mode === "manual" || !page || !size.width || !size.height) return;
-    const zoom = fitZoom(mode, size.width, size.height, page.width, page.height, t.rotation);
+    if (mode === "manual" || !t.pages.length || !size.width || !size.height) return;
+    // Widest page for width mode, largest page for page mode; never currentPage.
+    const pageW = Math.max(...t.pages.map((p) => p.width));
+    const pageH = Math.max(...t.pages.map((p) => p.height));
+    const zoom = fitZoom(mode, size.width, size.height, pageW, pageH);
     if (Math.abs(t.zoom - zoom) > .0001) updateActiveTab(t => { t.zoom = zoom; });
   });
 
@@ -134,9 +124,8 @@ export function PdfViewer() {
         e.preventDefault();
         const t = tab();
         const cur = t.zoom;
-        const target = e.deltaY < 0 ? nextZoom(cur) : prevZoom(cur);
-        setNavigationMode("manual");
-        if (target == null) return;
+        const target = Math.min(4, Math.max(0.25, cur * Math.exp(-e.deltaY * 0.01)));
+        if (Math.abs(target - cur) < 1e-9) return;
 
         const rect = scrollEl.getBoundingClientRect();
         const cx = e.clientX - rect.left;
@@ -144,6 +133,7 @@ export function PdfViewer() {
         const docX = scrollEl.scrollLeft + cx;
         const docY = scrollEl.scrollTop + cy;
         const ratio = target / cur;
+        // Anchor at the pointer; mode switches to manual inside setManualZoom.
 
         setManualZoom(target);
         const zoomTabId = t.tabId;
@@ -181,12 +171,52 @@ export function PdfViewer() {
     ),
   );
 
+  const [systemDark, setSystemDark] = createSignal(false);
+  onMount(() => {
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!mq) return;
+    setSystemDark(mq.matches);
+    const on = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener("change", on);
+    onCleanup(() => mq.removeEventListener("change", on));
+  });
+  const effectiveDark = () => uiStore.theme === "dark" || (uiStore.theme === "auto" && systemDark());
+
   return (
     <div class="viewer-shell">
       <Show when={uiStore.sidebarOpen}>
-        <Thumbnails />
+        <div class="sidebar-pane" style={{ width: `${uiStore.sidebarWidth}px` }}>
+          <div class="sidebar-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              classList={{ active: uiStore.sidebarMode === "thumbnails" }}
+              aria-selected={uiStore.sidebarMode === "thumbnails"}
+              onClick={() => setUiStore("sidebarMode", "thumbnails")}
+            >
+              썸네일
+            </button>
+            <button
+              type="button"
+              role="tab"
+              classList={{ active: uiStore.sidebarMode === "outline" }}
+              aria-selected={uiStore.sidebarMode === "outline"}
+              onClick={() => setUiStore("sidebarMode", "outline")}
+            >
+              목차
+            </button>
+          </div>
+          <Show when={uiStore.sidebarMode === "outline"} fallback={<Thumbnails />}>
+            <Outline />
+          </Show>
+        </div>
       </Show>
-      <div class="viewer-scroll" ref={scrollEl}>
+      <div
+        class="viewer-scroll"
+        classList={{ "invert-pages": uiStore.invertPagesInDark && effectiveDark() }}
+        ref={scrollEl}
+        onPointerDown={() => clearPageSelection()}
+      >
         <div class="viewer-stack">
           <For each={tab().pages}>
             {(page, i) => (
@@ -198,8 +228,7 @@ export function PdfViewer() {
                 docId={tab().docId}
                 revision={tab().revision}
                 contentVersion={tab().contentVersion}
-                zoom={tab().zoom}
-                rotation={tab().rotation}
+                scale={pxPerPt(tab().zoom)}
               />
             )}
           </For>

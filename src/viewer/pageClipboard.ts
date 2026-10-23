@@ -13,22 +13,23 @@ import {
   type Tab,
 } from "../state/document";
 import {
-  annotationClipboardCopiedAt,
-  annotationStore,
-  copySelectedAnnotations,
   createAnnotationId,
-  cutSelectedAnnotations,
-  duplicateSelectedAnnotations,
-  hasAnnotationClipboard,
-  pasteAnnotations,
   remapAnnotationsForTab,
 } from "../annotations/store";
 import {
+  addDocumentTab,
   copyPdfPages,
   deletePdfPages,
   duplicatePdfPages,
   pastePdfPages,
 } from "../ipc/pdf";
+import { invoke, open } from "../platform/desktop";
+import { undoDocumentEdit } from "./documentHistory";
+import {
+  moveToIndexFromSlot,
+  reindexAnnotationsForPages,
+  shouldHandlePageKey,
+} from "./pageUi";
 import { enqueueDocumentMutation } from "../ipc/documentMutations";
 import { invalidateOcrForDocument } from "../ocr/ocr";
 import type { Annotation } from "../annotations/types";
@@ -54,6 +55,30 @@ const [pageClipboard, setPageClipboard] = createStore<PageClipboardState>({
 });
 
 export { pageClipboard };
+
+interface PdfPageEditPayload {
+  id: string;
+  revision: number;
+  path: string;
+  pageCount: number;
+  pages: PageMeta[];
+  fileSize: number;
+  pageMapping: Array<number | null>;
+  historyToken?: string;
+  retainedHistoryTokens?: string[];
+}
+
+const READ_ONLY_MESSAGE = "읽기 전용 PDF입니다";
+
+/** Page edits are refused on read-only tabs. */
+export const guardWritable = (tab: Tab | null | undefined): tab is Tab => {
+  if (!tab) return false;
+  if (tab.readOnly) {
+    emitToast(READ_ONLY_MESSAGE, "info");
+    return false;
+  }
+  return true;
+};
 
 const isEditableTarget = (t: EventTarget | null): boolean => {
   if (!(t instanceof HTMLElement)) return false;
@@ -104,17 +129,7 @@ const applyEditResult = (
   tabId: string,
   expectedDocId: string,
   expectedRevision: number,
-  result: {
-    id: string;
-    revision: number;
-    path: string;
-    pageCount: number;
-    pages: PageMeta[];
-    fileSize: number;
-    pageMapping: Array<number | null>;
-    historyToken?: string;
-    retainedHistoryTokens?: string[];
-  },
+  result: PdfPageEditPayload,
   newSelection: number[],
   newCurrentPage: number,
   insertedAnnotations: Annotation[] = [],
@@ -194,9 +209,10 @@ export function copySelectedPages(): Promise<boolean> {
 async function performDeleteSelectedPages(
   tabId: string,
   selectedIndices?: number[],
+  announce = true,
 ): Promise<void> {
   const tab = documentStore.tabs.find((candidate) => candidate.tabId === tabId);
-  if (!tab) return;
+  if (!guardWritable(tab)) return;
   const indices = selectedIndices ?? sortedSelection(tab);
   if (indices.length === 0) return;
   if (indices.length >= tab.pageCount) {
@@ -221,6 +237,12 @@ async function performDeleteSelectedPages(
       [],
       newCurrent,
     );
+    if (announce) {
+      emitToast(`${indices.length}쪽을 삭제했습니다`, "info", {
+        timeoutMs: 8000,
+        actions: [{ label: "실행 취소", run: () => void undoDocumentEdit() }],
+      });
+    }
   } catch (error) {
     console.error("delete pages failed", error);
     emitToast(
@@ -239,7 +261,7 @@ export function deleteSelectedPages(): Promise<void> {
 
 async function performCutSelectedPages(tabId: string): Promise<void> {
   const tab = documentStore.tabs.find((candidate) => candidate.tabId === tabId);
-  if (!tab) return;
+  if (!guardWritable(tab)) return;
   if (tab.selectedPageIndices.length === 0) return;
   if (tab.selectedPageIndices.length >= tab.pageCount) {
     emitToast("모든 페이지를 잘라낼 수는 없습니다.");
@@ -253,7 +275,7 @@ async function performCutSelectedPages(tabId: string): Promise<void> {
     emitToast("페이지 복사에 실패하여 잘라내기를 취소했습니다.");
     return;
   }
-  await performDeleteSelectedPages(tabId, indices);
+  await performDeleteSelectedPages(tabId, indices, false);
 }
 
 export function cutSelectedPages(): Promise<void> {
@@ -285,7 +307,7 @@ export function pastePagesAfter(afterIndex?: number): Promise<void> {
     const current = documentStore.tabs.find(
       (candidate) => candidate.tabId === tabId,
     );
-    if (!current) return;
+    if (!guardWritable(current)) return;
     const after =
       afterIndex !== undefined
         ? afterIndex
@@ -335,7 +357,7 @@ export function duplicateSelectedPages(): Promise<void> {
     const current = documentStore.tabs.find(
       (candidate) => candidate.tabId === tabId,
     );
-    if (!current) return;
+    if (!guardWritable(current)) return;
     const indices = sortedSelection(current);
     if (indices.length === 0) return;
     const annotationSnapshot = snapshotAnnotationsForPages(current, indices);
@@ -417,103 +439,174 @@ export const clearPageSelection = () => {
   );
 };
 
+/** Move the selected pages so they land at `slot` (0..pageCount, "before page
+ * slot" in the current order). */
+export function moveSelectedPages(slot: number): Promise<void> {
+  const tab = activeTab();
+  if (!tab) return Promise.resolve();
+  const tabId = tab.tabId;
+  return enqueueDocumentMutation(tabId, async () => {
+    const current = documentStore.tabs.find((t) => t.tabId === tabId);
+    if (!guardWritable(current)) return;
+    const indices = sortedSelection(current);
+    const toIndex = moveToIndexFromSlot(indices, slot, current.pageCount);
+    if (toIndex === null) return;
+    try {
+      const expectedDocId = current.docId;
+      const expectedRevision = current.revision;
+      const result = await invoke<PdfPageEditPayload>("pdf_move_pages", {
+        docId: expectedDocId,
+        expectedRevision,
+        indices,
+        toIndex,
+      });
+      const moved = indices
+        .map((i) => result.pageMapping[i])
+        .filter((i): i is number => i != null)
+        .sort((a, b) => a - b);
+      applyEditResult(
+        tabId,
+        expectedDocId,
+        expectedRevision,
+        result,
+        moved,
+        moved[0] ?? toIndex,
+      );
+    } catch (error) {
+      console.error("move pages failed", error);
+      emitToast(
+        `페이지 이동 실패: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  });
+}
+
+/** Extract the selected pages into a new unsaved tab, copying annotations. */
+export function extractSelectedPages(): Promise<void> {
+  const tab = activeTab();
+  if (!tab) return Promise.resolve();
+  const tabId = tab.tabId;
+  return enqueueDocumentMutation(tabId, async () => {
+    const current = documentStore.tabs.find((t) => t.tabId === tabId);
+    if (!current) return;
+    const indices = sortedSelection(current);
+    if (indices.length === 0) return;
+    const annotations = reindexAnnotationsForPages(
+      cloneAnnotations(current.annotations.items),
+      indices,
+    ).map((a) => ({ ...a, id: createAnnotationId() }));
+    const base = current.path.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") || "문서";
+    try {
+      const payload = await invoke<Parameters<typeof addDocumentTab>[0]>(
+        "pdf_extract_pages",
+        {
+          docId: current.docId,
+          expectedRevision: current.revision,
+          indices,
+          name: `${base} 추출`,
+        },
+      );
+      addDocumentTab(payload, { annotations, unsaved: true });
+    } catch (error) {
+      console.error("extract pages failed", error);
+      emitToast(
+        `페이지 추출 실패: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  });
+}
+
+/** Choose a PDF and insert all of its pages after `afterIndex`. */
+export async function insertPdfAfter(afterIndex?: number): Promise<void> {
+  const tab = activeTab();
+  if (!guardWritable(tab)) return;
+  const tabId = tab.tabId;
+  let selected: string | string[] | null;
+  try {
+    selected = await open({
+      multiple: false,
+      title: "삽입할 PDF 선택",
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+  } catch (error) {
+    emitToast(
+      `파일 선택 창을 열 수 없습니다: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+    return;
+  }
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  if (!path) return;
+  return enqueueDocumentMutation(tabId, async () => {
+    const current = documentStore.tabs.find((t) => t.tabId === tabId);
+    if (!guardWritable(current)) return;
+    const after =
+      afterIndex ??
+      (current.selectedPageIndices.length > 0
+        ? Math.max(...current.selectedPageIndices)
+        : current.currentPage);
+    try {
+      const expectedDocId = current.docId;
+      const expectedRevision = current.revision;
+      const result = await invoke<PdfPageEditPayload>("pdf_insert_file", {
+        docId: expectedDocId,
+        expectedRevision,
+        path,
+        afterIndex: after,
+      });
+      const insertedStart = Math.max(0, Math.min(current.pageCount, after + 1));
+      const count = result.pageCount - current.pageCount;
+      const selection = Array.from({ length: count }, (_, i) => insertedStart + i);
+      applyEditResult(tabId, expectedDocId, expectedRevision, result, selection, insertedStart);
+    } catch (error) {
+      console.error("insert pdf failed", error);
+      emitToast(
+        `PDF 삽입 실패: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  });
+}
+
 export function installPageClipboardShortcuts() {
   onMount(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isEditableTarget(e.target)) return;
+      const active = document.activeElement;
+      const hasTextSelection = (window.getSelection()?.toString() ?? "") !== "";
+      if (
+        !shouldHandlePageKey({
+          insideThumbnailSidebar: !!active?.closest?.(".thumbnail-sidebar"),
+          editableTarget: isEditableTarget(e.target),
+          hasTextSelection,
+          mod: e.metaKey || e.ctrlKey,
+          key: e.key,
+        })
+      )
+        return;
       const tab = activeTab();
       if (!tab) return;
-      const mod = e.metaKey || e.ctrlKey;
-
-      // While a text annotation is being edited — including when focus is
-      // soft-blurred into the format toolbar's <select>, which isEditableTarget
-      // above doesn't catch — clipboard keys belong to the text, not the page
-      // or annotation clipboard. Bailing here avoids tearing down the active
-      // edit (which would drop an uncommitted style patch) before it commits.
-      if (
-        mod &&
-        annotationStore.editingId !== null &&
-        /^[cxvd]$/i.test(e.key)
-      ) {
-        return;
-      }
-
-      // Page-level shortcuts only fire when the user has thumbnails selected,
-      // so they don't conflict with annotation undo/copy/etc.
       const hasSelection = tab.selectedPageIndices.length > 0;
-      // An annotation can be selected while a thumbnail selection lingers from
-      // earlier navigation (page selection is sticky). Annotation operations
-      // win in that case — the user is acting on the annotation they clicked.
-      const hasAnnotationSelection = annotationStore.selectedIds.length > 0;
-
-      if (mod && (e.key === "c" || e.key === "C")) {
-        if (hasAnnotationSelection) {
+      const key = e.key.toLowerCase();
+      if (e.metaKey || e.ctrlKey) {
+        if (key === "v") {
+          if (!pageClipboard.token) return;
           e.preventDefault();
-          copySelectedAnnotations();
+          void pastePagesAfter();
           return;
         }
         if (!hasSelection) return;
         e.preventDefault();
-        void copySelectedPages();
+        if (key === "c") void copySelectedPages();
+        else if (key === "x") void cutSelectedPages();
+        else void duplicateSelectedPages();
         return;
       }
-      if (mod && (e.key === "x" || e.key === "X")) {
-        if (hasAnnotationSelection) {
-          e.preventDefault();
-          cutSelectedAnnotations();
-          return;
-        }
-        if (!hasSelection) return;
-        e.preventDefault();
-        void cutSelectedPages();
-        return;
-      }
-      if (mod && (e.key === "v" || e.key === "V")) {
-        // Most-recent copy wins when both clipboards hold something.
-        const annoAt = annotationClipboardCopiedAt();
-        const pageAt = pageClipboard.token ? pageClipboard.copiedAt : -1;
-        if (hasAnnotationClipboard() && annoAt >= pageAt) {
-          e.preventDefault();
-          pasteAnnotations();
-          return;
-        }
-        if (!pageClipboard.token) {
-          // Fall back to annotation paste if that's the only filled buffer.
-          if (hasAnnotationClipboard()) {
-            e.preventDefault();
-            pasteAnnotations();
-          }
-          return;
-        }
-        e.preventDefault();
-        void pastePagesAfter();
-        return;
-      }
-      if (mod && (e.key === "d" || e.key === "D")) {
-        if (hasAnnotationSelection) {
-          e.preventDefault();
-          duplicateSelectedAnnotations();
-          return;
-        }
-        if (!hasSelection) return;
-        e.preventDefault();
-        void duplicateSelectedPages();
-        return;
-      }
-      if (!mod && (e.key === "Delete" || e.key === "Backspace")) {
-        if (!hasSelection) return;
-        // Annotations and pages share Delete. When both have a selection the
-        // user is almost always operating on the annotation they just clicked
-        // (page selection is sticky from earlier thumbnail navigation), so
-        // yield to the annotation handler in keyboard.ts. Page-delete still
-        // works fine when no annotation is selected.
-        if (annotationStore.selectedIds.length > 0) return;
-        e.preventDefault();
-        void deleteSelectedPages();
-        return;
-      }
+      if (!hasSelection) return;
+      e.preventDefault();
+      void deleteSelectedPages();
     };
-    // Capture phase so we run before the annotation keyboard handler in keyboard.ts.
     window.addEventListener("keydown", onKey, true);
     onCleanup(() => window.removeEventListener("keydown", onKey, true));
   });

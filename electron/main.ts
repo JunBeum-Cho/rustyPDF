@@ -6,9 +6,19 @@ import {
   clipboard,
   ClipboardItem,
   nativeImage,
+  shell,
   Menu,
 } from "electron";
-import { readFile, writeFile, mkdtemp, copyFile } from "node:fs/promises";
+import {
+  readFile,
+  writeFile,
+  mkdtemp,
+  mkdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,22 +28,141 @@ if (process.env.RUSTYPDF_SMOKE)
     mkdtempSync(path.join(tmpdir(), "rustypdf-smoke-data-")),
   );
 import { pathToFileURL } from "node:url";
-import { ServiceWorker } from "./worker-client";
-import { assertCommand, assertSender, takeOpenPaths } from "./protocol";
+import { PdfWorkerClient } from "./worker-client";
+import {
+  assertCommand,
+  assertSender,
+  takeOpenPaths,
+  EVENTS,
+} from "./protocol";
+import { PathGrants, draftFileName, safeExternalUrl } from "./grants";
+import { initAutoUpdates } from "./updater";
+const DRAFT_LIMIT = 200 * 1024 * 1024;
+const NATIVE_IMAGE = /\.(png|jpe?g)$/i;
 let smokePath: string | undefined;
 let window: BrowserWindow | null = null;
-let service: ServiceWorker;
+let service: PdfWorkerClient;
 let allowExit = false;
 let quitting = false;
 let subscribed = false;
+let askedUnresponsive = false;
 const queue: string[] = [];
+const grants = new PathGrants();
 const root = path.resolve(__dirname, "..");
 const dev = process.env.RUSTYPDF_DEV_URL;
 const url = dev ?? pathToFileURL(path.join(root, "dist/index.html")).href;
 function enqueue(paths: string[]) {
-  queue.push(...paths.filter((p) => p.toLowerCase().endsWith(".pdf")));
+  const pdfs = paths.filter((p) => p.toLowerCase().endsWith(".pdf"));
+  for (const file of pdfs) grants.grant(file);
+  queue.push(...pdfs);
   if (subscribed && window)
     window.webContents.send("open-pdfs", takeOpenPaths(queue));
+}
+function sendEvent(name: string, payload?: unknown) {
+  if (!EVENTS.has(name) || !window || window.isDestroyed()) return;
+  window.webContents.send(name, payload);
+}
+async function convertImages(paths: unknown[], temp: string) {
+  const out: string[] = [];
+  for (const [index, file] of paths.entries()) {
+    const source = String(file);
+    if (NATIVE_IMAGE.test(source)) {
+      out.push(source);
+      continue;
+    }
+    const image = nativeImage.createFromPath(source);
+    if (image.isEmpty())
+      throw new Error(
+        `이 이미지 형식은 이 컴퓨터에서 지원되지 않습니다: ${path.basename(source)}`,
+      );
+    const target = path.join(temp, `${index}.png`);
+    await writeFile(target, image.toPNG());
+    out.push(target);
+  }
+  return out;
+}
+async function printImages(args: Record<string, unknown>) {
+  const pages = args.pages;
+  if (!Array.isArray(pages) || !pages.length) throw new Error("Invalid pages");
+  const temp = await mkdtemp(path.join(app.getPath("temp"), "rustypdf-print-"));
+  let printer: BrowserWindow | null = null;
+  try {
+    const body: string[] = [];
+    let first = { w: 612, h: 792 };
+    for (const [index, page] of pages.entries()) {
+      const { png, widthPt, heightPt } = page as {
+        png: Uint8Array;
+        widthPt: number;
+        heightPt: number;
+      };
+      if (!(png instanceof Uint8Array) || !(widthPt > 0) || !(heightPt > 0))
+        throw new Error("Invalid pages");
+      if (index === 0) first = { w: widthPt, h: heightPt };
+      await writeFile(path.join(temp, `${index}.png`), png);
+      body.push(
+        `<div class="p" style="width:${widthPt}pt;height:${heightPt}pt"><img src="${index}.png"></div>`,
+      );
+    }
+    const html =
+      `<!doctype html><meta charset="utf-8"><title>${String(args.title ?? "RustyPDF").replace(/[<&]/g, "")}</title>` +
+      `<style>@page{margin:0;size:${first.w}pt ${first.h}pt}html,body{margin:0;padding:0}` +
+      `.p{page-break-after:always;overflow:hidden}img{display:block;width:100%;height:100%}</style>${body.join("")}`;
+    const file = path.join(temp, "print.html");
+    await writeFile(file, html);
+    printer = new BrowserWindow({
+      show: false,
+      webPreferences: { sandbox: true, contextIsolation: true },
+    });
+    await printer.loadFile(file);
+    const contents = printer.webContents;
+    return await new Promise<boolean>((resolve) =>
+      contents.print({ silent: false, printBackground: true }, (success) =>
+        resolve(success),
+      ),
+    );
+  } finally {
+    printer?.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+function buildMenu() {
+  const packaged = app.isPackaged;
+  if (packaged && process.platform !== "darwin") {
+    Menu.setApplicationMenu(null);
+    return;
+  }
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      ...(process.platform === "darwin"
+        ? [
+            {
+              label: "RustyPDF",
+              submenu: [
+                { role: "about" as const },
+                { type: "separator" as const },
+                { role: "quit" as const },
+              ],
+            },
+          ]
+        : []),
+      {
+        label: "File",
+        submenu: [
+          {
+            role: "recentDocuments",
+            submenu: [{ role: "clearRecentDocuments" }],
+          },
+        ],
+      },
+      { role: "editMenu" },
+      packaged
+        ? {
+            label: "View",
+            submenu: [{ role: "togglefullscreen" }],
+          }
+        : { role: "viewMenu" },
+    ]),
+  );
 }
 app.on("open-file", (event, file) => {
   event.preventDefault();
@@ -51,6 +180,9 @@ if (!app.requestSingleInstanceLock()) {
     const assetsDir = app.isPackaged
       ? path.join(process.resourcesPath, "assets")
       : path.join(root, "resources/assets");
+    const fontsDir = app.isPackaged
+      ? path.join(app.getAppPath(), "dist/fonts")
+      : path.join(root, "resources/fonts");
     const legacy =
       process.platform === "darwin"
         ? path.join(
@@ -61,12 +193,21 @@ if (!app.requestSingleInstanceLock()) {
             process.env.LOCALAPPDATA ?? app.getPath("appData"),
             "com.rustpdf.viewer",
           );
-    service = new ServiceWorker(path.join(__dirname, "worker.cjs"), {
-      dataDir: app.getPath("userData"),
-      legacyDataDirs: [legacy],
-      assetsDir,
-    });
-    const validate = (event: Electron.IpcMainInvokeEvent) => {
+    service = new PdfWorkerClient(
+      path.join(__dirname, "worker.cjs"),
+      {
+        dataDir: app.getPath("userData"),
+        legacyDataDirs: [legacy],
+        assetsDir,
+        fontsDir,
+      },
+      {
+        onEvent: (name, payload) => sendEvent(name, payload),
+        onRestart: () => sendEvent("pdf-service-restarted"),
+      },
+    );
+    const draftsDir = path.join(app.getPath("userData"), "drafts");
+    const validate = (event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent) => {
       if (
         !window ||
         event.sender !== window.webContents ||
@@ -75,46 +216,114 @@ if (!app.requestSingleInstanceLock()) {
         throw new Error("Foreign desktop sender");
       assertSender(event.senderFrame.url, url);
     };
+    ipcMain.on("desktop:grant", (event, file) => {
+      try {
+        validate(event);
+        if (typeof file === "string" && file && path.isAbsolute(file))
+          grants.grant(file);
+      } catch {
+        /* foreign sender: ignore */
+      }
+    });
     ipcMain.handle("desktop:command", async (event, command, args = {}) => {
       validate(event);
       assertCommand(command);
       if (!args || typeof args !== "object" || Array.isArray(args))
         throw new Error("Invalid arguments");
-      if (command === "initial_open_paths") {
-        subscribed = true;
-        return takeOpenPaths(queue);
+      switch (command) {
+        case "initial_open_paths":
+          subscribed = true;
+          return takeOpenPaths(queue);
+        case "request_app_exit":
+          allowExit = true;
+          app.quit();
+          return;
+        case "note_recent_document":
+          if (
+            !process.env.RUSTYPDF_SMOKE &&
+            typeof args.path === "string" &&
+            path.isAbsolute(args.path)
+          )
+            app.addRecentDocument(args.path);
+          return;
+        case "clipboard_write_png":
+          await clipboard.write([
+            new ClipboardItem({
+              "image/png": new Blob([new Uint8Array(args.bytes)]),
+            }),
+          ]);
+          return;
+        case "print_images":
+          return printImages(args);
+        case "open_external":
+          await shell.openExternal(safeExternalUrl(args.url));
+          return;
+        case "paths_exist": {
+          if (!Array.isArray(args.paths)) throw new Error("Invalid arguments");
+          return Promise.all(
+            args.paths.map((file: unknown) =>
+              typeof file === "string" && path.isAbsolute(file)
+                ? stat(file).then(
+                    () => true,
+                    () => false,
+                  )
+                : false,
+            ),
+          );
+        }
+        case "draft_write": {
+          if (
+            typeof args.path !== "string" ||
+            !path.isAbsolute(args.path) ||
+            typeof args.json !== "string"
+          )
+            throw new Error("Invalid arguments");
+          if (Buffer.byteLength(args.json) > DRAFT_LIMIT)
+            throw new Error("임시 저장 데이터가 너무 큽니다.");
+          await mkdir(draftsDir, { recursive: true });
+          const target = path.join(draftsDir, draftFileName(args.path));
+          const temp = `${target}.${process.pid}.tmp`;
+          await writeFile(temp, args.json);
+          await rename(temp, target);
+          return;
+        }
+        case "draft_read": {
+          if (typeof args.path !== "string" || !path.isAbsolute(args.path))
+            throw new Error("Invalid arguments");
+          try {
+            return await readFile(
+              path.join(draftsDir, draftFileName(args.path)),
+              "utf8",
+            );
+          } catch {
+            return null;
+          }
+        }
+        case "draft_delete": {
+          if (typeof args.path !== "string" || !path.isAbsolute(args.path))
+            throw new Error("Invalid arguments");
+          await unlink(
+            path.join(draftsDir, draftFileName(args.path)),
+          ).catch(() => undefined);
+          return;
+        }
       }
-      if (command === "request_app_exit") {
-        allowExit = true;
-        app.quit();
-        return;
+      let checked = grants.checkCommand(command, args);
+      if (command === "pdf_create_from_images") {
+        const base = path.join(app.getPath("temp"), "rustypdf-images");
+        await mkdir(base, { recursive: true });
+        const temp = await mkdtemp(path.join(base, "run-"));
+        try {
+          checked = {
+            ...checked,
+            paths: await convertImages(checked.paths as unknown[], temp),
+          };
+          return await service.invoke(command, checked);
+        } finally {
+          await rm(temp, { recursive: true, force: true });
+        }
       }
-      if (command === "note_recent_document") {
-        if (
-          !process.env.RUSTYPDF_SMOKE &&
-          typeof args.path === "string" &&
-          path.isAbsolute(args.path)
-        )
-          app.addRecentDocument(args.path);
-        return;
-      }
-      if (command === "set_dock_recents") return;
-      if (command === "clipboard_write_png") {
-        await clipboard.write([
-          new ClipboardItem({
-            "image/png": new Blob([new Uint8Array(args.bytes)]),
-          }),
-        ]);
-        return;
-      }
-      const result = await service.invoke(command, args);
-      if (
-        command === "pdf_open" &&
-        typeof args.path === "string" &&
-        !process.env.RUSTYPDF_SMOKE
-      )
-        app.addRecentDocument(args.path);
-      return result;
+      return service.invoke(command, checked);
     });
     ipcMain.handle("desktop:dialog", async (event, kind, options = {}) => {
       validate(event);
@@ -134,15 +343,17 @@ if (!app.requestSingleInstanceLock()) {
             ...(options.multiple ? ["multiSelections" as const] : []),
           ],
         });
-        return selected.canceled
-          ? null
-          : options.multiple
-            ? selected.filePaths
-            : (selected.filePaths[0] ?? null);
+        if (selected.canceled) return null;
+        for (const file of selected.filePaths) grants.grant(file);
+        return options.multiple
+          ? selected.filePaths
+          : (selected.filePaths[0] ?? null);
       }
       if (kind === "save") {
         const selected = await dialog.showSaveDialog(window!, opts);
-        return selected.canceled ? null : (selected.filePath ?? null);
+        if (selected.canceled || !selected.filePath) return null;
+        grants.grant(selected.filePath, { write: true });
+        return selected.filePath;
       }
       if (kind === "ask" || kind === "unsaved") {
         const result = await dialog.showMessageBox(window!, {
@@ -169,6 +380,7 @@ if (!app.requestSingleInstanceLock()) {
       validate(event);
       if (typeof file !== "string" || !path.isAbsolute(file))
         throw new Error("Invalid path");
+      if (!grants.has(file)) throw new Error("허용되지 않은 파일 경로입니다.");
       return new Uint8Array(await readFile(file));
     });
     ipcMain.handle("desktop:write", async (event, file, bytes) => {
@@ -179,6 +391,8 @@ if (!app.requestSingleInstanceLock()) {
         !(bytes instanceof Uint8Array)
       )
         throw new Error("Invalid file");
+      if (!grants.canWrite(file))
+        throw new Error("허용되지 않은 파일 경로입니다.");
       await writeFile(file, bytes);
     });
     const create = () => {
@@ -194,6 +408,7 @@ if (!app.requestSingleInstanceLock()) {
           sandbox: true,
           contextIsolation: true,
           nodeIntegration: false,
+          devTools: !app.isPackaged,
           webSecurity: true,
         },
       });
@@ -225,6 +440,40 @@ if (!app.requestSingleInstanceLock()) {
           window?.webContents.send("app-close-requested");
         }
       });
+      window.on("unresponsive", async () => {
+        if (askedUnresponsive || !window) return;
+        askedUnresponsive = true;
+        const target = window;
+        const { response } = await dialog.showMessageBox(target, {
+          type: "warning",
+          title: "RustyPDF",
+          message: "창이 응답하지 않습니다.",
+          buttons: ["기다리기", "강제 종료"],
+          defaultId: 0,
+          cancelId: 0,
+        });
+        askedUnresponsive = false;
+        if (response === 1 && !target.isDestroyed())
+          target.webContents.forcefullyCrashRenderer();
+      });
+      window.webContents.on("render-process-gone", async (_event, details) => {
+        if (details.reason === "clean-exit" || quitting || !window) return;
+        if (process.env.RUSTYPDF_SMOKE) return;
+        const target = window;
+        const { response } = await dialog.showMessageBox(target, {
+          type: "error",
+          title: "RustyPDF",
+          message: "창이 예기치 않게 종료되었습니다.",
+          buttons: ["다시 불러오기", "종료"],
+          defaultId: 0,
+          cancelId: 1,
+        });
+        if (response === 0 && !target.isDestroyed()) target.reload();
+        else {
+          allowExit = true;
+          app.quit();
+        }
+      });
       window.on("closed", () => {
         window = null;
         subscribed = false;
@@ -244,216 +493,14 @@ if (!app.requestSingleInstanceLock()) {
         });
         window.webContents.on("did-finish-load", () =>
           setTimeout(async () => {
-            try {
-              const ok = await window!.webContents.executeJavaScript(
-                'Boolean(window.desktop && document.querySelector("#root")?.children.length)',
-              );
-              if (!ok)
-                throw new Error(
-                  "Renderer or sandbox preload did not initialize",
-                );
-              const priorClipboard = await Promise.all(
-                (await clipboard.read()).map(
-                  async (item) =>
-                    new ClipboardItem(
-                      Object.fromEntries(
-                        await Promise.all(
-                          item.types.map(async (type) => [
-                            type,
-                            await item.getType(type),
-                          ]),
-                        ),
-                      ),
-                    ),
-                ),
-              );
-              try {
-                await window!.webContents.executeJavaScript(`(async () => {
-                  const canvas = document.createElement('canvas');
-                  canvas.width = 2; canvas.height = 3;
-                  const context = canvas.getContext('2d');
-                  context.fillStyle = 'rgb(17,34,51)'; context.fillRect(0,0,2,3);
-                  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-                  await window.desktop.invoke('clipboard_write_png', {bytes: new Uint8Array(await blob.arrayBuffer())});
-                })()`);
-                const item = (await clipboard.read()).find((item) =>
-                  item.types.includes("image/png"),
-                );
-                if (!item)
-                  throw new Error("Clipboard PNG missing after IPC write");
-                const image = nativeImage.createFromBuffer(
-                  Buffer.from(
-                    await (await item.getType("image/png")).arrayBuffer(),
-                  ),
-                );
-                const size = image.getSize();
-                const pixel = image.toBitmap().subarray(0, 4);
-                if (
-                  size.width !== 2 ||
-                  size.height !== 3 ||
-                  !pixel.equals(Buffer.from([51, 34, 17, 255]))
-                )
-                  throw new Error(
-                    "Clipboard PNG round trip failed: " +
-                      JSON.stringify({ size, pixel: [...pixel] }),
-                  );
-              } finally {
-                if (priorClipboard.length)
-                  await clipboard.write(priorClipboard);
-                else clipboard.clear();
-              }
-              const canvas = await window!.webContents.executeJavaScript(
-                `(() => {const c=[...document.querySelectorAll('canvas')].find(c=>c.width>=800);return c?{width:c.width,height:c.height,png:c.toDataURL('image/png').split(',')[1]}:null})()`,
-              );
-              if (!canvas || canvas.width !== 816 || canvas.height !== 1056)
-                throw new Error(
-                  "PDF.js fixture rendering expected 816x1056: " +
-                    JSON.stringify(
-                      canvas && { width: canvas.width, height: canvas.height },
-                    ),
-                );
-              const editPath = path.join(
-                path.dirname(smokePath!),
-                "edit-fixture.pdf",
-              );
-              await copyFile(smokePath!, editPath);
-              const opened = (await service.invoke("pdf_open", {
-                path: editPath,
-              })) as { id: string; revision: number };
-              const args = {
-                docId: opened.id,
-                expectedRevision: opened.revision,
-              };
-              const ocr = (await service.invoke("pdf_ocr_page", {
-                ...args,
-                pageIndex: 0,
-                image: new Uint8Array(Buffer.from(canvas.png, "base64")),
-                imageWidth: canvas.width,
-                imageHeight: canvas.height,
-              })) as { text: string };
-              if (!ocr.text.toLowerCase().includes("rustypdf"))
-                throw new Error("Offline OCR failed fixture text");
-              await service.invoke("pdf_ocr_flush", args);
-              const edited = (await service.invoke("pdf_rotate_pages", {
-                ...args,
-                indices: [0],
-                direction: 1,
-              })) as { revision: number };
-              const targetPath = path.join(
-                path.dirname(smokePath!),
-                "saved.pdf",
-              );
-              const saved = (await service.invoke("pdf_save_document", {
-                docId: opened.id,
-                expectedRevision: edited.revision,
-                targetPath,
-              })) as { revision: number };
-              await service.invoke("export_annotated_pdf", {
-                docId: opened.id,
-                expectedRevision: saved.revision,
-                targetPath: path.join(path.dirname(smokePath!), "export.pdf"),
-                data: {
-                  version: 2,
-                  sourcePath: targetPath,
-                  updatedAt: new Date().toISOString(),
-                  annotations: [
-                    {
-                      id: "smoke-text",
-                      page: 0,
-                      type: "text",
-                      rect: { x: 70, y: 80, w: 450, h: 90 },
-                      rotation: 0,
-                      style: { color: "#112233", width: 1, fontSize: 24 },
-                      payload: {
-                        text: "한글 내보내기 RustyPDF",
-                        layout: [
-                          {
-                            baseline: 28,
-                            fragments: [
-                              {
-                                text: "한글 내보내기 RustyPDF",
-                                x: 0,
-                                fontSize: 24,
-                                color: "#112233",
-                                bold: true,
-                                italic: true,
-                                underline: true,
-                              },
-                            ],
-                          },
-                        ],
-                      },
-                    },
-                  ],
-                },
-              });
-              await writeFile(
-                path.join(path.dirname(smokePath!), "screenshot.png"),
-                (await window!.webContents.capturePage()).toPNG(),
-              );
-              await window!.webContents.executeJavaScript(
-                `document.querySelector('.viewer-scroll').scrollTop=400`,
-              );
-              await new Promise((resolve) => setTimeout(resolve, 400));
-              const scrolling = await window!.webContents.executeJavaScript(
-                `document.querySelector('.viewer-scroll').scrollTop`,
-              );
-              if (Math.abs(scrolling - 400) > 2)
-                throw new Error("Scroll snapped: " + scrolling);
-              const exportPath = path.join(
-                path.dirname(smokePath!),
-                "export.pdf",
-              );
-              enqueue([exportPath]);
-              await new Promise((resolve) => setTimeout(resolve, 1500));
-              await writeFile(
-                path.join(path.dirname(smokePath!), "export-screenshot.png"),
-                (await window!.webContents.capturePage()).toPNG(),
-              );
-              await window!.webContents.executeJavaScript(
-                `(() => { const tab = document.querySelectorAll('.tab-item')[0]; tab.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 })); if (!tab.classList.contains('active')) throw new Error('Smoke tab 0 did not activate'); })()`,
-              );
-              await new Promise((resolve) => setTimeout(resolve, 400));
-              const restored = await window!.webContents.executeJavaScript(
-                `document.querySelector('.viewer-scroll').scrollTop`,
-              );
-              if (Math.abs(restored - 400) > 2)
-                throw new Error("Tab scroll restore failed: " + restored);
-              await window!.webContents.executeJavaScript(
-                `document.querySelector('button[title="다음 페이지"]').click()`,
-              );
-              await new Promise((resolve) => setTimeout(resolve, 400));
-              const navigated = await window!.webContents.executeJavaScript(
-                `document.querySelector('.viewer-scroll').scrollTop`,
-              );
-              if (navigated <= 400)
-                throw new Error("Explicit next page navigation failed");
-              await window!.webContents.executeJavaScript(
-                `(() => { const tab = document.querySelectorAll('.tab-item')[1]; tab.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 })); if (!tab.classList.contains('active')) throw new Error('Smoke tab 1 did not activate'); })()`,
-              );
-              await new Promise((resolve) => setTimeout(resolve, 200));
-              await window!.webContents.executeJavaScript(
-                `(() => { const tab = document.querySelectorAll('.tab-item')[0]; tab.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 })); if (!tab.classList.contains('active')) throw new Error('Smoke tab 0 did not activate'); })()`,
-              );
-              await new Promise((resolve) => setTimeout(resolve, 400));
-              const navRestored = await window!.webContents.executeJavaScript(
-                `document.querySelector('.viewer-scroll').scrollTop`,
-              );
-              if (Math.abs(navRestored - navigated) > 2)
-                throw new Error(
-                  "Navigation tab restore failed: " +
-                    navRestored +
-                    " vs " +
-                    navigated,
-                );
-              console.log(
-                "Electron smoke passed: sandbox preload, PNG clipboard round trip, PDF.js 816x1056, offline eng+kor OCR, rotate/save/export, scroll/tab/navigation restore; artifacts " +
-                  path.dirname(smokePath!),
-              );
-            } catch (error) {
-              console.error(error);
-              failed = true;
-            }
+            const { runSmoke } = await import("./smoke");
+            const passed = await runSmoke({
+              window: window!,
+              service,
+              smokePath: smokePath!,
+              enqueue,
+            });
+            if (!passed) failed = true;
             allowExit = true;
             await service.dispose().catch((error) => console.error(error));
             app.exit(failed ? 1 : 0);
@@ -461,25 +508,7 @@ if (!app.requestSingleInstanceLock()) {
         );
       }
     };
-    Menu.setApplicationMenu(
-      Menu.buildFromTemplate([
-        {
-          label: "RustyPDF",
-          submenu: [{ role: "about" }, { type: "separator" }, { role: "quit" }],
-        },
-        {
-          label: "File",
-          submenu: [
-            {
-              role: "recentDocuments",
-              submenu: [{ role: "clearRecentDocuments" }],
-            },
-          ],
-        },
-        { role: "editMenu" },
-        { role: "viewMenu" },
-      ]),
-    );
+    buildMenu();
     enqueue(process.argv.slice(1).filter((p) => path.isAbsolute(p)));
     if (process.env.RUSTYPDF_SMOKE) {
       const { PDFDocument, StandardFonts } = await import("pdf-lib");
@@ -502,6 +531,7 @@ if (!app.requestSingleInstanceLock()) {
       enqueue([smokePath]);
     }
     create();
+    initAutoUpdates();
     app.on("activate", () => {
       if (!window) create();
     });

@@ -1,0 +1,14 @@
+.help-dialog { border: 1px solid var(--border, #8884); border-radius: 10px; padding: 20px 24px; background: var(--panel-bg, Canvas); color: inherit; max-width: 640px; }
+.help-dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+.help-dialog h2 { margin: 0 0 12px; font-size: 16px; }
+.help-dialog h3 { margin: 0 0 6px; font-size: 13px; opacity: 0.7; }
+.help-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 28px; margin-bottom: 14px; }
+.help-groups dl { margin: 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; font-size: 13px; }
+.help-groups dd { margin: 0; text-align: right; }
+.help-dialog kbd { font-family: inherit; padding: 1px 6px; border: 1px solid var(--border, #8886); border-radius: 4px; font-size: 12px; }
+.help-backdrop { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.4); }
+.password-dialog { display: flex; flex-direction: column; gap: 8px; min-width: 320px; }
+.password-dialog input { padding: 6px 8px; font-size: 14px; }
+.password-file { margin: 0; font-size: 13px; opacity: 0.8; word-break: break-all; }
+.password-error { margin: 0; color: #d33; font-size: 13px; }
+.help-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }

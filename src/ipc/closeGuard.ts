@@ -3,18 +3,18 @@ import { invoke } from "../platform/desktop";
 import { listen } from "../platform/desktop";
 
 import { documentStore, fileNameFromPath } from "../state/document";
-import { confirmUnsaved } from "../platform/desktop";
-import { saveTabPdfUntilClean } from "./pdf";
+import { ask, confirmUnsaved } from "../platform/desktop";
+import { deleteDraft, saveTabPdfUntilClean } from "./pdf";
 import {
   hasPendingDocumentMutations,
   waitForAllDocumentMutations,
 } from "./documentMutations";
 
 const hasUnsavedTabs = () =>
-  documentStore.tabs.some((t) => t.annotations.dirty || t.pageDirty);
+  documentStore.tabs.some((t) => t.annotations.dirty || t.pageDirty || t.formDirty);
 
 const unsavedTabs = () =>
-  documentStore.tabs.filter((t) => t.annotations.dirty || t.pageDirty);
+  documentStore.tabs.filter((t) => t.annotations.dirty || t.pageDirty || t.formDirty);
 
 export function attachCloseGuard(): () => void {
   let unlistenAppClose: (() => void) | undefined;
@@ -44,6 +44,9 @@ export function attachCloseGuard(): () => void {
           `저장되지 않은 변경사항이 있습니다:\n${dirtyNames.join("\n")}\n\n저장하시겠습니까?`,
         );
         if (choice === "cancel") return;
+        if (choice === "discard") {
+          for (const tab of tabsToSave) await deleteDraft(tab.path);
+        }
         if (choice === "save") {
           const failedNames: string[] = [];
           for (const tab of tabsToSave) {
@@ -56,7 +59,7 @@ export function attachCloseGuard(): () => void {
             }
           }
           if (failedNames.length > 0) {
-            const force = window.confirm(
+            const force = await ask(
               `다음 파일 저장에 실패했습니다:\n${failedNames.join("\n")}\n\n그래도 닫으시겠습니까?`,
             );
             if (!force) {

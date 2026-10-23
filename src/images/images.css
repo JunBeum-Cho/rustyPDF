@@ -33,3 +33,8 @@
 .image-import-footer { justify-content: flex-end; border-top: 1px solid var(--border); }
 .image-import-submit { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); padding: 9px 16px; }
 .image-import-submit:hover { background: var(--accent); opacity: 0.9; }
+.image-import-thumb { width: 48px; height: 48px; flex-shrink: 0; object-fit: cover; border-radius: 4px; background: var(--border); display: inline-flex; align-items: center; justify-content: center; color: var(--text-dim); }
+.image-import-grip { cursor: grab; color: var(--text-dim); user-select: none; touch-action: none; padding: 0 2px; }
+.image-import-list li.dragging { opacity: 0.5; }
+.image-import-list li.drop-before { box-shadow: 0 -2px 0 var(--accent, #3b82f6); }
+.image-import-list li.drop-after { box-shadow: 0 2px 0 var(--accent, #3b82f6); }

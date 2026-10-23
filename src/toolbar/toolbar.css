@@ -140,3 +140,12 @@
 .zoom-entry { width: 58px; }
 .toolbar-group { flex-shrink: 0; }
 @media (max-width: 760px) { .toolbar { gap: 6px; padding: 6px; } .toolbar-spacer { display: none; } }
+
+.readonly-badge {
+  padding: 2px 8px;
+  margin-left: 4px;
+  border-radius: 10px;
+  font-size: 12px;
+  background: var(--badge-bg, rgba(128, 128, 128, 0.2));
+  white-space: nowrap;
+}

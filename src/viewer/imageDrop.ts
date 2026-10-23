@@ -4,7 +4,9 @@ import { readFile } from "../platform/desktop";
 import { createAnnotationId } from "../annotations/store";
 import type { Annotation } from "../annotations/types";
 import { displayPointToPage } from "../annotations/coords";
-import { activeTab, documentStore, updateTabById } from "../state/document";
+import { activeTab, documentStore } from "../state/document";
+import { addAnnotationToTab } from "../annotations/store";
+import { pxPerPt } from "./navigation";
 
 const EXT_MIME: Record<string, string> = {
   png: "image/png",
@@ -84,7 +86,7 @@ export async function handleImageDrop(
   position: { x: number; y: number },
 ): Promise<void> {
   const tab = activeTab();
-  if (!tab) return;
+  if (!tab || tab.readOnly) return;
   const { tabId, docId, revision } = tab;
 
   const hit = findPageHit(position.x, position.y);
@@ -99,8 +101,8 @@ export async function handleImageDrop(
   const dropPagePoint = displayPointToPage(
     { x: hit.x, y: hit.y },
     pageMeta,
-    tab.zoom,
-    tab.rotation,
+    pxPerPt(tab.zoom),
+    0,
   );
 
   // Stack vertically if multiple images dropped together so they don't pile
@@ -163,22 +165,7 @@ export async function handleImageDrop(
         (candidate) => candidate.tabId === tabId,
       );
       if (!live || live.docId !== docId || live.revision !== revision) return;
-      updateTabById(tabId, (target) => {
-        target.annotations.history.push(
-          target.annotations.items.map((item) =>
-            JSON.parse(JSON.stringify(item)),
-          ),
-        );
-        if (target.annotations.history.length > 80)
-          target.annotations.history.shift();
-        target.annotations.future = [];
-        target.annotations.items.push(annotation);
-        target.annotations.selectedIds = [annotation.id];
-        target.annotations.editVersion += 1;
-        target.annotations.dirty = true;
-        target.annotations.saveStatus = "idle";
-        target.annotations.saveError = null;
-      });
+      addAnnotationToTab(tabId, annotation);
       stackOffset += 18;
     } catch (error) {
       console.error("image drop failed for", path, error);

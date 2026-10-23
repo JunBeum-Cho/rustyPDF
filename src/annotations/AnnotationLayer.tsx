@@ -1,7 +1,8 @@
 import { normalizeFontFamily } from "./fonts";
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import type { JSX } from "solid-js";
-import type { PageMeta } from "../state/document";
+import { activeTab, type PageMeta } from "../state/document";
+import { historyBusy } from "../viewer/documentHistory";
 import {
   contentBox,
   displayPointToPage,
@@ -14,6 +15,12 @@ import {
   resizeRect,
   type Rotation,
 } from "./coords";
+import {
+  moveQuads,
+  normalizeCaptureRect,
+  simplifyPoints,
+  unionRect,
+} from "./layerGeometry";
 import {
   addAnnotation,
   annotationStore,
@@ -52,9 +59,11 @@ interface AnnotationLayerProps {
   page: PageMeta;
   width: number;
   height: number;
+  /** CSS pixels per PDF point (D5: pages never rotate the layer). */
   zoom: number;
-  rotation: Rotation;
 }
+
+const ROTATION = 0;
 
 type DraftKind = Exclude<AnnotationKind, "text"> | "capture";
 
@@ -124,6 +133,7 @@ const annotationBboxPage = (annotation: Annotation): Rect | null => {
   ) {
     return null;
   }
+  if (annotation.quads?.length) return unionRect(annotation.quads);
   if (annotation.rect) {
     return annotation.rect;
   }
@@ -279,6 +289,10 @@ const textStyleChanged = (
 
 export function AnnotationLayer(props: AnnotationLayerProps) {
   const [draft, setDraft] = createSignal<Draft>(null);
+  // Pen points live in a mutable buffer; the tick signal re-renders the draft
+  // path without copying the array on every pointer move.
+  const [penTick, setPenTick] = createSignal(0);
+  const locked = () => historyBusy() || (activeTab()?.readOnly ?? false);
   const [dragState, setDragState] = createSignal<DragState>(null);
   let layerRef: SVGSVGElement | undefined;
   let lastTextClick:
@@ -312,12 +326,14 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     updateAnnotationTextLive(editEntry.id, html, htmlToPlainText(html));
   };
 
+  const draftMarkerId = `arrow-draft-${props.page.index}`;
+
   const pageAnnotations = createMemo(() =>
     annotationStore.items.filter((annotation) => annotation.page === props.page.index),
   );
 
   const selectedIds = createMemo(() => new Set(annotationStore.selectedIds));
-  const displaySize = createMemo(() => displayedPageSize(props.page, props.rotation));
+  const displaySize = createMemo(() => displayedPageSize(props.page, ROTATION));
 
   const eventToPagePoint = (event: PointerEvent | MouseEvent): Point => {
     const rect = layerRef?.getBoundingClientRect();
@@ -331,7 +347,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       },
       props.page,
       props.zoom,
-      props.rotation,
+      ROTATION,
     );
   };
 
@@ -350,7 +366,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         id: createAnnotationId(),
         page: props.page.index,
         type,
-        points: currentDraft.points,
+        points: simplifyPoints(currentDraft.points, 0.5),
         style: styleForTool(type),
       };
     }
@@ -380,7 +396,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   };
 
   const onLayerPointerDown: JSX.EventHandlerUnion<SVGSVGElement, PointerEvent> = (event) => {
-    if (event.button !== 0) {
+    if (event.button !== 0 || locked()) {
       return;
     }
     lastTextClick = null;
@@ -460,7 +476,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         const points = currentDraft.points;
         const previous = points[points.length - 1];
         if (distance(previous, point) > 0.8) {
-          setDraft({ ...currentDraft, current: point, points: [...points, point] });
+          points.push(point);
+          currentDraft.current = point;
+          setPenTick((tick) => tick + 1);
         }
       } else {
         setDraft({ ...currentDraft, current: point });
@@ -470,6 +488,10 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
 
     const currentDrag = dragState();
     if (!currentDrag) {
+      return;
+    }
+    if (locked()) {
+      setDragState(null);
       return;
     }
     clearNativeTextSelection();
@@ -501,6 +523,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           ...annotation,
           rect: original.rect ? moveRect(original.rect, delta) : annotation.rect,
           points: movePoints(original.points, delta),
+          ...(original.quads ? { quads: moveQuads(original.quads, delta) } : {}),
         };
       });
     } else if (currentDrag.mode === "resize") {
@@ -534,47 +557,37 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       if (currentDraft.type === "capture") {
         const rect = normalizeRect(currentDraft.start, currentDraft.current);
         if (rect.w >= MIN_SIZE && rect.h >= MIN_SIZE) {
-          const pngPromise = captureRegion({
-            pageIndex: props.page.index,
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: rect.h,
-          });
-
-          pngPromise.then(
-            (buf) => {
-              emitToast("스크린샷이 준비됐습니다", "info", {
-                // Auto-dismiss after 5s. The user can still hit either
-                // action button before then; once it fades away the
-                // capture is gone (we don't keep the buffer around).
-                timeoutMs: 5000,
-                actions: [
-                  {
-                    label: "내 컴퓨터로 저장하기",
-                    run: async () => {
-                      const saved = await saveCaptureAs(buf);
-                      if (saved) emitToast("스크린샷을 저장했습니다");
+          const norm = normalizeCaptureRect(rect, props.page);
+          if (norm) {
+            captureRegion({ pageIndex: props.page.index, ...norm }).then(
+              async (buf) => {
+                try {
+                  await copyPngToClipboard(buf);
+                } catch (error) {
+                  console.error("capture copy failed", error);
+                }
+                emitToast("클립보드에 복사했습니다", "info", {
+                  timeoutMs: 8000,
+                  actions: [
+                    {
+                      label: "파일로 저장",
+                      run: async () => {
+                        const saved = await saveCaptureAs(buf);
+                        if (saved) emitToast("스크린샷을 저장했습니다");
+                      },
                     },
-                  },
-                  {
-                    label: "클립보드에 복사하기",
-                    run: async () => {
-                      await copyPngToClipboard(buf);
-                      emitToast("스크린샷이 클립보드에 복사됐습니다");
-                    },
-                  },
-                ],
-              });
-            },
-            (error) => {
-              console.error("capture failed", error);
-              emitToast(
-                `캡처 실패: ${error instanceof Error ? error.message : String(error)}`,
-                "error",
-              );
-            },
-          );
+                  ],
+                });
+              },
+              (error) => {
+                console.error("capture failed", error);
+                emitToast(
+                  `캡처 실패: ${error instanceof Error ? error.message : String(error)}`,
+                  "error",
+                );
+              },
+            );
+          }
         }
         setDraft(null);
         // Auto-revert to the select tool after a single capture so the user
@@ -680,7 +693,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   };
 
   const startMove = (event: PointerEvent, annotation: Annotation) => {
-    if (event.button !== 0) {
+    if (event.button !== 0 || locked()) {
       return;
     }
     // Clicking an existing annotation always selects/moves it, regardless of
@@ -720,7 +733,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     annotation: Annotation,
     handle: "nw" | "ne" | "sw" | "se",
   ) => {
-    if (!annotation.rect) {
+    if (!annotation.rect || locked()) {
       return;
     }
     event.stopPropagation();
@@ -744,7 +757,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     annotation: Annotation,
     pointIndex: number,
   ) => {
-    if (!annotation.points) {
+    if (!annotation.points || locked()) {
       return;
     }
     event.stopPropagation();
@@ -764,7 +777,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
   };
 
   const editText = (event: MouseEvent, annotation: Annotation) => {
-    if (annotation.type !== "text") {
+    if (annotation.type !== "text" || locked()) {
       return;
     }
     event.stopPropagation();
@@ -818,10 +831,11 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     const stroke = annotationStore.color;
     const width = Math.max(1, annotationStore.strokeWidth * props.zoom);
     if (currentDraft.type === "pen") {
+      penTick();
       return (
         <path
           class="annotation-shape annotation-draft"
-          d={displayPath(currentDraft.points, props.page, props.zoom, props.rotation)}
+          d={displayPath(currentDraft.points, props.page, props.zoom, ROTATION)}
           fill="none"
           stroke={stroke}
           stroke-width={width}
@@ -830,7 +844,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     }
     if (currentDraft.type === "line" || currentDraft.type === "arrow") {
       const [start, end] = [currentDraft.start, currentDraft.current].map((point) =>
-        pagePointToDisplay(point, props.page, props.zoom, props.rotation),
+        pagePointToDisplay(point, props.page, props.zoom, ROTATION),
       );
       return (
         <line
@@ -841,7 +855,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           y2={end.y}
           stroke={stroke}
           stroke-width={width}
-          marker-end={currentDraft.type === "arrow" ? "url(#annotation-arrow)" : undefined}
+          marker-end={currentDraft.type === "arrow" ? `url(#${draftMarkerId})` : undefined}
         />
       );
     }
@@ -849,7 +863,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       normalizeRect(currentDraft.start, currentDraft.current),
       props.page,
       props.zoom,
-      props.rotation,
+      ROTATION,
     );
     const draftFill =
       annotationStore.fill === "transparent" ? "none" : annotationStore.fill;
@@ -915,7 +929,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       bboxPage,
       props.page,
       props.zoom,
-      props.rotation,
+      ROTATION,
     );
     const padPx = HIT_PAD * props.zoom;
     return (
@@ -961,7 +975,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         <path
           {...shapeProps}
           classList={{ selected: selected() }}
-          d={displayPath(annotation.points, props.page, props.zoom, props.rotation)}
+          d={displayPath(annotation.points, props.page, props.zoom, ROTATION)}
           fill="none"
         />
       );
@@ -970,9 +984,9 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     if (annotation.type === "line" || annotation.type === "arrow") {
       const points = annotation.points ?? [];
       const start = () =>
-        pagePointToDisplay(points[0] ?? { x: 0, y: 0 }, props.page, props.zoom, props.rotation);
+        pagePointToDisplay(points[0] ?? { x: 0, y: 0 }, props.page, props.zoom, ROTATION);
       const end = () =>
-        pagePointToDisplay(points[1] ?? { x: 0, y: 0 }, props.page, props.zoom, props.rotation);
+        pagePointToDisplay(points[1] ?? { x: 0, y: 0 }, props.page, props.zoom, ROTATION);
       return (
         <line
           {...shapeProps}
@@ -981,16 +995,64 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
           y1={start().y}
           x2={end().x}
           y2={end().y}
-          marker-end={annotation.type === "arrow" ? "url(#annotation-arrow)" : undefined}
+          marker-end={annotation.type === "arrow" ? `url(#arrow-${annotation.id})` : undefined}
         />
       );
     }
 
+    if (
+      annotation.quads?.length &&
+      (annotation.type === "highlight" ||
+        annotation.type === "underline" ||
+        annotation.type === "strikeout")
+    ) {
+      const boxes = () =>
+        (annotation.quads ?? []).map((quad) =>
+          rectToDisplayBox(quad, props.page, props.zoom, ROTATION),
+        );
+      const lineWidth = () => Math.max(1, (annotation.style.width || 1) * props.zoom);
+      return (
+        <g
+          class="annotation-quads"
+          classList={{ selected: selected() }}
+          onPointerDown={(event) => startMove(event, annotation)}
+        >
+          <For each={boxes()}>
+            {(b) =>
+              annotation.type === "highlight" ? (
+                <rect
+                  class="annotation-shape annotation-quad-highlight"
+                  x={b.x}
+                  y={b.y}
+                  width={b.w}
+                  height={b.h}
+                  fill={annotation.style.fill ?? annotation.style.color}
+                  style={{
+                    opacity: annotation.style.opacity ?? 0.32,
+                    "mix-blend-mode": "multiply",
+                  }}
+                />
+              ) : (
+                <line
+                  class="annotation-shape"
+                  x1={b.x}
+                  x2={b.x + b.w}
+                  y1={annotation.type === "underline" ? b.y + b.h : b.y + b.h / 2}
+                  y2={annotation.type === "underline" ? b.y + b.h : b.y + b.h / 2}
+                  stroke={annotation.style.color}
+                  stroke-width={lineWidth()}
+                />
+              )
+            }
+          </For>
+        </g>
+      );
+    }
     if (!annotation.rect) {
       return null;
     }
     const box = () =>
-      rectToDisplayBox(annotation.rect!, props.page, props.zoom, props.rotation);
+      rectToDisplayBox(annotation.rect!, props.page, props.zoom, ROTATION);
     // Content keeps its own orientation inside the box: page rotation turns
     // the box, and this turns what is drawn in it. Without the pair, a photo
     // on a rotated page would be squashed into the transposed box instead of
@@ -1216,6 +1278,11 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         height={box().h}
         fill={annotation.style.fill ?? "none"}
         opacity={annotation.style.opacity ?? 1}
+        style={
+          annotation.type === "highlight"
+            ? { "mix-blend-mode": "multiply" }
+            : undefined
+        }
       />
     );
   };
@@ -1224,8 +1291,8 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     if (!selectedIds().has(annotation.id)) {
       return null;
     }
-    if (annotation.rect) {
-      const box = rectToDisplayBox(annotation.rect, props.page, props.zoom, props.rotation);
+    if (annotation.rect && !annotation.quads?.length) {
+      const box = rectToDisplayBox(annotation.rect, props.page, props.zoom, ROTATION);
       const handles: Array<["nw" | "ne" | "sw" | "se", number, number]> = [
         ["nw", box.x, box.y],
         ["ne", box.x + box.w, box.y],
@@ -1252,7 +1319,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       return (
         <For each={annotation.points}>
           {(pt, i) => {
-            const display = pagePointToDisplay(pt, props.page, props.zoom, props.rotation);
+            const display = pagePointToDisplay(pt, props.page, props.zoom, ROTATION);
             return (
               <rect
                 class="annotation-handle handle-endpoint"
@@ -1273,7 +1340,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       const bbox = { x: Math.min(...xs), y: Math.min(...ys), w: 0, h: 0 };
       bbox.w = Math.max(...xs) - bbox.x;
       bbox.h = Math.max(...ys) - bbox.y;
-      const box = rectToDisplayBox(bbox, props.page, props.zoom, props.rotation);
+      const box = rectToDisplayBox(bbox, props.page, props.zoom, ROTATION);
       return (
         <rect
           class="annotation-bbox"
@@ -1304,12 +1371,14 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
       // Without this the click leaks straight to the underlying text layer
       // and the annotation stays selected forever.
       classList={{
+        "read-only": locked(),
         "passes-through":
-          annotationStore.tool === "select" &&
+          locked() ||
+          (annotationStore.tool === "select" &&
           annotationStore.editingId === null &&
           dragState() === null &&
           draft() === null &&
-          annotationStore.selectedIds.length === 0,
+          annotationStore.selectedIds.length === 0),
       }}
       width={props.width}
       height={props.height}
@@ -1321,7 +1390,7 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
     >
       <defs>
         <marker
-          id="annotation-arrow"
+          id={draftMarkerId}
           markerWidth="10"
           markerHeight="10"
           refX="8"
@@ -1331,6 +1400,21 @@ export function AnnotationLayer(props: AnnotationLayerProps) {
         >
           <path d="M0,0 L0,6 L9,3 z" fill={annotationStore.color} />
         </marker>
+        <For each={pageAnnotations().filter((a) => a.type === "arrow")}>
+          {(annotation) => (
+            <marker
+              id={`arrow-${annotation.id}`}
+              markerWidth="10"
+              markerHeight="10"
+              refX="8"
+              refY="3"
+              orient="auto"
+              markerUnits="strokeWidth"
+            >
+              <path d="M0,0 L0,6 L9,3 z" fill={annotation.style.color} />
+            </marker>
+          )}
+        </For>
       </defs>
       {/*
         Hit areas render BEFORE visible shapes so painted strokes still

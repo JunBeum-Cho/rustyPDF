@@ -1,17 +1,13 @@
 import { onFileDrop } from "../platform/desktop";
 import { listen } from "../platform/desktop";
 import { onCleanup, onMount } from "solid-js";
-import { initialOpenPaths, openPdf, requestOpenPdf } from "./pdf";
+import { initialOpenPaths, openPdf } from "./pdf";
 
 import { addImagePaths, imageImportOpen } from "../images/importState";
 
 const isPdfPath = (path: string) => path.toLowerCase().endsWith(".pdf");
 const isImagePath = (path: string) =>
-  /\.(png|jpe?g|gif|webp|bmp|svg|tiff?)$/i.test(path);
-
-export interface FileDropHandlers {
-  onImagePaths?: (paths: string[], event: { x: number; y: number }) => void;
-}
+  /\.(heic|heif|webp|gif|bmp|tiff?|png|jpe?g)$/i.test(path);
 
 let imageDropHandler:
   ((paths: string[], event: { x: number; y: number }) => void) | null = null;
@@ -44,7 +40,7 @@ export function installFileOpenHandlers() {
           const pdfs = paths.filter(isPdfPath);
           const images = paths.filter(isImagePath);
           for (const p of pdfs) {
-            void requestOpenPdf(p);
+            void openPdf(p);
           }
           if (images.length > 0 && imageDropHandler) {
             // Desktop drop positions already use CSS client pixels.

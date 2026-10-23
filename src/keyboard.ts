@@ -6,18 +6,21 @@ import {
   updateActiveTab,
 } from "./state/document";
 import { applyTheme, setUiStore, uiStore } from "./state/ui";
-import { closeTab, requestOpenPdfDialog, saveActivePdf } from "./ipc/pdf";
+import { closeTab, openPdfDialog, saveActivePdf } from "./ipc/pdf";
 import {
   deleteSelectedAnnotations,
   setAnnotationTool,
 } from "./annotations/store";
-import { rotateDocument } from "./viewer/pageRotation";
-
+import { rotateSelectedPages } from "./viewer/pageRotation";
 import { undoDocumentEdit, redoDocumentEdit } from "./viewer/documentHistory";
-import { setManualZoom, setNavigationMode } from "./viewer/navigation";
+import { setManualZoom, setNavigationMode, zoomIn, zoomOut } from "./viewer/navigation";
+import { printActiveDocument } from "./print/print";
 import { blocksToolShortcut } from "./platform/shortcuts";
+import { toggleShortcutHelp } from "./help/ShortcutHelp";
 
-const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+import { shortcutFor, type Shortcut } from "./platform/shortcuts";
+export { shortcutFor };
+export type { Shortcut };
 
 function isEditableTarget(t: EventTarget | null): boolean {
   if (!(t instanceof HTMLElement)) return false;
@@ -34,41 +37,6 @@ function isInteractiveTarget(t: EventTarget | null): boolean {
     t instanceof HTMLElement &&
     Boolean(t.closest("button, a, select, [role='button']"))
   );
-}
-
-function handleUndoRedo(e: KeyboardEvent): boolean {
-  const mod = e.metaKey || e.ctrlKey;
-  if (!mod) return false;
-  if (e.key === "z" || e.key === "Z") {
-    e.preventDefault();
-    if (e.shiftKey) void redoDocumentEdit();
-    else void undoDocumentEdit();
-    return true;
-  }
-  if (e.key === "y" || e.key === "Y") {
-    e.preventDefault();
-    void redoDocumentEdit();
-    return true;
-  }
-  return false;
-}
-
-function nextZoom() {
-  const tab = activeTab();
-  if (!tab) return;
-  setNavigationMode("manual");
-  const next = ZOOM_STEPS.find((z) => z > tab.zoom);
-  if (next)
-    setManualZoom(next);
-}
-
-function prevZoom() {
-  const tab = activeTab();
-  if (!tab) return;
-  setNavigationMode("manual");
-  const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
-  if (prev)
-    setManualZoom(prev);
 }
 
 function gotoPage(delta: number) {
@@ -94,119 +62,70 @@ export function installKeyboardShortcuts() {
     applyTheme(uiStore.theme);
 
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
-
-      // Cmd/Ctrl+S must save even while a text annotation is being edited.
-      // The contenteditable editor is an "editable target", so without this
-      // the guard below would swallow the shortcut entirely. The live text
-      // mirror keeps the store current, so the save captures what's on screen.
-      if (mod && (e.key === "s" || e.key === "S")) {
-        e.preventDefault();
-        if (activeTab()) void saveActivePdf(e.shiftKey);
+      // Sidebar page shortcuts (T10) run in the capture phase and mark the
+      // event handled; Delete there must not also delete annotations.
+      if (e.defaultPrevented) return;
+      const action = shortcutFor(e);
+      if (!action) return;
+      if (
+        action.type === "deleteAnnotations" &&
+        e.target instanceof HTMLElement &&
+        e.target.closest(".thumbnail-sidebar")
+      ) {
         return;
       }
-
-      if (isEditableTarget(e.target)) {
-        if (isAnnotationToolbarTarget(e.target) && handleUndoRedo(e)) return;
-        return;
-      }
-
       const tab = activeTab();
+      const editable = isEditableTarget(e.target);
 
-      if (mod && (e.key === "+" || e.key === "=")) {
-        e.preventDefault();
-        nextZoom();
-        return;
+      // Save, undo/redo in the annotation toolbar and help work from editors.
+      if (editable) {
+        const allowed =
+          action.type === "save" ||
+          action.type === "help" && (e.metaKey || e.ctrlKey) ||
+          ((action.type === "undo" || action.type === "redo") && isAnnotationToolbarTarget(e.target));
+        if (!allowed) return;
       }
-      if (mod && (e.key === "-" || e.key === "_")) {
-        e.preventDefault();
-        prevZoom();
-        return;
-      }
-      if (mod && e.key === "0") {
-        e.preventDefault();
-        setManualZoom(1);
-        return;
-      }
-      if (mod && (e.key === "o" || e.key === "O")) {
-        e.preventDefault();
-        void requestOpenPdfDialog();
-        return;
-      }
-      if (mod && (e.key === "f" || e.key === "F")) {
-        e.preventDefault();
-        setUiStore("searchOpen", (v) => !v);
-        return;
-      }
-      if (mod && e.key === "\\") {
-        e.preventDefault();
-        setUiStore("sidebarOpen", (v) => !v);
-        return;
-      }
-      if (mod && (e.key === "w" || e.key === "W")) {
-        e.preventDefault();
-        if (tab) void closeTab(tab.tabId);
-        return;
-      }
-      if (mod && e.key === "Tab") {
-        e.preventDefault();
-        cycleTab(e.shiftKey ? -1 : 1);
-        return;
-      }
-      if (handleUndoRedo(e)) return;
 
-      if (!mod && !e.altKey) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) {
         const target = e.target instanceof HTMLElement ? e.target : null;
-        if (target && (blocksToolShortcut(target.tagName, target.isContentEditable, target.getAttribute("role")) || target.closest("button, a, select, [role=button], [role=tab]"))) return;
-        const tools = { v: "select", t: "text", h: "highlight", p: "pen" } as const;
-        const tool = tools[e.key.toLowerCase() as keyof typeof tools];
-        if (tool) { e.preventDefault(); setAnnotationTool(tool); return; }
-        switch (e.key) {
-          case "Backspace":
-          case "Delete":
-            e.preventDefault();
-            deleteSelectedAnnotations();
-            break;
-          case "ArrowLeft":
-          case "PageUp":
-            e.preventDefault();
-            gotoPage(-1);
-            break;
-          case "ArrowRight":
-          case "PageDown":
-            e.preventDefault();
-            gotoPage(1);
-            break;
-          case " ":
-            // Don't hijack Space when a button/link is focused — that's the
-            // native "activate" key and stealing it breaks keyboard access.
-            if (isInteractiveTarget(e.target)) break;
-            e.preventDefault();
-            gotoPage(1);
-            break;
-          case "r":
-          case "R":
-            e.preventDefault();
-            void rotateDocument(e.shiftKey ? -1 : 1);
-            break;
-          case "Home":
-            e.preventDefault();
-            updateActiveTab((t) => {
-              t.navigationVersion = (t.navigationVersion ?? 0) + 1;
-              t.currentPage = 0;
-            });
-            break;
-          case "End":
-            e.preventDefault();
-            if (tab) {
-              updateActiveTab((t) => {
-                t.navigationVersion = (t.navigationVersion ?? 0) + 1;
-                t.currentPage = t.pageCount - 1;
-              });
-            }
-            break;
+        if (
+          target &&
+          action.type !== "help" &&
+          (blocksToolShortcut(target.tagName, target.isContentEditable, target.getAttribute("role")) ||
+            target.closest("button, a, select, [role=button], [role=tab]"))
+        ) {
+          return;
         }
       }
+
+      switch (action.type) {
+        case "tool": setAnnotationTool(action.tool); break;
+        case "rotate": if (tab && !tab.readOnly) void rotateSelectedPages(action.direction); break;
+        case "zoomIn": zoomIn(); break;
+        case "zoomOut": zoomOut(); break;
+        case "zoomReset": setNavigationMode("manual"); setManualZoom(1); break;
+        case "open": void openPdfDialog(); break;
+        case "search": setUiStore("searchOpen", (v) => !v); break;
+        case "close": if (tab) void closeTab(tab.tabId); break;
+        case "save": if (tab) void saveActivePdf(action.asNew); break;
+        case "undo": void undoDocumentEdit(); break;
+        case "redo": void redoDocumentEdit(); break;
+        case "print": if (tab) void printActiveDocument(); break;
+        case "help": toggleShortcutHelp(); break;
+        case "sidebar": setUiStore("sidebarOpen", (v) => !v); break;
+        case "cycleTab": cycleTab(action.direction); break;
+        case "deleteAnnotations": deleteSelectedAnnotations(); break;
+        case "page": gotoPage(action.delta); break;
+        case "pageSpace":
+          // Space on a focused button is the native "activate" key.
+          if (isInteractiveTarget(e.target)) return;
+          gotoPage(1);
+          break;
+        case "pageHome": gotoPage(-Infinity); break;
+        case "pageEnd": gotoPage(Infinity); break;
+      }
+      e.preventDefault();
     };
 
     window.addEventListener("keydown", onKey);

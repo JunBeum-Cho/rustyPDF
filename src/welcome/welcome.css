@@ -220,3 +220,15 @@
   background: var(--surface-3);
   color: var(--text);
 }
+
+.welcome-recents-item.missing {
+  opacity: 0.5;
+}
+
+.welcome-recents-tag {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+}

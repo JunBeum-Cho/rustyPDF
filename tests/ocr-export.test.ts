@@ -1,8 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
-import fontkit from "@pdf-lib/fontkit";
 import { addOcrTextLayer } from "../electron/ocr-export";
 import type { OcrPage } from "../electron/pdf-types";
 
@@ -13,10 +11,6 @@ async function reader(bytes: Uint8Array) {
   const { getDocument, Util, OPS } = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const task = getDocument({ data: bytes.slice(), useSystemFonts: false, disableFontFace: true });
   return { task, doc: await task.promise, canvas, Util, OPS };
-}
-async function font(pdf: PDFDocument) {
-  pdf.registerFontkit(fontkit);
-  return pdf.embedFont(await readFile(new URL("../resources/fonts/NotoSansKR-Regular.ttf", import.meta.url)), { subset: false });
 }
 function ocr(text = "한글 OCR export") : OcrPage {
   return { text, lines: [{ text, x: 0.1, y: 0.2, w: 0.7, h: 0.1 }] };
@@ -39,7 +33,7 @@ test("OCR adds searchable Korean and Latin without changing visible pixels on cr
   const original = await pdf.save();
   const pages = new Map([0, 1, 2, 3].map(i => [i, ocr()]));
   const exported = await PDFDocument.load(original);
-  await addOcrTextLayer(exported, pages, () => font(exported));
+  await addOcrTextLayer(exported, pages, undefined);
   const before = await reader(original), after = await reader(await exported.save());
   try {
     for (let i = 0; i < 4; i++) {
@@ -68,7 +62,7 @@ test("partial OCR keeps native text and unrecognized pages; separate lines retai
   pdf.addPage([300, 300]);
   const data = ocr("첫째 line");
   data.lines.push({text: "둘째 line", x: 0.1, y: 0.5, w: 0.7, h: 0.1});
-  await addOcrTextLayer(pdf, new Map([[0, data]]), () => font(pdf));
+  await addOcrTextLayer(pdf, new Map([[0, data]]), undefined);
   const result = await reader(await pdf.save());
   try {
     const content = await (await result.doc.getPage(1)).getTextContent();
@@ -82,16 +76,30 @@ test("partial OCR keeps native text and unrecognized pages; separate lines retai
 
 test("empty OCR and zero-area lines do not embed a font", async () => {
   const pdf = await PDFDocument.create(); pdf.addPage();
-  const noFont = async () => { throw new Error("unnecessary font"); };
-  await addOcrTextLayer(pdf, new Map(), noFont);
-  await addOcrTextLayer(pdf, new Map([[0, {text:"",lines:[{text:"",x:0,y:0,w:1,h:1},{text:"zero",x:0,y:0,w:0,h:0.1}]}]]), noFont);
+  const before = pdf.context.enumerateIndirectObjects().length;
+  await addOcrTextLayer(pdf, new Map());
+  await addOcrTextLayer(pdf, new Map([[0, {text:"",lines:[{text:"",x:0,y:0,w:1,h:1},{text:"zero",x:0,y:0,w:0,h:0.1}]}]]));
+  assert.equal(pdf.context.enumerateIndirectObjects().length, before);
 });
 
 test("invalid OCR geometry and page indices are rejected", async () => {
   for (const line of [{...ocr().lines[0],x:NaN},{...ocr().lines[0],w:-1},{...ocr().lines[0],x:0.8,w:0.5}]) {
     const pdf = await PDFDocument.create(); pdf.addPage();
-    await assert.rejects(addOcrTextLayer(pdf, new Map([[0,{text:line.text,lines:[line]}]]), () => font(pdf)), /geometry/i);
+    await assert.rejects(addOcrTextLayer(pdf, new Map([[0,{text:line.text,lines:[line]}]]), undefined), /geometry/i);
   }
   const pdf = await PDFDocument.create(); pdf.addPage();
-  await assert.rejects(addOcrTextLayer(pdf,new Map([[1,ocr()]]),()=>font(pdf)),/page/i);
+  await assert.rejects(addOcrTextLayer(pdf,new Map([[1,ocr()]]),undefined),/page/i);
+});
+
+test("OCR text is wrapped in a /RustyOCR marked-content section and the font is subset", async () => {
+  const pdf = await PDFDocument.create(); pdf.addPage([300, 300]);
+  await addOcrTextLayer(pdf, new Map([[0, ocr()]]));
+  const bytes = await pdf.save();
+  assert.ok(bytes.length < 400_000, `size ${bytes.length}`);
+  const reloaded = await PDFDocument.load(bytes);
+  const contents = reloaded.getPage(0).node.Contents() as any;
+  const streams = contents.asArray ? contents.asArray().map((r: any) => reloaded.context.lookup(r)) : [contents];
+  const { decodePDFRawStream } = await import("pdf-lib");
+  const text = streams.map((s: any) => Buffer.from(decodePDFRawStream(s).decode()).toString("latin1")).join("\n");
+  assert.match(text, /\/RustyOCR BMC[\s\S]*EMC/);
 });

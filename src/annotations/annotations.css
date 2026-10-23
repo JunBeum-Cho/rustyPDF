@@ -1,7 +1,7 @@
 .annotation-layer {
   position: absolute;
   inset: 0;
-  z-index: 2;
+  z-index: 3;
   touch-action: none;
 }
 
@@ -386,4 +386,10 @@
 .text-format-group button:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* Read-only documents (and history restores in flight): fully pass-through. */
+.annotation-layer.read-only,
+.annotation-layer.read-only * {
+  pointer-events: none !important;
 }

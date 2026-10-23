@@ -1,4 +1,4 @@
-import { createEffect, createRoot, on } from "solid-js";
+import { createEffect, createRoot, createSignal, on } from "solid-js";
 import { createStore } from "solid-js/store";
 import { invoke } from "../platform/desktop";
 import { documentStore, fileNameFromPath } from "../state/document";
@@ -42,21 +42,37 @@ const [recentFiles, setRecentFiles] = createStore<RecentsState>(loadInitial());
 
 export { recentFiles };
 
+const [missingRecents, setMissingRecents] = createSignal<ReadonlySet<string>>(new Set());
+export { missingRecents };
+
+/** Ask the main process which recent paths no longer exist. */
+export async function checkRecentPaths(): Promise<ReadonlySet<string>> {
+  const paths = recentFiles.entries.map((e) => e.path);
+  if (paths.length === 0) {
+    setMissingRecents(() => new Set<string>());
+    return missingRecents();
+  }
+  try {
+    const result = await invoke<boolean[]>("paths_exist", { paths });
+    const missing = new Set<string>();
+    if (Array.isArray(result)) {
+      paths.forEach((p, i) => {
+        if (result[i] === false) missing.add(p);
+      });
+    }
+    setMissingRecents(() => missing);
+  } catch {
+    /* keep previous state */
+  }
+  return missingRecents();
+}
+
 const persist = () => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(recentFiles));
   } catch {
     /* ignore quota issues */
   }
-};
-
-const syncDockMenu = () => {
-  const entries = recentFiles.entries.slice(0, 10);
-  const paths = entries.map((e) => e.path);
-  const names = entries.map((e) => e.name);
-  void invoke("set_dock_recents", { paths, names }).catch(() => {
-    /* ignore — non-critical (no-op on non-mac platforms) */
-  });
 };
 
 export const recordRecentFile = (path: string) => {
@@ -72,21 +88,16 @@ export const recordRecentFile = (path: string) => {
   void invoke("note_recent_document", { path }).catch(() => {
     /* ignore */
   });
-  // Rebuild the dock-tile recents submenu — we have to do this manually for
-  // non-document-based desktop apps.
-  syncDockMenu();
 };
 
 export const removeRecentFile = (path: string) => {
   setRecentFiles("entries", (prev) => prev.filter((e) => e.path !== path));
   persist();
-  syncDockMenu();
 };
 
 export const clearRecentFiles = () => {
   setRecentFiles("entries", []);
   persist();
-  syncDockMenu();
 };
 
 /**
@@ -109,8 +120,5 @@ export function installRecentFilesTracking() {
         },
       ),
     );
-    // Push the dock menu once at startup so the previously-saved recents
-    // are visible without requiring the user to open another file first.
-    queueMicrotask(syncDockMenu);
   });
 }

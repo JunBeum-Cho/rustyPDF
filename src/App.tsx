@@ -7,7 +7,12 @@ import { Welcome } from "./welcome/Welcome";
 import { ToastHost } from "./capture/Toast";
 import { activeTab, documentStore } from "./state/document";
 import { installKeyboardShortcuts } from "./keyboard";
-import { installAnnotationAutosave } from "./annotations/persistence";
+import { installDraftAutosave } from "./annotations/persistence";
+import { installDocumentEventHandlers } from "./ipc/pdf";
+import { pdfEngine } from "./platform/pdf-engine";
+import { TextMarkupToolbar } from "./annotations/TextMarkupToolbar";
+import { ShortcutHelp } from "./help/ShortcutHelp";
+import { PasswordDialog, requestPassword } from "./help/PasswordDialog";
 import { installFileOpenHandlers, setImageDropHandler } from "./ipc/opening";
 import { installCloseGuard } from "./ipc/closeGuard";
 import { installPageClipboardShortcuts } from "./viewer/pageClipboard";
@@ -19,12 +24,14 @@ import { copyPageText } from "./ocr/copyText";
 
 export default function App() {
   installKeyboardShortcuts();
-  installAnnotationAutosave();
+  installDraftAutosave();
+  installDocumentEventHandlers();
   installFileOpenHandlers();
   installCloseGuard();
   installPageClipboardShortcuts();
   installRecentFilesTracking();
   onMount(() => {
+    pdfEngine().setPasswordProvider(requestPassword);
     document.addEventListener("copy", copyPageText);
     setImageDropHandler((paths, position) => {
       if (imageImportOpen()) addImagePaths(paths);
@@ -47,6 +54,9 @@ export default function App() {
       </main>
       <ToastHost />
       <ImageImportDialog />
+      <TextMarkupToolbar />
+      <ShortcutHelp />
+      <PasswordDialog />
     </div>
   );
 }

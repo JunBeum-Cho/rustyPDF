@@ -1,8 +1,15 @@
-import { For, Show } from "solid-js";
-import { FolderOpen, Images, X } from "lucide-solid";
+import { For, Show, onMount } from "solid-js";
+import { FolderOpen, Images, Combine, X } from "lucide-solid";
 import { openImageImport } from "../images/importState";
-import { requestOpenPdfDialog, openPdf } from "../ipc/pdf";
-import { recentFiles, removeRecentFile } from "./recentFiles";
+import { addDocumentTab, openPdf, openPdfDialog } from "../ipc/pdf";
+import { invoke, open } from "../platform/desktop";
+import { emitToast } from "../capture/capture";
+import {
+  checkRecentPaths,
+  missingRecents,
+  recentFiles,
+  removeRecentFile,
+} from "./recentFiles";
 // The welcome logo points at the same PNG that `npm run icon` regenerates
 // for the OS-level app icon, so the in-app branding stays in sync with
 // the taskbar / Dock icon without needing a separate asset.
@@ -32,7 +39,51 @@ const dirOf = (path: string): string => {
   return parts.join("/") || "/";
 };
 
+const offerRemoval = (path: string, message: string) =>
+  emitToast(message, "error", {
+    actions: [{ label: "목록에서 제거", run: () => removeRecentFile(path) }],
+  });
+
+const openRecent = async (path: string) => {
+  if (missingRecents().has(path)) {
+    offerRemoval(path, "파일을 찾을 수 없습니다.");
+    return;
+  }
+  // openPdf already toasts the failure; only add the removal action quietly.
+  if (!(await openPdf(path))) {
+    emitToast("목록에서 제거할 수 있습니다.", "info", {
+      actions: [{ label: "목록에서 제거", run: () => removeRecentFile(path) }],
+    });
+  }
+};
+
+const mergePdfs = async () => {
+  let selected: string | string[] | null;
+  try {
+    selected = await open({
+      multiple: true,
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+  } catch (error) {
+    emitToast(`파일 선택 창을 열 수 없습니다: ${String(error)}`, "error");
+    return;
+  }
+  if (selected === null) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  if (paths.length < 2) {
+    emitToast("두 개 이상 선택해 주세요");
+    return;
+  }
+  try {
+    const payload = await invoke("pdf_merge_files", { paths, name: "합친 문서" });
+    await addDocumentTab(payload as never, { unsaved: true });
+  } catch (error) {
+    emitToast(`PDF를 합칠 수 없습니다: ${String(error)}`, "error");
+  }
+};
+
 export function Welcome() {
+  onMount(() => void checkRecentPaths());
   return (
     <div class="welcome">
       <div class="welcome-inner">
@@ -41,14 +92,14 @@ export function Welcome() {
             <img src={logoUrl} alt="RustyPDF" />
           </div>
           <h1>RustyPDF</h1>
-          <p class="welcome-tagline">가벼운 PDF 뷰어</p>
+          <p class="welcome-tagline">PDF 보기 · 주석 · 편집</p>
         </div>
 
         <div class="welcome-actions">
           <button
             type="button"
             class="welcome-primary"
-            onClick={requestOpenPdfDialog}
+            onClick={() => void openPdfDialog()}
           >
             <FolderOpen size={18} />
             <span>PDF 열기</span>
@@ -56,6 +107,10 @@ export function Welcome() {
           <button type="button" class="welcome-secondary" onClick={() => openImageImport()}>
             <Images size={18} />
             <span>이미지 → PDF 변환</span>
+          </button>
+          <button type="button" class="welcome-secondary" onClick={() => void mergePdfs()}>
+            <Combine size={18} />
+            <span>PDF 합치기</span>
           </button>
         </div>
 
@@ -78,16 +133,24 @@ export function Welcome() {
                     <button
                       type="button"
                       class="welcome-recents-item"
+                      classList={{ missing: missingRecents().has(entry.path) }}
                       title={entry.path}
-                      onClick={() => void openPdf(entry.path)}
+                      onClick={() => void openRecent(entry.path)}
                     >
                       <div class="welcome-recents-item-main">
                         <span class="welcome-recents-name">{entry.name}</span>
                         <span class="welcome-recents-path">{dirOf(entry.path)}</span>
                       </div>
-                      <span class="welcome-recents-time">
-                        {formatRelative(entry.openedAt)}
-                      </span>
+                      <Show
+                        when={missingRecents().has(entry.path)}
+                        fallback={
+                          <span class="welcome-recents-time">
+                            {formatRelative(entry.openedAt)}
+                          </span>
+                        }
+                      >
+                        <span class="welcome-recents-tag">파일 없음</span>
+                      </Show>
                     </button>
                     <button
                       type="button"

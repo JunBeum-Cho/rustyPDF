@@ -1,5 +1,4 @@
-import { clearDocumentHistoryRecovery } from "../viewer/documentHistoryRecovery";
-import { PdfEngine } from "./pdf-engine";
+import { pdfEngine, resetPdfEngine } from "./pdf-engine";
 export type DialogOptions = {
   multiple?: boolean;
   directory?: boolean;
@@ -25,48 +24,33 @@ export interface DesktopBridge {
   filePath(file: File): string;
 }
 let testing: DesktopBridge | null = null;
-let engine: PdfEngine | undefined;
 export function setDesktopForTests(bridge: DesktopBridge | null) {
   testing = bridge;
-  engine?.dispose();
-  engine = undefined;
+  resetPdfEngine(bridge ? (cmd, a) => bridge.invoke(cmd, a) : undefined);
 }
 function bridge() {
   const value = testing ?? globalThis.window?.desktop;
   if (!value) throw new Error("Electron desktop bridge unavailable");
   return value;
 }
+const INVALIDATING = new Set([
+  "pdf_delete_pages",
+  "pdf_duplicate_pages",
+  "pdf_rotate_pages",
+  "pdf_move_pages",
+  "pdf_paste_pages",
+  "pdf_insert_file",
+  "pdf_restore_snapshot",
+  "pdf_apply_form_bytes",
+  "pdf_save_document",
+]);
 export async function invoke<T>(
   command: string,
   args: Record<string, unknown> = {},
 ): Promise<T> {
-  const host = bridge();
-  if (!engine) engine = new PdfEngine((cmd, a) => host.invoke(cmd, a));
-  if (
-    [
-      "pdf_render_page",
-      "pdf_capture_region",
-      "pdf_text_lines",
-      "pdf_search",
-      "pdf_ocr_page",
-    ].includes(command)
-  )
-    return (await engine.invoke(command, args)) as T;
-  if (command === "pdf_close") engine.close(String(args.docId));
-  const result = await host.invoke(command, args);
-  if (command === "pdf_close") clearDocumentHistoryRecovery(String(args.docId));
-  if (
-    [
-      "pdf_delete_pages",
-      "pdf_paste_pages",
-      "pdf_duplicate_pages",
-      "pdf_rotate_pages",
-      "pdf_restore_snapshot",
-      "pdf_rollback_restore",
-      "pdf_save_document",
-    ].includes(command)
-  )
-    engine.close(String(args.docId));
+  const result = await bridge().invoke(command, args);
+  if (command === "pdf_close" || INVALIDATING.has(command))
+    pdfEngine().close(String(args.docId));
   return result as T;
 }
 export const open = (options: DialogOptions = {}) => bridge().open(options);

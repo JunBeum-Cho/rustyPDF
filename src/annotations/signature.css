@@ -1,0 +1,14 @@
+.signature-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.signature-dialog { background: var(--bg, #fff); color: var(--text, #111); border-radius: 8px; padding: 16px; width: 648px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,.3); display: flex; flex-direction: column; gap: 10px; }
+.signature-dialog h2 { margin: 0; font-size: 15px; }
+.signature-pad { width: 600px; height: 200px; max-width: 100%; background: #fff; border: 1px solid var(--border, #bbb); border-radius: 4px; touch-action: none; cursor: crosshair; }
+.signature-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.signature-actions .spacer { flex: 1; }
+.signature-color { width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; padding: 0; cursor: pointer; }
+.signature-color.active { border-color: var(--accent, #3b82f6); }
+.signature-saved { display: flex; gap: 8px; flex-wrap: wrap; }
+.signature-saved-item { position: relative; border: 1px solid var(--border, #bbb); border-radius: 4px; background: #fff; padding: 2px; }
+.signature-saved-item > button.pick { border: 0; background: transparent; cursor: pointer; padding: 0; }
+.signature-saved-item img { display: block; width: 100px; height: 40px; object-fit: contain; }
+.signature-saved-item .remove { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border, #bbb); background: var(--bg, #fff); font-size: 11px; line-height: 1; cursor: pointer; padding: 0; }
+.signature-error { color: #c0392b; font-size: 12px; }

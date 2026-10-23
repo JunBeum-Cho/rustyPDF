@@ -1,9 +1,80 @@
 /*
- * Invisible text layer for OCR-derived selection. Sits between the page
- * bitmap (z-index 1) and the annotation layer (z-index 2). Pointer events
- * pass through to the layer for click-to-select, but annotation interaction
- * still wins because the annotation SVG is on top.
+ * Selectable text over the page bitmap, between the canvas (z-index 1) and
+ * the annotation layer (z-index 2). Rules for .textLayer are the subset of
+ * pdf_viewer.css that the PDF.js TextLayer needs. Sizes come from the
+ * --total-scale-factor variable (CSS px per PDF point).
  */
+.textLayer {
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: clip;
+  text-align: initial;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-size-adjust: none;
+  -webkit-text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  color-scheme: only light;
+  pointer-events: none;
+}
+
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+  -webkit-user-select: text;
+  pointer-events: auto;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  --font-height: 0;
+  --scale-x: 1;
+  --rotate: 0deg;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+  display: contents;
+}
+
+.textLayer ::selection {
+  background: rgba(56, 132, 255, 0.32);
+  color: transparent;
+}
+
+.textLayer br::selection {
+  background: transparent;
+}
+
+/* Sentinel that keeps drag selections from jumping past the last line. */
+.textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: auto;
+}
+.textLayer.selecting .endOfContent {
+  top: 0;
+}
+
 .ocr-text-layer {
   position: absolute;
   top: 0;
@@ -13,40 +84,25 @@
   user-select: text;
   -webkit-user-select: text;
   overflow: hidden;
-  transform-origin: top left;
 }
 
 .ocr-text-line {
   position: absolute;
+  display: inline-block;
   white-space: pre;
-  /* The text itself is invisible but the selection highlight is real. */
   color: transparent;
   background: transparent;
-  /* Re-enable pointer events on each line so the user can click + drag to
-     highlight. The container above turns them off so areas without lines
-     don't eat clicks meant for the annotation/page. */
   pointer-events: auto;
   cursor: text;
   user-select: text;
   -webkit-user-select: text;
-  /* `top left` keeps `left`/`top` positions stable when we scaleX —
-     otherwise the box would visually shift as the scale ratio changes. */
   transform-origin: top left;
   font-family: -apple-system, system-ui, sans-serif;
   font-weight: 400;
   letter-spacing: 0;
-  /* Don't let the scaled glyph spill into adjacent lines — the bounding
-     rect we set per-span (height, font-size) is the authoritative box. */
-  display: inline-block;
-  overflow: hidden;
 }
 
 .ocr-text-line::selection {
-  background: rgba(56, 132, 255, 0.32);
-  color: transparent;
-}
-
-.ocr-text-line::-moz-selection {
   background: rgba(56, 132, 255, 0.32);
   color: transparent;
 }
@@ -58,7 +114,6 @@
   z-index: 1;
   pointer-events: none;
   user-select: none;
-  transform-origin: top left;
 }
 .search-location-mark {
   position: absolute;

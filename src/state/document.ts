@@ -21,8 +21,6 @@ export interface AnnotationTabState {
   saveStatus: SaveStatus;
   saveError: string | null;
   lastSavedAt: string | null;
-  history: Annotation[][];
-  future: Annotation[][];
 }
 
 export const emptyAnnotationTabState = (): AnnotationTabState => ({
@@ -34,17 +32,26 @@ export const emptyAnnotationTabState = (): AnnotationTabState => ({
   saveStatus: "idle",
   saveError: null,
   lastSavedAt: null,
-  history: [],
-  future: [],
 });
 
+export interface PageEditSnapshot {
+  items: Annotation[];
+  selectedPageIndices: number[];
+  pageAnchor: number | null;
+  currentPage: number;
+}
+
+/** `items` is the annotation list before the edit. At most 80 entries per stack. */
+export type DocumentHistoryEntry =
+  | { kind: "annotation"; items: Annotation[] }
+  | { kind: "page"; token: string; snapshot: PageEditSnapshot };
+
 export interface Tab {
-  editHistory?: import("../viewer/documentHistoryState").DocumentHistoryEntry[];
-  editFuture?: import("../viewer/documentHistoryState").DocumentHistoryEntry[];
+  editHistory?: DocumentHistoryEntry[];
+  editFuture?: DocumentHistoryEntry[];
   tabId: string; // stable local id used for tab identity
   docId: string; // stable backend document handle
   revision: number; // backend generation; incremented by mutations/saves
-  annotationDocumentKey: string; // distinguishes identical PDF copies
   path: string;
   isUnsaved?: boolean; // generated in memory; first save asks for a path
   pageCount: number;
@@ -52,14 +59,16 @@ export interface Tab {
   fileSize: number;
   contentVersion: number; // bumps when saved bytes change without a new docId
   zoom: number;
-  /** Additional transient viewer rotation. Persistent editor rotation keeps this at zero. */
-  rotation: 0 | 90 | 180 | 270;
   currentPage: number;
   navigationVersion: number;
   selectedPageIndices: number[]; // for thumbnail multi-select
   pageAnchor: number | null; // shift-click anchor
   pageDirty: boolean; // page-level edits not yet saved to disk
   annotations: AnnotationTabState;
+  readOnly: boolean;
+  readOnlyReason: "encrypted" | null;
+  signed: boolean;
+  formDirty: boolean;
 }
 
 export interface AnnotationUiState {

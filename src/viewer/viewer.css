@@ -80,7 +80,7 @@
   border-radius: 10px;
   font-variant-numeric: tabular-nums;
   pointer-events: none;
-  z-index: 3;
+  z-index: 4;
 }
 
 .thumbnail-sidebar {
@@ -251,7 +251,46 @@ body.resizing-sidebar * {
   letter-spacing: 0.02em;
 }
 
-.render-error { position: absolute; z-index: 4; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: var(--surface); color: var(--text); }
+.render-error { position: absolute; z-index: 5; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: var(--surface); color: var(--text); }
 .render-error button { padding: 8px 16px; }
 .thumbnail-preview { position: relative; }
 .thumbnail-error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 6px; background: var(--surface); color: var(--text); font-size: 12px; }
+
+.sidebar-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-height: 0;
+  position: relative;
+}
+.sidebar-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  flex: 0 0 auto;
+}
+.sidebar-tabs button {
+  flex: 1;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.sidebar-tabs button.active {
+  background: rgba(127, 127, 127, 0.25);
+}
+.viewer-scroll.invert-pages .page-canvas {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+.thumbnail-sidebar { width: 100%; flex: 1 1 auto; min-height: 0; }
+.outline-panel { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 4px 6px 16px; font-size: 12px; }
+.outline-row { display: flex; align-items: flex-start; gap: 2px; }
+.outline-toggle { flex: 0 0 18px; width: 18px; padding: 2px 0; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; }
+.outline-title { flex: 1; min-width: 0; padding: 3px 4px; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font: inherit; text-align: left; overflow-wrap: anywhere; }
+.outline-title:hover, .outline-toggle:hover { background: rgba(127, 127, 127, 0.2); }
+.outline-empty { margin: 12px 8px; opacity: 0.7; font-size: 12px; }

@@ -6,6 +6,8 @@ export type AnnotationKind =
   | "arrow"
   | "pen"
   | "highlight"
+  | "underline"
+  | "strikeout"
   | "image";
 
 export type AnnotationTool = "select" | AnnotationKind | "capture";
@@ -68,6 +70,8 @@ export interface Annotation {
   type: AnnotationKind;
   rect?: Rect;
   points?: Point[];
+  /** Text-selection markup quads (page points, top-left origin, same space as `rect`). */
+  quads?: Rect[];
   /**
    * Quarter-turn (clockwise, degrees) applied to this annotation's own
    * content inside `rect`. Page rotation accumulates here for the kinds that

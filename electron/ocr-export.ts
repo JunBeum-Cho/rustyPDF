@@ -1,17 +1,27 @@
 import {
-  PDFDocument, PDFFont, pushGraphicsState, popGraphicsState,
+  PDFDocument, type PDFFont, PDFName, PDFOperator, pushGraphicsState, popGraphicsState,
   concatTransformationMatrix, beginText, endText, setFontAndSize,
   setTextRenderingMode, TextRenderingMode, setTextMatrix, showText,
 } from "pdf-lib";
 import type { OcrPage } from "./pdf-types.js";
+import { createFontProvider, type FontProvider } from "./pdf-annotations.js";
+
+/** All text the OCR layer may draw (for font subsetting). */
+export function ocrText(pages: ReadonlyMap<number, OcrPage>): string {
+  let out = "";
+  for (const page of pages.values()) for (const line of page.lines) out += line.text;
+  return out;
+}
 
 /** Add completed OCR in intrinsic-rotation display coordinates, without ink. */
 export async function addOcrTextLayer(
   pdf: PDFDocument,
   pages: ReadonlyMap<number, OcrPage>,
-  getFont: () => Promise<PDFFont>,
+  fontsDir?: string,
+  provider?: FontProvider,
 ): Promise<void> {
   let font: PDFFont | undefined;
+  const fonts = provider ?? createFontProvider(pdf, ocrText(pages), fontsDir);
   for (const [index, result] of pages) {
     if (!Number.isInteger(index) || index < 0 || index >= pdf.getPageCount())
       throw new Error("Invalid OCR page");
@@ -33,7 +43,7 @@ export async function addOcrTextLayer(
         throw new Error("Invalid OCR geometry");
       // Recognition can yield blank/degenerate boxes. Never ask for a font for them.
       if (!line.text.trim() || !line.w || !line.h) continue;
-      font ??= await getFont();
+      font ??= await fonts.get("Noto Sans KR", false);
       // A line is one OCR bounding box. Normalize internal whitespace, then let
       // PDF.js infer spaces from positioned runs, avoiding CJK blank glyph aliases.
       const text = line.text.trim().replace(/\s+/gu, " ");
@@ -44,7 +54,7 @@ export async function addOcrTextLayer(
       const scale = line.w * width / naturalWidth;
       const baseline = line.y * height + font.heightAtSize(size, { descender: false });
       const key = page.node.newFontDictionary(font.name, font.ref);
-      page.pushOperators(pushGraphicsState(), concatTransformationMatrix(...matrices[rotation]),
+      page.pushOperators(PDFOperator.of("BMC" as any, [PDFName.of("RustyOCR")]), pushGraphicsState(), concatTransformationMatrix(...matrices[rotation]),
         beginText(), setFontAndSize(key, size), setTextRenderingMode(TextRenderingMode.Invisible));
       let x = line.x * width;
       for (const run of text.split(/( +)/u)) {
@@ -52,7 +62,7 @@ export async function addOcrTextLayer(
           page.pushOperators(setTextMatrix(scale, 0, 0, -1, x, baseline), showText(font.encodeText(run)));
         x += font.widthOfTextAtSize(run, size) * scale;
       }
-      page.pushOperators(endText(), popGraphicsState());
+      page.pushOperators(endText(), popGraphicsState(), PDFOperator.of("EMC" as any));
     }
   }
 }

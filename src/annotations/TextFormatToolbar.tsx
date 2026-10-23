@@ -37,6 +37,7 @@ import {
   alignRight,
   getActiveEditor,
   queryTextFormatState,
+  sameValueOrNull,
   setFontFamily,
   setFontSizePx,
   setFontColor,
@@ -47,12 +48,6 @@ import {
 } from "./textFormat";
 
 const ICON = 14;
-
-const sameValueOrNull = <T,>(values: T[]): T | null => {
-  if (values.length === 0) return null;
-  const first = values[0];
-  return values.every((value) => value === first) ? first : null;
-};
 
 /** Text controls inside the floating annotation menu. */
 export function TextFormatToolbar() {

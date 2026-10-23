@@ -3,15 +3,19 @@ export { COMMON_FONTS } from "./fonts";
 /**
  * Rich-text formatting helpers for the contenteditable text annotation editor.
  *
- * We rely on `document.execCommand` for the bulk of the work — it's
- * formally deprecated but every Chromium/WebKit engine still implements it,
- * and writing an equivalent Range/Selection-based engine is a project of its
- * own. The user's request was per-selection styling (not whole-block), which
- * execCommand handles natively.
+ * The work is split in two:
+ *  - Colour, font size and font family go through `applyInlineStyle`, a small
+ *    Range-based engine that splits the boundary text nodes and wraps only
+ *    the selected text in `<span style>`. execCommand's foreColor / fontSize /
+ *    fontName rewrite surrounding markup unpredictably (legacy <font> tags,
+ *    size 1-7, whole-block restyles), which made the saved HTML untidy.
+ *  - Bold / italic / underline / alignment still use `document.execCommand`
+ *    through the single `runFormatCommand` helper: it is deprecated but every
+ *    engine implements it, and it keeps the native undo stack for toggles.
  *
  * Buttons that drive these helpers MUST call `event.preventDefault()` on
  * mousedown — otherwise the browser moves focus to the button and the
- * editor's selection collapses, leaving execCommand with nothing to act on.
+ * editor's selection collapses, leaving the helpers with nothing to act on.
  */
 
 import { activeTab } from "../state/document";
@@ -181,28 +185,106 @@ const restoreSelectionInto = (editor: HTMLElement) => {
   sel.addRange(savedRange);
 };
 
-const runCommandOnEditor = (
-  editor: HTMLElement,
-  command: string,
-  value?: string,
-) => {
-  restoreSelectionInto(editor);
-  const range = currentRangeInEditor(editor);
-  if (!range || range.collapsed) {
-    if (command === "foreColor" && value) {
-      applyEditorDefaultStyle(editor, { color: value });
-      return;
-    }
-    if (command === "fontName" && value) {
-      applyEditorDefaultStyle(editor, { fontFamily: value });
-      return;
+/**
+ * Wrap only the selected text of `range` in `<span style>`. Boundary text
+ * nodes are split first; a span that already covers exactly the same text is
+ * reused, and the same property is removed from elements fully inside the
+ * range so nested spans never fight. A collapsed range is a no-op.
+ * Returns the range covering the styled text, or null when nothing changed.
+ */
+export function applyInlineStyle(range: Range, style: TextStylePatch): Range | null {
+  if (range.collapsed) return null;
+  const props: [string, string][] = [];
+  if (style.color !== undefined) props.push(["color", style.color]);
+  if (style.fontSize !== undefined) props.push(["font-size", `${style.fontSize}px`]);
+  if (style.fontFamily !== undefined) props.push(["font-family", normalizeFontFamily(style.fontFamily)]);
+  if (props.length === 0) return null;
+  const doc = range.commonAncestorContainer.ownerDocument ?? document;
+
+  // Split the end first so the start offset stays valid when both are in one node.
+  if (range.endContainer.nodeType === Node.TEXT_NODE) {
+    const t = range.endContainer as Text;
+    if (range.endOffset > 0 && range.endOffset < t.length) t.splitText(range.endOffset);
+  }
+  let startNode = range.startContainer;
+  if (startNode.nodeType === Node.TEXT_NODE) {
+    const t = startNode as Text;
+    if (range.startOffset >= t.length) {
+      // Nothing selected in this node; the walk below starts after it.
+    } else if (range.startOffset > 0) {
+      const tail = t.splitText(range.startOffset);
+      if (range.endContainer === t) range.setEnd(tail, range.endOffset - range.startOffset);
+      range.setStart(tail, 0);
+      startNode = tail;
     }
   }
+
+  const root = range.commonAncestorContainer;
+  const texts: Text[] = [];
+  const walker = doc.createTreeWalker(
+    root.nodeType === Node.TEXT_NODE ? (root.parentNode as Node) : root,
+    NodeFilter.SHOW_TEXT,
+  );
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const t = n as Text;
+    if (t.length === 0 || !range.intersectsNode(t)) continue;
+    const from = t === range.startContainer ? range.startOffset : 0;
+    const to = t === range.endContainer ? range.endOffset : t.length;
+    if (to > from) texts.push(t);
+  }
+  if (texts.length === 0) return null;
+
+  // Strip the property from elements wholly inside the selection.
+  const scope = (root.nodeType === Node.TEXT_NODE ? root.parentElement : root) as Element | null;
+  const inside = (el: Element) => {
+    const r = doc.createRange();
+    r.selectNode(el);
+    return range.compareBoundaryPoints(Range.START_TO_START, r) <= 0 &&
+      range.compareBoundaryPoints(Range.END_TO_END, r) >= 0;
+  };
+  if (scope) {
+    const els = [...scope.querySelectorAll<HTMLElement>("[style], font")];
+    for (const el of els) {
+      if (!inside(el)) continue;
+      for (const [prop] of props) el.style.removeProperty(prop);
+      if (el.tagName === "FONT") {
+        if (style.color !== undefined) el.removeAttribute("color");
+        if (style.fontFamily !== undefined) el.removeAttribute("face");
+        if (style.fontSize !== undefined) el.removeAttribute("size");
+      }
+      if (!el.getAttribute("style")?.trim()) el.removeAttribute("style");
+    }
+  }
+
+  const styled: Text[] = [];
+  for (const t of texts) {
+    let span: HTMLElement;
+    const parent = t.parentElement;
+    if (
+      parent && parent.tagName === "SPAN" && parent.childNodes.length === 1 &&
+      !parent.classList.contains("annotation-text-edit")
+    ) {
+      span = parent;
+    } else {
+      span = doc.createElement("span");
+      t.parentNode!.insertBefore(span, t);
+      span.appendChild(t);
+    }
+    for (const [prop, value] of props) span.style.setProperty(prop, value);
+    styled.push(t);
+  }
+  const out = doc.createRange();
+  out.setStart(styled[0], 0);
+  out.setEnd(styled[styled.length - 1], styled[styled.length - 1].length);
+  return out;
+}
+
+/** The one place execCommand is called (bold / italic / underline / align). */
+function runFormatCommand(editor: HTMLElement, command: string) {
   // styleWithCSS makes execCommand emit inline style attrs instead of legacy
-  // <font> tags — that gives us proper CSS we can serialize back into the
-  // sidecar without surprises.
+  // <font> tags — proper CSS we can serialize into the sidecar.
   document.execCommand("styleWithCSS", false, "true");
-  document.execCommand(command, false, value);
+  document.execCommand(command, false);
   if (command === "italic") {
     // Chromium emits inline `italic` with its default synthesis angle. Keep
     // the live selection/caret while matching the export's 12-degree shear.
@@ -210,22 +292,49 @@ const runCommandOnEditor = (
       if (element.style.fontStyle === "italic") element.style.fontStyle = "oblique 12deg";
     }
   }
-  // Update savedRange to the result so subsequent commands stack on the
-  // same selection instead of resetting back to the pre-command range.
+}
+
+const saveCurrentRange = () => {
+  // Update savedRange so subsequent commands stack on the same selection.
   const sel = window.getSelection();
-  if (sel && sel.rangeCount > 0) {
-    savedRange = sel.getRangeAt(0).cloneRange();
-  }
+  if (sel && sel.rangeCount > 0) savedRange = sel.getRangeAt(0).cloneRange();
 };
 
-const applyCommand = (command: string, value?: string) => {
+const runCommandOnEditor = (editor: HTMLElement, command: string) => {
+  restoreSelectionInto(editor);
+  runFormatCommand(editor, command);
+  saveCurrentRange();
+};
+
+/** Colour / size / font: styles the selection, or the editor default when collapsed. */
+const styleEditor = (editor: HTMLElement, patch: TextStylePatch) => {
+  restoreSelectionInto(editor);
+  const range = currentRangeInEditor(editor);
+  if (!range || range.collapsed) {
+    applyEditorDefaultStyle(editor, patch);
+    return;
+  }
+  const scaled = patch.fontSize === undefined
+    ? patch
+    : { ...patch, fontSize: patch.fontSize * editorZoom(editor) };
+  const out = applyInlineStyle(range, scaled);
+  if (!out) return;
+  const sel = window.getSelection();
+  if (sel) {
+    sel.removeAllRanges();
+    sel.addRange(out);
+  }
+  savedRange = out.cloneRange();
+};
+
+const applyEditorAction = (action: (editor: HTMLElement) => void) => {
   const editor = getActiveEditor();
   if (editor) {
-    runCommandOnEditor(editor, command, value);
+    action(editor);
     return;
   }
   // No active editor: try promoting the selected text annotation into edit
-  // mode, then defer the command until the new contenteditable is mounted
+  // mode, then defer the action until the new contenteditable is mounted
   // and focusable. rAF is enough — Solid commits the DOM change before the
   // next paint.
   if (!tryEnterEditMode()) return;
@@ -234,9 +343,12 @@ const applyCommand = (command: string, value?: string) => {
     if (!e) return;
     e.focus();
     selectAllInEditor(e);
-    runCommandOnEditor(e, command, value);
+    action(e);
   });
 };
+
+const applyCommand = (command: string) =>
+  applyEditorAction((editor) => runCommandOnEditor(editor, command));
 
 export const toggleBold = () => applyCommand("bold");
 export const toggleItalic = () => applyCommand("italic");
@@ -245,55 +357,42 @@ export const alignLeft = () => applyCommand("justifyLeft");
 export const alignCenter = () => applyCommand("justifyCenter");
 export const alignRight = () => applyCommand("justifyRight");
 
-export const setFontFamily = (font: string) => applyCommand("fontName", normalizeFontFamily(font));
-
-const wrapSelectionWithFontSize = (editor: HTMLElement, px: number) => {
-  restoreSelectionInto(editor);
-  const range = currentRangeInEditor(editor);
-  if (!range || range.collapsed) {
-    applyEditorDefaultStyle(editor, { fontSize: px });
-    return;
-  }
-  const sel = window.getSelection();
-  if (!sel) return;
-  const span = document.createElement("span");
-  span.style.fontSize = `${px * editorZoom(editor)}px`;
-  try {
-    range.surroundContents(span);
-  } catch {
-    const contents = range.extractContents();
-    span.appendChild(contents);
-    range.insertNode(span);
-  }
-  const newRange = document.createRange();
-  newRange.selectNodeContents(span);
-  sel.removeAllRanges();
-  sel.addRange(newRange);
-  savedRange = newRange.cloneRange();
-};
+export const setFontFamily = (font: string) =>
+  applyEditorAction((editor) => styleEditor(editor, { fontFamily: normalizeFontFamily(font) }));
 
 /**
  * Apply an arbitrary pixel font-size. Prefers the active selection; if no
  * editor is focused, promotes the selected text annotation into edit mode,
  * then applies the new size to its full contents.
  */
-export const setFontSizePx = (px: number) => {
-  const editor = getActiveEditor();
-  if (editor) {
-    wrapSelectionWithFontSize(editor, px);
-    return;
-  }
-  if (!tryEnterEditMode()) return;
-  requestAnimationFrame(() => {
-    const e = getActiveEditor();
-    if (!e) return;
-    e.focus();
-    selectAllInEditor(e);
-    wrapSelectionWithFontSize(e, px);
-  });
+export const setFontSizePx = (px: number) =>
+  applyEditorAction((editor) => styleEditor(editor, { fontSize: px }));
+
+export const setFontColor = (color: string) =>
+  applyEditorAction((editor) => styleEditor(editor, { color }));
+
+/** `rgb(r, g, b)` / `rgba(...)` computed colour to `#rrggbb`; black if unparsable. */
+export const cssColorToHex = (value: string): string => {
+  const match = value.match(/-?\d+(\.\d+)?/g);
+  if (!match || match.length < 3) return "#000000";
+  const channel = (raw: string) => {
+    const n = Math.round(Number(raw));
+    const clamped = Math.min(255, Math.max(0, Number.isFinite(n) ? n : 0));
+    return clamped.toString(16).padStart(2, "0");
+  };
+  return `#${channel(match[0])}${channel(match[1])}${channel(match[2])}`;
 };
 
-export const setFontColor = (color: string) => applyCommand("foreColor", color);
+/** Computed font-style that counts as italic (we render italic as oblique 12deg). */
+export const isItalicStyle = (fontStyle: string): boolean =>
+  fontStyle === "italic" || fontStyle.startsWith("oblique");
+
+/** The shared value when every entry agrees, otherwise null. */
+export const sameValueOrNull = <T,>(values: T[]): T | null => {
+  if (values.length === 0) return null;
+  const first = values[0];
+  return values.every((value) => value === first) ? first : null;
+};
 
 export interface TextFormatState {
   bold: boolean;
@@ -332,12 +431,11 @@ export const queryTextFormatState = (): TextFormatState | null => {
         : sel?.focusNode?.parentElement ?? null;
     if (node && editor.contains(node)) {
       const computed = window.getComputedStyle(node);
-      italic = computed.fontStyle === "italic" || computed.fontStyle.startsWith("oblique");
+      italic = isItalicStyle(computed.fontStyle);
       const sz = computed.fontSize;
       const m = /^(\d+(?:\.\d+)?)px$/.exec(sz);
       if (m) fontSizePx = Math.round(parseFloat(m[1]) / editorZoom(editor));
-      const rgb = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/.exec(computed.color);
-      if (rgb) color = "#" + rgb.slice(1).map((value) => Number(value).toString(16).padStart(2, "0")).join("");
+      if (/^rgba?\(/.test(computed.color)) color = cssColorToHex(computed.color);
     }
   } catch { /* ignore */ }
   return {

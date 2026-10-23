@@ -1,4 +1,12 @@
-import { recoverDocumentHistory } from "../viewer/documentHistoryRecovery";
+export type PreMutationHook = (tabId: string) => Promise<void>;
+const hooks = new Set<PreMutationHook>();
+
+/** Hooks run (in registration order) before every queued mutation task. */
+export function registerPreMutationHook(hook: PreMutationHook): () => void {
+  hooks.add(hook);
+  return () => { hooks.delete(hook); };
+}
+
 /**
  * One serialization lane per open tab. Every operation that reads and then
  * replaces PDF bytes (page edits, save, export, clipboard copy) goes through
@@ -12,7 +20,7 @@ export function enqueueDocumentMutation<T>(
 ): Promise<T> {
   const previous = mutationTails.get(tabId) ?? Promise.resolve();
   const operation = previous.then(async () => {
-    await recoverDocumentHistory(tabId);
+    for (const hook of [...hooks]) await hook(tabId);
     return task();
   });
   const tail = operation.then(

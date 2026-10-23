@@ -16,7 +16,12 @@ asarUnpack:
 mac:
   icon: resources/icons/icon.icns
   category: public.app-category.productivity
-  identity: null
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  # Signing uses CSC_LINK/CSC_KEY_PASSWORD when present; set CSC_IDENTITY_AUTO_DISCOVERY=false to skip.
+  # Notarization is enabled only by env (APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID, or APPLE_API_KEY*).
   target:
     - target: dmg
       arch: [arm64, x64]
@@ -31,3 +36,8 @@ fileAssociations:
     role: Viewer
 directories:
   output: release
+# Auto update feed is off by default. Example generic provider:
+# publish:
+#   provider: generic
+#   url: https://updates.example.com/rustypdf
+publish: null

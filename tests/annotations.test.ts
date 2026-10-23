@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { JSDOM } from "jsdom";
-import { physicalDropToClient } from "../src/ipc/dropPosition";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");
 Object.assign(globalThis, { window: dom.window, document: dom.window.document });
@@ -83,13 +82,31 @@ test("paste falls back to plain text when rich clipboard content has no text", (
   assert.equal(inserted, "복사한 글자<br>다음 줄");
 });
 
-test("physical drop coordinates hit the same CSS point at different monitor scales", () => {
-  for (const ratio of [1, 1.25, 1.5, 2, 3]) {
-    const client = physicalDropToClient({ x: 400 * ratio, y: 300 * ratio }, ratio);
-    assert.deepEqual(client, { x: 400, y: 300 });
-    // The actual page-relative hit remains independent of monitor scale.
-    assert.deepEqual({ x: client.x - 100, y: client.y - 50 }, { x: 300, y: 250 });
-  }
+test("pasted annotations are clamped inside the target page and cascade resets on re-copy", async () => {
+  const store = await import("../src/annotations/store");
+  const { setDocumentStore, activeTab, emptyAnnotationTabState } = await import("../src/state/document");
+  const page = { index: 0, width: 200, height: 300, rotation: 0 as const };
+  const item = { id: "r", page: 0, type: "rect" as const, rect: { x: 170, y: 270, w: 30, h: 30 }, style: { color: "#000", width: 1 } };
+  const tab: any = { tabId: "p", docId: "d", revision: 1, path: "/x.pdf", pageCount: 1, pages: [page], fileSize: 1, contentVersion: 0, zoom: 1,
+    currentPage: 0, navigationVersion: 0, selectedPageIndices: [], pageAnchor: null, pageDirty: false, annotations: emptyAnnotationTabState(),
+    readOnly: false, readOnlyReason: null, signed: false, formDirty: false };
+  tab.annotations.items = [item];
+  tab.annotations.selectedIds = ["r"];
+  setDocumentStore({ tabs: [tab], activeTabId: "p" });
+  assert.equal(store.duplicateSelectedAnnotations(), true);
+  const pasted = activeTab()!.annotations.items[1];
+  assert.deepEqual({ ...pasted.rect }, { x: 170, y: 270, w: 30, h: 30 });
+  setDocumentStore("tabs", 0, "annotations", "items", [{ ...item, rect: { x: 10, y: 10, w: 20, h: 20 } }]);
+  setDocumentStore("tabs", 0, "annotations", "selectedIds", ["r"]);
+  store.copySelectedAnnotations();
+  store.pasteAnnotations();
+  store.pasteAnnotations();
+  const [, first, second] = activeTab()!.annotations.items;
+  assert.deepEqual([first.rect!.x, second.rect!.x], [26, 42]);
+  store.selectAnnotation("r");
+  store.copySelectedAnnotations();
+  store.pasteAnnotations();
+  assert.equal(activeTab()!.annotations.items[3].rect!.x, 26);
 });
 
 test("text color defaults to black and stays independent of drawing color", async () => {

@@ -5,7 +5,7 @@ import {
   pagePointToDisplay,
   rectToDisplayBox,
 } from "../annotations/coords";
-import { rotatePdfPages } from "../ipc/pdf";
+import { invoke } from "../platform/desktop";
 import { enqueueDocumentMutation } from "../ipc/documentMutations";
 import { invalidateOcrForDocument } from "../ocr/ocr";
 import {
@@ -13,7 +13,25 @@ import {
   documentStore,
   updateTabById,
   type PageMeta,
+  type Tab,
 } from "../state/document";
+
+interface RotateResult {
+  id: string;
+  revision: number;
+  path: string;
+  pageCount: number;
+  pages: PageMeta[];
+  fileSize: number;
+}
+
+/** Selected pages, else the current page. */
+const targetPages = (tab: Tab): number[] => {
+  const selected = [...new Set(tab.selectedPageIndices)]
+    .filter((i) => i >= 0 && i < tab.pageCount)
+    .sort((a, b) => a - b);
+  return selected.length > 0 ? selected : [tab.currentPage];
+};
 
 const clonePages = (pages: PageMeta[]): PageMeta[] =>
   pages.map((page) => ({ ...page }));
@@ -28,16 +46,21 @@ async function performRotation(
   // Read the latest state when this queued turn starts. Fast repeated clicks
   // therefore become 90° + 90° instead of racing two mutations against the
   // same old dimensions.
+  if (tab.readOnly) {
+    emitToast("읽기 전용 PDF입니다", "info");
+    return;
+  }
   const oldPages = clonePages(tab.pages);
-  const indices = oldPages.map((page) => page.index);
+  const indices = targetPages(tab);
+  const targetSet = new Set(indices);
   const expectedDocId = tab.docId;
   const expectedRevision = tab.revision;
-  const result = await rotatePdfPages(
-    expectedDocId,
+  const result = await invoke<RotateResult>("pdf_rotate_pages", {
+    docId: expectedDocId,
     expectedRevision,
     indices,
     direction,
-  );
+  });
   const live = documentStore.tabs.find(
     (candidate) => candidate.tabId === tabId,
   );
@@ -59,6 +82,7 @@ async function performRotation(
   updateTabById(tabId, (current) => {
     let transformedAnnotations = false;
     for (const annotation of current.annotations.items) {
+      if (!targetSet.has(annotation.page)) continue;
       const oldPage = oldPages[annotation.page];
       if (!oldPage) continue;
       transformedAnnotations = true;
@@ -68,6 +92,11 @@ async function performRotation(
           oldPage,
           1,
           geometryRotation,
+        );
+      }
+      if (annotation.quads) {
+        annotation.quads = annotation.quads.map((quad) =>
+          rectToDisplayBox(quad, oldPage, 1, geometryRotation),
         );
       }
       if (annotation.points) {
@@ -96,14 +125,8 @@ async function performRotation(
     current.fileSize = result.fileSize;
     current.contentVersion += 1;
     current.pageDirty = true;
-    // The toolbar now commits `/Rotate`; no additional renderer-only turn is
-    // allowed to remain or the bitmap and annotation coordinate systems would
-    // diverge again.
-    current.rotation = 0;
 
     if (transformedAnnotations) {
-      current.annotations.history = [];
-      current.annotations.future = [];
       current.annotations.editingId = null;
       current.annotations.editVersion += 1;
       current.annotations.dirty = true;
@@ -114,8 +137,8 @@ async function performRotation(
   commitPageEditHistory(tabId, before, result);
 }
 
-/** Persistently rotate every page in the active document one quarter-turn. */
-export function rotateDocument(direction: 1 | -1): Promise<void> {
+/** Persistently rotate the selected pages (else the current page) one quarter-turn. */
+export function rotateSelectedPages(direction: 1 | -1): Promise<void> {
   const tab = activeTab();
   if (!tab) return Promise.resolve();
 

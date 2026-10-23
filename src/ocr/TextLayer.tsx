@@ -1,82 +1,50 @@
 import {
   For,
+  Show,
   createEffect,
   createMemo,
   createSignal,
   on,
-  onMount,
+  onCleanup,
+  untrack,
 } from "solid-js";
-import { ocrPdfLines, pdfNativeTextLines, type OcrLine } from "../ipc/pdf";
+import { invoke } from "../platform/desktop";
+import { pdfEngine } from "../platform/pdf-engine";
+import type { OcrLine } from "../ipc/pdf";
 import { activeTab } from "../state/document";
 import type { PageMeta } from "../state/document";
-import type { Rotation } from "../annotations/coords";
 import { ocrState } from "./ocr";
 import "./textLayer.css";
 import { activeSearchMatch } from "../search/store";
-import { highlightGeometry } from "../search/model";
 
 interface Props {
   pageIndex: number;
   page: PageMeta;
   revision: number;
   contentVersion: number;
+  /** CSS px per PDF point (also the PDF.js viewport scale). */
   zoom: number;
-  rotation: Rotation;
+}
+
+const OCR_FONT = "-apple-system, system-ui, sans-serif";
+let measureCtx: CanvasRenderingContext2D | null | undefined;
+/** One shared canvas for every OCR line: no per-line layout reads. */
+function naturalWidth(text: string, fontPx: number): number {
+  if (measureCtx === undefined)
+    measureCtx = document.createElement("canvas").getContext("2d");
+  if (!measureCtx) return 0;
+  measureCtx.font = `400 100px ${OCR_FONT}`;
+  return (measureCtx.measureText(text).width * fontPx) / 100;
 }
 
 /**
- * Invisible-but-selectable text overlay aligned with the rendered page
- * bitmap. Each line is positioned in normalized 0–1 coords from the OCR /
- * PDF.js text extraction; we measure the rendered glyph width at the
- * current zoom and apply `transform: scaleX(...)` so the system font's
- * natural width is squashed/stretched to exactly fill the original PDF
- * font's bbox width. Without this fix-up the selection highlight drifts
- * progressively the further you zoom from 100%.
+ * Selectable text over the page bitmap. Native text uses the PDF.js
+ * TextLayer; pages without it use OCR lines. Everything is sized with the
+ * `--total-scale-factor` CSS variable, so zooming never re-renders.
  */
 export function TextLayer(props: Props) {
-  type LineSpace = "raw" | "display";
-  const [layerData, setLayerData] = createSignal<{
-    lines: OcrLine[];
-    space: LineSpace;
-  }>({ lines: [], space: "display" });
-
-  // Pdfium reports page width/height *after* the PDF's intrinsic `/Rotate`,
-  // but native text bounds live in the page's unrotated coordinate system.
-  // OCR bounds, on the other hand, already describe the rendered page. Keep
-  // track of which coordinate space we received so the selectable layer is
-  // transformed exactly once.
-  const rawPageWidth = () =>
-    props.page.rotation === 90 || props.page.rotation === 270
-      ? props.page.height
-      : props.page.width;
-  const rawPageHeight = () =>
-    props.page.rotation === 90 || props.page.rotation === 270
-      ? props.page.width
-      : props.page.height;
-  const basePageWidth = () =>
-    (layerData().space === "raw" ? rawPageWidth() : props.page.width) *
-    props.zoom;
-  const basePageHeight = () =>
-    (layerData().space === "raw" ? rawPageHeight() : props.page.height) *
-    props.zoom;
-
-  const layerRotation = (): Rotation => {
-    const intrinsic = layerData().space === "raw" ? props.page.rotation : 0;
-    return ((intrinsic + props.rotation) % 360) as Rotation;
-  };
-
-  const rotationTransform = () => {
-    switch (layerRotation()) {
-      case 90:
-        return `translateX(${basePageHeight()}px) rotate(90deg)`;
-      case 180:
-        return `translate(${basePageWidth()}px, ${basePageHeight()}px) rotate(180deg)`;
-      case 270:
-        return `translateY(${basePageWidth()}px) rotate(270deg)`;
-      default:
-        return "none";
-    }
-  };
+  let layer!: HTMLDivElement;
+  const [ocrLines, setOcrLines] = createSignal<OcrLine[]>([]);
 
   const pageOcrDone = createMemo(() => {
     const tab = activeTab();
@@ -84,42 +52,77 @@ export function TextLayer(props: Props) {
       ? (ocrState.byDoc[tab.docId]?.done.has(props.pageIndex) ?? false)
       : false;
   });
-  let fetchSequence = 0;
+
+  createEffect(() => {
+    const zoom = String(props.zoom);
+    layer.style.setProperty("--scale-factor", zoom);
+    layer.style.setProperty("--total-scale-factor", zoom);
+  });
+
+  let sequence = 0;
   createEffect(
     on(
       () => {
         const tab = activeTab();
-        if (!tab) return null;
-        return [
-          tab.docId,
-          props.revision,
-          props.pageIndex,
-          pageOcrDone(),
-          props.contentVersion,
-        ] as const;
+        return tab
+          ? ([
+              tab.docId,
+              props.revision,
+              props.pageIndex,
+              pageOcrDone(),
+              props.contentVersion,
+            ] as const)
+          : null;
       },
       async (deps) => {
+        const mine = ++sequence;
+        layer.replaceChildren();
+        setOcrLines([]);
         if (!deps) return;
-        const sequence = ++fetchSequence;
         const [docId, revision, pageIndex] = deps;
+        let task: { cancel(): void } | undefined;
+        onCleanup(() => task?.cancel());
         try {
-          const native = await pdfNativeTextLines(docId, revision, pageIndex);
-          if (sequence !== fetchSequence) return;
-          if (native.length > 0) {
-            setLayerData({ lines: native, space: "raw" });
+          const pdf = await pdfEngine().getDocument(docId, revision);
+          if (mine !== sequence) return;
+          const page = await pdf.getPage(pageIndex + 1);
+          if (mine !== sequence) return;
+          const { TextLayer: PdfTextLayer } = await import("pdfjs-dist");
+          if (mine !== sequence) return;
+          const viewport = page.getViewport({ scale: untrack(() => props.zoom) });
+          const layerTask = new PdfTextLayer({
+            textContentSource: page.streamTextContent(),
+            container: layer,
+            viewport,
+          });
+          task = layerTask;
+          await layerTask.render();
+          if (mine !== sequence) return;
+          if (layer.querySelector("span")) {
+            const end = document.createElement("div");
+            end.className = "endOfContent";
+            layer.append(end);
             return;
           }
-          const ocr = await ocrPdfLines(docId, revision, pageIndex);
-          if (sequence !== fetchSequence) return;
-          setLayerData({ lines: ocr ?? [], space: "display" });
+          const lines = await invoke<OcrLine[] | null>("pdf_ocr_lines", {
+            docId,
+            expectedRevision: revision,
+            pageIndex,
+          });
+          if (mine !== sequence) return;
+          setOcrLines(lines ?? []);
         } catch (error) {
-          if (sequence !== fetchSequence) return;
-          console.warn("text-layer fetch failed", error);
-          setLayerData({ lines: [], space: "display" });
+          if (mine !== sequence) return;
+          if ((error as Error)?.name !== "AbortException")
+            console.warn("text-layer render failed", error);
         }
       },
     ),
   );
+
+  // `selecting` lets the endOfContent sentinel capture drags past the text.
+  const startSelecting = () => layer.classList.add("selecting");
+  const stopSelecting = () => layer.classList.remove("selecting");
 
   const match = () => {
     const selected = activeSearchMatch(),
@@ -133,27 +136,32 @@ export function TextLayer(props: Props) {
       : null;
   };
 
+  const ocrSpans = createMemo(() =>
+    ocrLines().map((line) => {
+      const fontPts = line.h * props.page.height;
+      const natural = naturalWidth(line.text, fontPts);
+      const target = line.w * props.page.width;
+      return {
+        line,
+        fontPts,
+        scaleX: natural > 0 && target > 0 ? target / natural : 1,
+      };
+    }),
+  );
+
   return (
     <>
-      <For each={match()?.hit.rectangles ?? []}>
-        {(rect, index) => {
-          const geometry = () =>
-            highlightGeometry(
-              props.page,
-              props.zoom,
-              props.rotation,
-              rect.space ?? match()?.hit.space ?? "raw",
-            );
-          return (
-            <div
-              class="search-mark-layer"
-              aria-hidden="true"
-              style={{
-                width: `${geometry().width}px`,
-                height: `${geometry().height}px`,
-                transform: geometry().transform,
-              }}
-            >
+      <Show when={match()}>
+        <div
+          class="search-mark-layer"
+          aria-hidden="true"
+          style={{
+            width: `${props.page.width * props.zoom}px`,
+            height: `${props.page.height * props.zoom}px`,
+          }}
+        >
+          <For each={match()?.hit.rectangles ?? []}>
+            {(rect, index) => (
               <span
                 class="search-location-mark"
                 ref={(el) => {
@@ -176,90 +184,45 @@ export function TextLayer(props: Props) {
                   height: `${rect.h * 100}%`,
                 }}
               />
-            </div>
-          );
-        }}
-      </For>
+            )}
+          </For>
+        </div>
+      </Show>
       <div
-        class="ocr-text-layer"
-        style={{
-          width: `${basePageWidth()}px`,
-          height: `${basePageHeight()}px`,
-          transform: rotationTransform(),
-        }}
-      >
-        <For each={layerData().lines}>
-          {(line) => (
-            <Line
-              line={line}
-              pageWidth={basePageWidth}
-              pageHeight={basePageHeight}
-            />
-          )}
-        </For>
-      </div>
+        ref={layer}
+        class="textLayer"
+        onPointerDown={startSelecting}
+        onPointerUp={stopSelecting}
+        onPointerLeave={stopSelecting}
+      />
+      <Show when={ocrSpans().length > 0}>
+        <div
+          class="ocr-text-layer"
+          style={{
+            "--scale-factor": props.zoom,
+            "--total-scale-factor": props.zoom,
+            width: `${props.page.width * props.zoom}px`,
+            height: `${props.page.height * props.zoom}px`,
+          }}
+        >
+          <For each={ocrSpans()}>
+            {({ line, fontPts, scaleX }) => (
+              <span
+                class="ocr-text-line"
+                style={{
+                  left: `${line.x * 100}%`,
+                  top: `${line.y * 100}%`,
+                  "font-size": `calc(${fontPts}px * var(--total-scale-factor))`,
+                  "line-height": `calc(${fontPts}px * var(--total-scale-factor))`,
+                  transform: `scaleX(${scaleX})`,
+                }}
+              >
+                {line.text}
+              </span>
+            )}
+          </For>
+        </div>
+      </Show>
     </>
-  );
-}
-
-interface LineProps {
-  line: OcrLine;
-  pageWidth: () => number;
-  pageHeight: () => number;
-}
-
-function Line(props: LineProps) {
-  let span!: HTMLSpanElement;
-  const [scaleX, setScaleX] = createSignal(1);
-
-  // Re-measure whenever the page dimensions change. `scrollWidth` reports
-  // the unscaled natural glyph width, while `targetWidth` is the bbox
-  // mapped into the current display. Applying `scaleX = target / natural`
-  // makes the rendered text exactly fill the bbox so the user's selection
-  // highlight matches the original PDF ink.
-  const measure = () => {
-    if (!span) return;
-    const target = props.line.w * props.pageWidth();
-    // Read the natural width with scaleX = 1; the previous transform is
-    // applied via CSS variable below so we can temporarily neutralise it
-    // by measuring `scrollWidth` (which is layout-only and ignores transforms).
-    const natural = span.scrollWidth;
-    if (natural <= 0 || target <= 0) {
-      setScaleX(1);
-      return;
-    }
-    setScaleX(target / natural);
-  };
-
-  onMount(() => {
-    // Wait one frame for the browser to lay out the text at the requested
-    // font-size before measuring; otherwise scrollWidth reads as 0 on
-    // first render in some webkit builds.
-    requestAnimationFrame(measure);
-  });
-
-  // Re-measure on zoom / page-size change.
-  createEffect(
-    on(
-      () => [props.pageWidth(), props.pageHeight()] as const,
-      () => requestAnimationFrame(measure),
-    ),
-  );
-
-  return (
-    <span
-      ref={span}
-      class="ocr-text-line"
-      style={{
-        left: `${props.line.x * props.pageWidth()}px`,
-        top: `${props.line.y * props.pageHeight()}px`,
-        height: `${props.line.h * props.pageHeight()}px`,
-        "font-size": `${props.line.h * props.pageHeight()}px`,
-        "line-height": `${props.line.h * props.pageHeight()}px`,
-        transform: `scaleX(${scaleX()})`,
-      }}
-    >
-      {props.line.text}
-    </span>
   );
 }

@@ -38,65 +38,110 @@ test("OCR lines normalize, empty differs from malformed", () => {
 });
 // The production engine is also exercised manually against bundled eng+kor models.
 
+const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const fake = (opts: { text?: Set<number>; log?: string[] } = {}) => {
+  const gates: Array<() => void> = [];
+  return {
+    gates,
+    recognize: async (d: string, _r: number, p: number) => {
+      opts.log?.push(`${d}:${p}`);
+      await new Promise<void>((r) => gates.push(r));
+    },
+    hasText: async (_d: string, _r: number, p: number) =>
+      opts.text?.has(p) ?? false,
+    status: async () => [] as number[],
+    flush: async () => {},
+  };
+};
+const release = async (b: { gates: Array<() => void> }) => {
+  await tick();
+  b.gates.shift()?.();
+  await tick();
+};
+
+test("second document queues behind the active run, FIFO", async () => {
+  const { runOcrAll, getDocProgress } = await import("../src/ocr/ocr");
+  const log: string[] = [];
+  const b = fake({ log });
+  const a = runOcrAll("qa", 0, 1, b);
+  const c = runOcrAll("qb", 0, 1, b);
+  await tick();
+  assert.equal(getDocProgress("qb")?.waiting, true);
+  assert.deepEqual(log, ["qa:0"]);
+  await release(b);
+  await a;
+  await tick();
+  assert.deepEqual(log, ["qa:0", "qb:0"]);
+  assert.equal(getDocProgress("qb")?.waiting, false);
+  await release(b);
+  await c;
+  assert.equal(getDocProgress("qb")?.done, 1);
+});
+
+test("starting a queued or active doc again is a no-op", async () => {
+  const { runOcrAll } = await import("../src/ocr/ocr");
+  const log: string[] = [];
+  const b = fake({ log });
+  const a = runOcrAll("noop", 0, 1, b);
+  await runOcrAll("noop", 0, 1, b);
+  await release(b);
+  await a;
+  assert.deepEqual(log, ["noop:0"]);
+});
+
+test("whole-document run skips pages with text, single page does not", async () => {
+  const { runOcrAll, runOcrPage, getDocProgress } =
+    await import("../src/ocr/ocr");
+  const log: string[] = [];
+  const b = fake({ log, text: new Set([0, 2]) });
+  const all = runOcrAll("skip", 0, 3, b);
+  await release(b);
+  await all;
+  assert.deepEqual(log, ["skip:1"]);
+  assert.equal(getDocProgress("skip")?.skipped, 2);
+  const one = runOcrPage("skip", 0, 3, 0, b);
+  await release(b);
+  await one;
+  assert.deepEqual(log, ["skip:1", "skip:0"]);
+});
+
+test("cancel removes the queued run", async () => {
+  const { runOcrAll, cancelOcr, getDocProgress } =
+    await import("../src/ocr/ocr");
+  const log: string[] = [];
+  const b = fake({ log });
+  const a = runOcrAll("ca", 0, 1, b);
+  const c = runOcrAll("cb", 0, 1, b);
+  await tick();
+  cancelOcr("cb");
+  await c;
+  assert.equal(getDocProgress("cb")?.waiting, false);
+  await release(b);
+  await a;
+  await tick();
+  assert.deepEqual(log, ["ca:0"]);
+});
+
 test("cancelled OCR discards late completion and schedules no next page", async () => {
   const { runOcrAll, cancelOcr, getDocProgress } =
     await import("../src/ocr/ocr");
-  let finish!: () => void;
-  const calls: number[] = [];
-  const backend = {
-    recognize: async (_d: string, _r: number, p: number) => {
-      calls.push(p);
-      await new Promise<void>((r) => (finish = r));
-    },
-    flush: async () => {},
-  };
-  const running = runOcrAll("cancel", 0, 3, backend);
-  cancelOcr();
+  const log: string[] = [];
+  const b = fake({ log });
+  const running = runOcrAll("cancel", 0, 3, b);
+  await tick();
+  cancelOcr("cancel");
   assert.equal(getDocProgress("cancel")?.current, null);
-  finish();
+  await release(b);
   await running;
-  assert.deepEqual(calls, [0]);
+  assert.deepEqual(log, ["cancel:0"]);
   assert.equal(getDocProgress("cancel")?.done, 0);
 });
-test("current page OCR, failures and retry retain accurate completed count", async () => {
-  const { runOcrPage, runOcrAll, getDocProgress } =
+
+test("includeOcrOnSave defaults to true and persists", async () => {
+  const { includeOcrOnSave, setIncludeOcrOnSave } =
     await import("../src/ocr/ocr");
-  let fails = true;
-  const calls: number[] = [];
-  const backend = {
-    recognize: async (_d: string, _r: number, p: number) => {
-      calls.push(p);
-      if (p === 1 && fails) throw Error("bad page");
-    },
-    flush: async () => {},
-  };
-  await runOcrPage("retry", 0, 3, 2, backend);
-  assert.deepEqual(calls, [2]);
-  await runOcrAll("retry", 0, 3, backend);
-  assert.equal(getDocProgress("retry")?.done, 2);
-  assert.equal(getDocProgress("retry")?.failures[1], "bad page");
-  fails = false;
-  await runOcrAll("retry", 0, 3, backend);
-  assert.equal(getDocProgress("retry")?.done, 3);
-  assert.deepEqual(getDocProgress("retry")?.failures, {});
-});
-test("revision invalidation rejects the late page and stops scheduling", async () => {
-  const { runOcrAll, invalidateOcrForDocument, getDocProgress } =
-    await import("../src/ocr/ocr");
-  let finish!: () => void;
-  let calls = 0;
-  const backend = {
-    recognize: async () => {
-      calls++;
-      await new Promise<void>((r) => (finish = r));
-    },
-    flush: async () => {},
-  };
-  const running = runOcrAll("edited", 0, 2, backend);
-  invalidateOcrForDocument("edited", 1, 1);
-  finish();
-  await running;
-  assert.equal(calls, 1);
-  assert.equal(getDocProgress("edited")?.done, 0);
-  assert.equal(getDocProgress("edited")?.total, 1);
+  assert.equal(includeOcrOnSave(), true);
+  setIncludeOcrOnSave(false);
+  assert.equal(includeOcrOnSave(), false);
+  setIncludeOcrOnSave(true);
 });

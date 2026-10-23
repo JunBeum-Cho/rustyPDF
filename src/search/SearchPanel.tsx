@@ -1,13 +1,88 @@
 import { For, Show, createEffect, createSignal, on, onCleanup } from "solid-js";
 import { activeTab, updateActiveTab } from "../state/document";
 import { setUiStore, uiStore } from "../state/ui";
-import { searchPdf, type SearchHit } from "../ipc/pdf";
+import type { OcrLine, SearchHit } from "../ipc/pdf";
+import { invoke } from "../platform/desktop";
+import { pdfEngine } from "../platform/pdf-engine";
 import "./search.css";
-import { nextSearchIndex } from "./model";
+import {
+  buildOcrText,
+  buildPageText,
+  itemRect,
+  mergeSearchHits,
+  nextSearchIndex,
+  searchPageText,
+  type PageText,
+} from "./model";
 import { setActiveSearchMatch } from "./store";
 import { ocrState } from "../ocr/ocr";
 
 const DEBOUNCE_MS = 220;
+const BATCH_PAGES = 20;
+
+/** Per (doc, revision) caches: native page text and the OCR lines. */
+interface DocCache {
+  key: string;
+  native: Map<number, Promise<PageText>>;
+  ocrKey: string;
+  ocr: Promise<Record<string, OcrLine[]>> | null;
+}
+let cache: DocCache | null = null;
+
+function docCache(docId: string, revision: number): DocCache {
+  const key = `${docId}:${revision}`;
+  if (cache?.key !== key) cache = { key, native: new Map(), ocrKey: "", ocr: null };
+  return cache;
+}
+
+/** One pdf_ocr_all_lines per revision (refetched only when OCR grew). */
+function ocrLines(docId: string, revision: number, doneCount: number) {
+  const c = docCache(docId, revision);
+  const ocrKey = String(doneCount);
+  if (!c.ocr || c.ocrKey !== ocrKey) {
+    c.ocrKey = ocrKey;
+    c.ocr = invoke<Record<string, OcrLine[]>>("pdf_ocr_all_lines", {
+      docId,
+      expectedRevision: revision,
+    });
+  }
+  return c.ocr;
+}
+
+function nativeText(docId: string, revision: number, pageIndex: number) {
+  const c = docCache(docId, revision);
+  let found = c.native.get(pageIndex);
+  if (!found) {
+    found = (async () => {
+      const pdf = await pdfEngine().getDocument(docId, revision);
+      const page = await pdf.getPage(pageIndex + 1);
+      const viewport = page.getViewport({ scale: 1 });
+      const content = await page.getTextContent();
+      const items = content.items.flatMap((item) =>
+        "str" in item
+          ? [{ str: item.str, hasEOL: item.hasEOL, rect: itemRect(item, viewport) }]
+          : [],
+      );
+      return buildPageText(items);
+    })();
+    found.catch(() => c.native.delete(pageIndex));
+    c.native.set(pageIndex, found);
+  }
+  return found;
+}
+
+async function searchOnePage(
+  docId: string,
+  revision: number,
+  pageIndex: number,
+  query: string,
+  ocr: Record<string, OcrLine[]>,
+): Promise<SearchHit[]> {
+  const native = await nativeText(docId, revision, pageIndex);
+  if (native.text.trim()) return searchPageText(pageIndex, native, query);
+  const lines = ocr[String(pageIndex)];
+  return lines?.length ? searchPageText(pageIndex, buildOcrText(lines), query) : [];
+}
 
 export function SearchPanel() {
   const [query, setQuery] = createSignal("");
@@ -17,8 +92,12 @@ export function SearchPanel() {
   const [activeIndex, setActiveIndex] = createSignal(-1);
 
   let inputEl: HTMLInputElement | undefined;
-  let searchSequence = 0;
+  /** Bumped by every new query/tab/revision; stale loops stop. */
+  let generation = 0;
   let pendingNavigation = false;
+  /** OCR pages already searched in the current generation. */
+  let ocrSeen = new Set<number>();
+  let fullSearchRunning = false;
 
   createEffect(
     on(
@@ -42,75 +121,109 @@ export function SearchPanel() {
     ),
   );
 
+  const stillCurrent = (mine: number, tabId: string, revision: number) => {
+    const live = activeTab();
+    return mine === generation && live?.tabId === tabId && live.revision === revision;
+  };
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   createEffect(() => {
-    const sequence = ++searchSequence;
+    const mine = ++generation;
     pendingNavigation = false;
     setError(null);
     setActiveSearchMatch(null);
     setHits([]);
     setActiveIndex(-1);
+    ocrSeen = new Set();
+    fullSearchRunning = false;
     const q = query().trim();
     const tab = activeTab();
     const open = uiStore.searchOpen;
-    // OCR replaces this Set after each completed page. Track that property
-    // so the existing query refreshes even when PDF revision is unchanged.
-    if (tab) void ocrState.byDoc[tab.docId]?.done;
     if (timer) clearTimeout(timer);
     onCleanup(() => {
       if (timer) clearTimeout(timer);
     });
     if (!open || !tab || q.length === 0) {
-      setHits([]);
-      setError(null);
       setLoading(false);
       return;
     }
     setLoading(true);
-    const docId = tab.docId;
-    const tabId = tab.tabId;
-    const revision = tab.revision;
+    const { docId, tabId, revision, pageCount } = tab;
     timer = setTimeout(async () => {
+      fullSearchRunning = true;
       try {
-        const result = await searchPdf(docId, revision, q);
-        // The user may have switched tabs while the search was in flight —
-        // or edited/requeried this document. Never let an older response
-        // paint its page indices over a newer generation or query.
-        const live = activeTab();
-        if (
-          sequence !== searchSequence ||
-          live?.tabId !== tabId ||
-          live.revision !== revision
-        )
-          return;
-        setHits(result);
-        setActiveIndex(-1);
-        if (pendingNavigation) {
-          pendingNavigation = false;
-          jumpTo(0);
+        const done = new Set(ocrState.byDoc[docId]?.done ?? []);
+        const ocr = await ocrLines(docId, revision, done.size);
+        let acc: SearchHit[] = [];
+        for (let from = 0; from < pageCount; from += BATCH_PAGES) {
+          const pages = Array.from(
+            { length: Math.min(BATCH_PAGES, pageCount - from) },
+            (_, i) => from + i,
+          );
+          const results = await Promise.all(
+            pages.map((p) => searchOnePage(docId, revision, p, q, ocr)),
+          );
+          if (!stillCurrent(mine, tabId, revision)) return;
+          acc = mergeSearchHits(acc, results.flat(), pages, -1).hits;
+          setHits(acc);
+          if (pendingNavigation && acc.length) {
+            pendingNavigation = false;
+            jumpTo(0);
+          }
         }
+        ocrSeen = done;
         setError(null);
       } catch (e) {
-        const live = activeTab();
-        if (
-          sequence !== searchSequence ||
-          live?.tabId !== tabId ||
-          live.revision !== revision
-        )
-          return;
+        if (!stillCurrent(mine, tabId, revision)) return;
         setError(e instanceof Error ? e.message : String(e));
         setHits([]);
       } finally {
-        const live = activeTab();
-        if (
-          sequence === searchSequence &&
-          live?.tabId === tabId &&
-          live.revision === revision
-        )
+        if (stillCurrent(mine, tabId, revision)) {
+          fullSearchRunning = false;
           setLoading(false);
+          void searchNewOcrPages();
+        }
       }
     }, DEBOUNCE_MS);
   });
+
+  /** OCR progress: search only newly recognised pages and merge. */
+  async function searchNewOcrPages() {
+    const tab = activeTab();
+    const q = query().trim();
+    if (!tab || !q || !uiStore.searchOpen || fullSearchRunning) return;
+    const done = ocrState.byDoc[tab.docId]?.done;
+    if (!done || ocrState.byDoc[tab.docId].revision !== tab.revision) return;
+    const fresh = [...done].filter((p) => !ocrSeen.has(p) && p < tab.pageCount);
+    if (fresh.length === 0) return;
+    const mine = generation;
+    const { docId, tabId, revision } = tab;
+    const seen = new Set(done);
+    try {
+      const ocr = await ocrLines(docId, revision, done.size);
+      const results = await Promise.all(
+        fresh.map((p) => searchOnePage(docId, revision, p, q, ocr)),
+      );
+      if (!stillCurrent(mine, tabId, revision)) return;
+      const merged = mergeSearchHits(hits(), results.flat(), fresh, activeIndex());
+      ocrSeen = seen;
+      setHits(merged.hits);
+      setActiveIndex(merged.activeIndex);
+    } catch {
+      /* the next OCR progress event retries */
+    }
+  }
+
+  createEffect(
+    on(
+      () => {
+        const tab = activeTab();
+        return tab ? ocrState.byDoc[tab.docId]?.done : undefined;
+      },
+      () => void searchNewOcrPages(),
+      { defer: true },
+    ),
+  );
 
   onCleanup(() => setActiveSearchMatch(null));
 

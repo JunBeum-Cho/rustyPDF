@@ -24,11 +24,25 @@ export function parseZoomEntry(value: string): number | null {
   const zoom = Number(normalized) / 100;
   return zoom >= .25 && zoom <= 4 ? zoom : null;
 }
-export function fitZoom(mode: Exclude<FitMode, 'manual'>, width: number, height: number, pageWidth: number, pageHeight: number, rotation: number): number {
-  const swap = rotation === 90 || rotation === 270;
-  const w = swap ? pageHeight : pageWidth, h = swap ? pageWidth : pageHeight;
-  const fit = mode === 'width' ? (width - 32) / w : Math.min((width - 32) / w, (height - 32) / h);
-  return Math.max(.25, Math.min(4, fit));
+export const pxPerPt = (zoom: number) => zoom * 4 / 3;
+export const ZOOM_STEPS = [.25, .5, .75, 1, 1.25, 1.5, 2, 3, 4];
+export function zoomIn() {
+  const cur = activeTab()?.zoom;
+  if (cur == null) return;
+  const next = ZOOM_STEPS.find(z => z > cur + 1e-6);
+  if (next != null) setManualZoom(next);
+}
+export function zoomOut() {
+  const cur = activeTab()?.zoom;
+  if (cur == null) return;
+  const prev = [...ZOOM_STEPS].reverse().find(z => z < cur - 1e-6);
+  if (prev != null) setManualZoom(prev);
+}
+/** Page dims in pt; returns user zoom (px fit / (4/3)) clamped to 0.25-4. */
+export function fitZoom(mode: Exclude<FitMode, 'manual'>, viewW: number, viewH: number, pageW: number, pageH: number): number {
+  const fitW = (viewW - 32) / pageW;
+  const px = mode === 'width' ? fitW : Math.min(fitW, (viewH - 32) / pageH);
+  return Math.max(.25, Math.min(4, px / (4 / 3)));
 }
 export function navigateToPage(index: number) {
   updateActiveTab(t => { t.currentPage = Math.max(0, Math.min(t.pageCount - 1, index)); t.navigationVersion = (t.navigationVersion ?? 0) + 1; });

@@ -11,6 +11,8 @@ import { ScanText } from "lucide-solid";
 import { activeTab } from "../state/document";
 import {
   cancelOcr,
+  includeOcrOnSave,
+  setIncludeOcrOnSave,
   ocrState,
   refreshOcrStatus,
   runOcrAll,
@@ -72,6 +74,7 @@ export function OcrButton() {
   const busy = () =>
     preparing() ||
     progress()?.current != null ||
+    progress()?.waiting === true ||
     (progress()?.queued.size ?? 0) > 0;
   async function start(all = false, retryPage?: number) {
     const t = tab();
@@ -102,7 +105,8 @@ export function OcrButton() {
     request++;
     setPreparing(false);
     setStopped(true);
-    cancelOcr();
+    const t = tab();
+    if (t) cancelOcr(t.docId);
   }
   return (
     <Show when={tab()}>
@@ -125,7 +129,9 @@ export function OcrButton() {
         >
           <ScanText size={16} />
           <span class="ocr-progress-label">
-            {busy()
+            {progress()?.waiting
+              ? `OCR 대기 중`
+              : busy()
               ? `OCR ${progress()?.done.size ?? 0}/${progress()?.total ?? tab()!.pageCount}`
               : `OCR${progress()?.done.size ? ` ${progress()!.done.size}/${progress()!.total}` : ""}`}
           </span>
@@ -157,6 +163,7 @@ export function OcrButton() {
           when={
             menuOpen() ||
             stopped() ||
+            (progress()?.skipped ?? 0) > 0 ||
             Object.keys(progress()?.failures ?? {}).length > 0
           }
         >
@@ -178,6 +185,16 @@ export function OcrButton() {
             }}
           >
             <Show when={menuOpen()}>
+              <label class="ocr-option">
+                <input
+                  type="checkbox"
+                  checked={includeOcrOnSave()}
+                  onChange={(e) =>
+                    setIncludeOcrOnSave(e.currentTarget.checked)
+                  }
+                />
+                저장할 때 인식한 텍스트 포함(검색 가능한 PDF)
+              </label>
               <button
                 type="button"
                 class="toolbar-btn"
@@ -186,6 +203,9 @@ export function OcrButton() {
               >
                 문서 전체 텍스트 인식
               </button>
+            </Show>
+            <Show when={(progress()?.skipped ?? 0) > 0}>
+              <p role="status">텍스트 있음 {progress()!.skipped}쪽 건너뜀</p>
             </Show>
             <Show when={stopped()}>
               <p role="status">

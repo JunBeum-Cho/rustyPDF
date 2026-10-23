@@ -1,4 +1,5 @@
 import { normalizeFontFamily } from "./fonts";
+import { cssColorToHex, isItalicStyle } from "./textFormat";
 import { contentBox } from "./coords";
 import type { Annotation, TextLayoutFragment, TextLayoutLine } from "./types";
 import { escapeAnnotationText, sanitizeAnnotationHtml } from "./sanitize";
@@ -102,17 +103,6 @@ const baselineOffset = (
   return offset;
 };
 
-const toHexColor = (value: string): string => {
-  const match = value.match(/-?\d+(\.\d+)?/g);
-  if (!match || match.length < 3) return "#000000";
-  const channel = (raw: string) => {
-    const n = Math.round(Number(raw));
-    const clamped = Math.min(255, Math.max(0, Number.isFinite(n) ? n : 0));
-    return clamped.toString(16).padStart(2, "0");
-  };
-  return `#${channel(match[0])}${channel(match[1])}${channel(match[2])}`;
-};
-
 const isBoldWeight = (weight: string): boolean => {
   const normalized = weight.trim().toLowerCase();
   if (normalized === "bold" || normalized === "bolder") return true;
@@ -176,11 +166,10 @@ const collectLines = (box: HTMLElement, host: HTMLElement): TextLayoutLine[] => 
       const ascent = baselineOffset(host, computed, fontSize, baselines);
       const shared = {
         fontSize,
-        color: toHexColor(computed.color),
+        color: cssColorToHex(computed.color),
         fontFamily,
         bold: isBoldWeight(computed.fontWeight),
-        italic:
-          computed.fontStyle === "italic" || computed.fontStyle.startsWith("oblique"),
+        italic: isItalicStyle(computed.fontStyle),
         underline: (computed.textDecorationLine || computed.textDecoration || "")
           .includes("underline"),
       };

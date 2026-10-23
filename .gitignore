@@ -149,3 +149,18 @@ resources/assets/
 public/pdfjs/
 public/fonts/
 .superlite/
+
+# superlite: dependency, build and cache folders
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/

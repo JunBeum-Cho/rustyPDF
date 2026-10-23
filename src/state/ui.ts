@@ -8,6 +8,8 @@ export interface UiState {
   sidebarOpen: boolean;
   sidebarWidth: number;
   searchOpen: boolean;
+  invertPagesInDark: boolean;
+  sidebarMode: "thumbnails" | "outline";
 }
 
 export const SIDEBAR_MIN_WIDTH = 110;
@@ -21,6 +23,8 @@ const defaults: UiState = {
   sidebarOpen: false,
   sidebarWidth: SIDEBAR_DEFAULT_WIDTH,
   searchOpen: false,
+  invertPagesInDark: false,
+  sidebarMode: "thumbnails",
 };
 
 export const clampSidebarWidth = (value: number) =>
@@ -53,6 +57,8 @@ createRoot(() => {
       sidebarOpen: uiStore.sidebarOpen,
       sidebarWidth: uiStore.sidebarWidth,
       searchOpen: uiStore.searchOpen,
+      invertPagesInDark: uiStore.invertPagesInDark,
+      sidebarMode: uiStore.sidebarMode,
     });
     try {
       localStorage.setItem(STORAGE_KEY, snapshot);

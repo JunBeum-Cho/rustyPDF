@@ -12,6 +12,10 @@ const common = {
     "@pdf-lib/fontkit",
     "pdf-lib",
     "exifr",
+    "subset-font",
+    "harfbuzzjs",
+    "fontverter",
+    "electron-updater",
   ],
   sourcemap: true,
 };

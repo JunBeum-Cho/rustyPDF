@@ -152,12 +152,16 @@ test("export embeds distinct bundled families and weights, reuses faces, and hon
   ] });
   const result = await PDFDocument.load(bytes);
   const { PDFName, PDFDict } = await import("pdf-lib");
-  const resources = result.getPage(0).node.Resources()!;
-  const fonts = resources.lookup(PDFName.of("Font"), PDFDict);
-  const refs = new Set(fonts.values().map((value) => value.toString()));
+  const xobjects = result.getPage(0).node.Resources()!.lookup(PDFName.of("XObject"), PDFDict);
+  const fontValues = xobjects.values().flatMap((ref) => {
+    const form = result.context.lookup(ref) as any;
+    const fonts = form.dict.lookup(PDFName.of("Resources"), PDFDict).lookup(PDFName.of("Font"), PDFDict);
+    return fonts.values();
+  });
+  const refs = new Set(fontValues.map((value) => value.toString()));
   assert.equal(refs.size, 3, "regular Sans, regular Serif, and reused bold Serif");
   const names = [...refs].map((ref) => {
-    const value = fonts.values().find((value) => value.toString() === ref)!;
+    const value = fontValues.find((value) => value.toString() === ref)!;
     const font = result.context.lookup(value, PDFDict);
     return font.get(PDFName.of("BaseFont"))!.toString();
   });

@@ -1,4 +1,4 @@
-import { createMemo } from "solid-js";
+import { createMemo, createSignal } from "solid-js";
 import {
   ArrowUpRight,
   Camera,
@@ -8,6 +8,7 @@ import {
   Minus,
   MousePointer2,
   PenLine,
+  Signature,
   Redo2,
   Square,
   Type,
@@ -32,6 +33,8 @@ import {
   sendBackward,
   setAnnotationFillColor,
 } from "./store";
+import { SignatureDialog } from "./SignatureDialog";
+import "./signature.css";
 import { ColorPalette } from "./ColorPalette";
 import { TextFormatToolbar } from "./TextFormatToolbar";
 import { getActiveEditor, setFontColor } from "./textFormat";
@@ -55,7 +58,15 @@ const tools: Array<{ tool: AnnotationTool; label: string; icon: () => JSX.Elemen
 ];
 
 export function AnnotationToolbar() {
-  const canExport = createMemo(() => Boolean(activeTab()));
+  const [signatureOpen, setSignatureOpen] = createSignal(false);
+  const readOnly = () => activeTab()?.readOnly ?? false;
+  const canExport = createMemo(() => Boolean(activeTab()) && !readOnly());
+  const statusLabel = () => {
+    const tab = activeTab();
+    if (tab?.readOnly) return "읽기 전용";
+    if (tab?.isUnsaved) return "저장 전 문서";
+    return annotationStore.dirty || tab?.pageDirty || tab?.formDirty ? "변경됨" : "저장됨";
+  };
   const context = createMemo(() => {
     const annotations = activeTab()?.annotations;
     const text = annotations?.items.some(
@@ -83,11 +94,22 @@ export function AnnotationToolbar() {
             title={`${label}${({ select: " (V)", text: " (T)", highlight: " (H)", pen: " (P)" } as Record<string, string>)[tool] ?? ""}`}
             aria-label={label}
             aria-pressed={annotationStore.tool === tool}
+            disabled={readOnly() && tool !== "select"}
           >
             {icon()}
           </button>
         ))}
+        <button
+          type="button"
+          onClick={() => setSignatureOpen(true)}
+          disabled={readOnly() || !activeTab()}
+          title="서명 추가"
+          aria-label="서명"
+        >
+          <Signature size={ICON_SIZE} />
+        </button>
       </div>
+      <SignatureDialog open={signatureOpen()} onClose={() => setSignatureOpen(false)} />
       <ColorPalette label={textSettings() ? "글자색" : "그리기 색상"}
         value={textSettings() ? annotationStore.textColor : annotationStore.color}
         onChange={(color) => {
@@ -183,25 +205,16 @@ export function AnnotationToolbar() {
         class="toolbar-btn"
         onClick={exportAnnotatedPdfFile}
         disabled={!canExport()}
-        title="보이는 주석과 인식이 완료된 OCR 검색 텍스트를 PDF에 넣어 공유합니다"
+        title="주석은 PDF 안에 저장되어 다른 뷰어에서도 보입니다"
       >
         <Download size={ICON_SIZE} />
         <span>내보내기</span>
       </button>
       <span
         class="annotation-save-status"
-        title="저장은 주석을 다시 편집할 수 있게 보관합니다. 주석 포함 PDF는 공유할 때 사용하세요."
-        classList={{ error: annotationStore.saveStatus === "error" }}
+        title="주석은 PDF 안에 저장되어 다른 뷰어에서도 보입니다"
       >
-        {annotationStore.saveStatus === "saving"
-          ? "저장 중"
-          : annotationStore.saveStatus === "error"
-            ? "저장 실패"
-            : activeTab()?.isUnsaved
-              ? "저장 전 문서"
-              : annotationStore.dirty || activeTab()?.pageDirty
-              ? "변경됨"
-              : "저장됨"}
+        {statusLabel()}
       </span>
     </div>
   );

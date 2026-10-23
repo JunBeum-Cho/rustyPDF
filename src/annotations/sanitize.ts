@@ -82,5 +82,8 @@ export const insertSafeEditorTransfer = (transfer: DataTransfer): void => {
   const safe = template.content.textContent?.trim()
     ? template.innerHTML
     : escapeAnnotationText(transfer.getData("text/plain"));
+  // Deliberately execCommand: it is the only way to insert at the caret
+  // while keeping the browser's native undo/redo stack and IME composition
+  // state; a manual Range insert would silently drop Ctrl+Z for the paste.
   if (safe) document.execCommand("insertHTML", false, safe);
 };

@@ -54,3 +54,19 @@ test("Korean contextual spaces keep the same advance in shaped runs and exported
     assert.equal(shaped, unshaped, `${family} ${bold ? "bold" : "regular"} must not widen contextual spaces`);
   }
 });
+
+test("subset fonts keep the full face's advances for covered text", async () => {
+  const { PDFDocument } = await import("pdf-lib");
+  const { createFontProvider } = await import("../electron/pdf-annotations");
+  const text = "한글 내보내기 RustyPDF";
+  const pdf = await PDFDocument.create();
+  const provider = createFontProvider(pdf, text);
+  const { readFile } = await import("node:fs/promises");
+  const { default: fontkit } = await import("@pdf-lib/fontkit");
+  for (const bold of [false, true]) {
+    const subset = await provider.get("Noto Sans KR", bold);
+    const full = fontkit.create(await readFile(new URL(`../resources/fonts/${fontFileName("Noto Sans KR", bold)}`, import.meta.url))) as any;
+    const expected = [...text].reduce((sum, ch) => sum + full.glyphForCodePoint(ch.codePointAt(0)).advanceWidth, 0) * 1000 / full.unitsPerEm;
+    assert.ok(Math.abs(subset.widthOfTextAtSize(text, 1000) - expected) < 1);
+  }
+});

@@ -7,6 +7,7 @@ const mockIPC = (handler: (command: string, args: any) => any) =>
   setDesktopForTests({
     invoke: handler,
     save: (options: unknown) => handler("plugin:dialog|save", { options }),
+    ask: async () => true,
   } as any);
 const clearMocks = () => setDesktopForTests(null);
 
@@ -14,6 +15,7 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>");
 Object.assign(globalThis, {
   window: dom.window,
   document: dom.window.document,
+  NodeFilter: dom.window.NodeFilter,
 });
 // IPC tests do not render; leave the viewer's stylesheet to Vite in the app.
 register(
@@ -36,6 +38,9 @@ const payload = {
     rotation: 0,
   })),
   fileSize: 1000,
+  readOnly: false,
+  readOnlyReason: null,
+  signed: false,
 };
 
 test("image document stays editable and unsaved until a destination is chosen", async () => {
@@ -53,6 +58,7 @@ test("image document stays editable and unsaved until a destination is chosen", 
     }
     if (cmd === "pdf_save_document")
       return { ...payload, path: args.targetPath, revision: 1 };
+    if (cmd === "draft_delete") return;
     throw new Error(`Unexpected command: ${cmd}`);
   });
   try {
@@ -141,7 +147,7 @@ test("image list preserves order, skips duplicates and rejects more than 100 ima
   setImagePaths([]);
   addImagePaths(["/a.png", "/b.JPG", "/a.png", "/unsupported.pdf"]);
   assert.deepEqual(imagePaths(), ["/a.png", "/b.JPG"]);
-  assert.match(imageImportError(), /PNG 또는 JPG/);
+  assert.match(imageImportError(), /지원하는 형식/);
   moveImage(1, -1);
   assert.deepEqual(imagePaths(), ["/b.JPG", "/a.png"]);
   moveImage(0, -1);
@@ -152,8 +158,7 @@ test("image list preserves order, skips duplicates and rejects more than 100 ima
   setImagePaths([]);
 });
 
-test("an edit during a pending annotation save stays dirty", async () => {
-  const { flushAnnotationSaveForTab } = await import("../src/ipc/pdf");
+test("an edit during a pending save stays dirty", async () => {
   const { addAnnotation, updateAnnotationTextLive } =
     await import("../src/annotations/store");
   let release!: () => void;
@@ -163,19 +168,20 @@ test("an edit during a pending annotation save stays dirty", async () => {
   });
   mockIPC(async (cmd) => {
     if (cmd === "pdf_create_from_images") return payload;
-    if (cmd === "annotations_save") {
+    if (cmd === "pdf_save_document") {
       started();
       await new Promise<void>((resolve) => {
         release = resolve;
       });
-      return;
+      return { ...payload, path: "/tmp/real.pdf", revision: 1 };
     }
+    if (cmd === "plugin:dialog|save") return "/tmp/real.pdf";
+    if (cmd === "draft_delete") return;
     throw new Error(`Unexpected command ${cmd}`);
   });
   try {
     await openImagesAsPdf(["/tmp/one.png"]);
     const tab = activeTab()!;
-    setDocumentStore("tabs", 0, "pageDirty", false);
     addAnnotation({
       id: "text",
       page: 0,
@@ -184,11 +190,12 @@ test("an edit during a pending annotation save stays dirty", async () => {
       style: { color: "#000", width: 1 },
       payload: { text: "before" },
     });
-    const pending = flushAnnotationSaveForTab(tab.tabId);
+    const pending = saveActivePdf();
     await saving;
     updateAnnotationTextLive("text", "after", "after");
     release();
-    await pending;
+    assert.equal(await pending, true);
+    assert.equal(activeTab()?.pageDirty, false);
     assert.equal(activeTab()?.annotations.dirty, true);
     assert.equal(activeTab()?.annotations.items[0].payload?.text, "after");
   } finally {

@@ -1,18 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  mkdtemp,
-  writeFile,
-  readFile,
-  rename,
-  copyFile,
-} from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rename, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PDFDocument } from "pdf-lib";
 import { PdfService } from "../electron/pdf-service";
-import { AnnotationStore } from "../electron/annotation-store";
+import { aliasName, loadLegacy } from "../electron/annotation-store";
 import { fingerprint } from "../electron/storage";
+
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "rustypdf-integration-"));
   const path = join(dir, "source.pdf");
@@ -21,232 +16,139 @@ async function fixture() {
   pdf.addPage([400, 500]);
   const bytes = await pdf.save();
   await writeFile(path, bytes);
-  const dataDir = join(dir, "data");
-  return { dir, path, bytes, dataDir };
+  return { dir, path, bytes, dataDir: join(dir, "data") };
 }
-const sidecar = (path: string, id = "annotation") => ({
-  version: 2,
-  sourcePath: path,
-  documentKey: "integration-owner",
-  updatedAt: "2026-10-21T00:00:00Z",
-  annotations: [
-    {
-      id,
-      page: 1,
-      type: "rect",
-      rect: { x: 20, y: 30, w: 40, h: 50 },
-      style: { color: "#123456", width: 2 },
-    },
-  ],
+const rect = (id = "annotation", page = 1) => ({
+  id,
+  page,
+  type: "rect",
+  rect: { x: 20, y: 30, w: 40, h: 50 },
+  style: { color: "#123456", width: 2 },
 });
+const args = (doc: { id: string; revision: number }, extra: object = {}) => ({
+  docId: doc.id,
+  expectedRevision: doc.revision,
+  ...extra,
+});
+
 test("editable lifecycle survives page edit, save, close and reopen", async () => {
   const f = await fixture();
   const service = new PdfService({ dataDir: f.dataDir });
   try {
     const opened: any = await service.invoke("pdf_open", { path: f.path });
-    const initial = sidecar(f.path);
-    await service.invoke("annotations_save", {
-      docId: opened.id,
-      expectedRevision: 0,
-      path: f.path,
-      data: initial,
-    });
-    const rotated: any = await service.invoke("pdf_rotate_pages", {
-      docId: opened.id,
-      expectedRevision: 0,
-      indices: [1],
-      direction: 1,
-    });
+    const rotated: any = await service.invoke("pdf_rotate_pages", args(opened, { indices: [1], direction: 1 }));
     assert.deepEqual(rotated.pageMapping, [0, 1]);
-    const mapped = {
-      ...initial,
-      documentRevision: rotated.revision + 1,
-      pageLayout: rotated.pages,
-      annotations: initial.annotations.map((a) => ({
-        ...a,
-        page: rotated.pageMapping[a.page],
-        rect: { x: 420, y: 20, w: 50, h: 40 },
-      })),
-    };
-    const saved: any = await service.invoke("pdf_save_document", {
-      docId: opened.id,
-      expectedRevision: 1,
-      targetPath: f.path,
-      sidecar: mapped,
-    });
-    assert.equal(saved.revision, 2);
-    assert.deepEqual(
-      Buffer.from(
-        await service.invoke("pdf_document_bytes", {
-          docId: opened.id,
-          expectedRevision: 2,
-        }),
-      ),
-      await readFile(f.path),
-    );
-    await assert.rejects(
-      service.invoke("pdf_document_bytes", {
-        docId: opened.id,
-        expectedRevision: 1,
+    const saved: any = await service.invoke(
+      "pdf_save_document",
+      args(rotated, {
+        targetPath: f.path,
+        annotations: { version: 3, annotations: [rect()] },
+        includeOcr: false,
       }),
-      /revision/i,
     );
+    assert.equal(saved.revision, 2);
+    const disk = await PDFDocument.load(await readFile(f.path));
+    assert.equal(disk.getPage(1).getRotation().angle, 90);
     await service.invoke("pdf_close", { docId: opened.id });
     const reopened: any = await service.invoke("pdf_open", { path: f.path });
     assert.equal(reopened.revision, 0);
-    assert.deepEqual(reopened.pages[1], {
-      index: 1,
-      width: 500,
-      height: 400,
-      rotation: 90,
-    });
-    const loaded: any = await service.invoke("annotations_load", {
-      docId: reopened.id,
-      expectedRevision: 0,
-      path: f.path,
-    });
-    assert.equal(loaded.status, "exact");
-    assert.deepEqual(loaded.sidecar.annotations, mapped.annotations);
-    const disk = await PDFDocument.load(await readFile(f.path));
-    assert.equal(disk.getPage(1).getRotation().angle, 90);
+    assert.deepEqual(reopened.pages[1], { index: 1, width: 500, height: 400, rotation: 90 });
+    assert.equal(reopened.annotations.length, 1);
+    assert.equal(reopened.annotations[0].id, "annotation");
+    assert.deepEqual(reopened.annotations[0].rect, rect().rect);
   } finally {
     await service.dispose();
   }
 });
-test("OCR v2 fingerprint cache reloads including valid empty pages, external bytes invalidate it", async () => {
+
+test("OCR cache reloads from userData including empty pages; changed bytes invalidate it", async () => {
   const f = await fixture();
-  await writeFile(
-    `${f.path}.ocr.json`,
-    JSON.stringify({
-      version: 2,
-      pdfFingerprint: fingerprint(f.bytes),
-      documentRevision: 99,
-      pages: {
-        0: {
-          text: "cached",
-          lines: [{ text: "cached", x: 0.1, y: 0.2, w: 0.3, h: 0.1 }],
-        },
-        1: { text: "", lines: [] },
-        9: { text: "invalid page", lines: [] },
-      },
-    }),
-  );
+  const first = { text: "cached", lines: [{ text: "cached", x: 0.1, y: 0.2, w: 0.3, h: 0.1 }] };
   const service = new PdfService({ dataDir: f.dataDir });
   try {
     const opened: any = await service.invoke("pdf_open", { path: f.path });
-    assert.deepEqual(
-      await service.invoke("pdf_ocr_status", {
-        docId: opened.id,
-        expectedRevision: 0,
-      }),
-      [0, 1],
-    );
-    assert.deepEqual(
-      await service.invoke("pdf_ocr_lines", {
-        docId: opened.id,
-        expectedRevision: 0,
-        pageIndex: 1,
-      }),
-      [],
-    );
+    const state = (service as any).documents.get(opened.id);
+    state.ocr.set(0, first);
+    state.ocr.set(1, { text: "", lines: [] });
+    state.ocrDirty = true;
     await service.invoke("pdf_close", { docId: opened.id });
+    const again: any = await service.invoke("pdf_open", { path: f.path });
+    assert.deepEqual(await service.invoke("pdf_ocr_status", args(again)), [0, 1]);
+    assert.deepEqual(await service.invoke("pdf_ocr_lines", args(again, { pageIndex: 1 })), []);
+    await service.invoke("pdf_close", { docId: again.id });
     const replacement = await PDFDocument.create();
     replacement.addPage([700, 800]);
     await writeFile(f.path, await replacement.save());
     const changed: any = await service.invoke("pdf_open", { path: f.path });
-    assert.deepEqual(
-      await service.invoke("pdf_ocr_status", {
-        docId: changed.id,
-        expectedRevision: 0,
-      }),
-      [],
-    );
-    assert.equal(
-      await service.invoke("pdf_ocr_lines", {
-        docId: changed.id,
-        expectedRevision: 0,
-        pageIndex: 0,
-      }),
-      null,
-    );
+    assert.deepEqual(await service.invoke("pdf_ocr_status", args(changed)), []);
+    assert.equal(await service.invoke("pdf_ocr_lines", args(changed, { pageIndex: 0 })), null);
   } finally {
     await service.dispose();
   }
 });
+
+test("legacy <pdf>.ocr.json is read once and never rewritten", async () => {
+  const f = await fixture();
+  const legacyPath = `${f.path}.ocr.json`;
+  const body = JSON.stringify({
+    version: 2,
+    pdfFingerprint: fingerprint(f.bytes),
+    documentRevision: 9,
+    pages: { 0: { text: "old", lines: [{ text: "old", x: 0.1, y: 0.2, w: 0.3, h: 0.1 }] }, 9: { text: "bad", lines: [] } },
+  });
+  await writeFile(legacyPath, body);
+  const service = new PdfService({ dataDir: f.dataDir });
+  try {
+    const opened: any = await service.invoke("pdf_open", { path: f.path });
+    assert.deepEqual(await service.invoke("pdf_ocr_status", args(opened)), [0]);
+    await service.invoke("pdf_close", { docId: opened.id });
+    assert.equal(await readFile(legacyPath, "utf8"), body);
+  } finally {
+    await service.dispose();
+  }
+});
+
 test("unfingerprinted legacy OCR is ignored", async () => {
   const f = await fixture();
-  await writeFile(
-    `${f.path}.ocr.json`,
-    JSON.stringify({ 0: { text: "unsafe legacy", lines: [] } }),
-  );
+  await writeFile(`${f.path}.ocr.json`, JSON.stringify({ 0: { text: "unsafe legacy", lines: [] } }));
   const service = new PdfService({ dataDir: f.dataDir });
   try {
     const opened: any = await service.invoke("pdf_open", { path: f.path });
-    assert.deepEqual(
-      await service.invoke("pdf_ocr_status", {
-        docId: opened.id,
-        expectedRevision: 0,
-      }),
-      [],
-    );
+    assert.deepEqual(await service.invoke("pdf_ocr_status", args(opened)), []);
   } finally {
     await service.dispose();
   }
 });
-test("legacy data directory migrates and moved ownership cannot attach to later copies", async () => {
+
+test("legacy sidecar in an old data directory loads read-only for a moved PDF", async () => {
   const f = await fixture();
-  const legacy = join(f.dir, "old-app");
-  const oldStore = new AnnotationStore(join(legacy, "annotations"));
-  await oldStore.save(f.path, f.bytes, sidecar(f.path));
+  const legacyDir = join(f.dir, "old-app");
+  const root = join(legacyDir, "annotations");
+  const hash = fingerprint(f.bytes);
+  await mkdir(join(root, "documents", hash), { recursive: true });
+  const sidecar = {
+    version: 2,
+    sourcePath: f.path,
+    pdfFingerprint: hash,
+    documentKey: "integration-owner",
+    annotations: [rect("old")],
+  };
+  await writeFile(join(root, "documents", hash, "integration-owner.notes.json"), JSON.stringify(sidecar));
+  await writeFile(join(root, aliasName(f.path)), JSON.stringify(sidecar));
   const moved = join(f.dir, "moved.pdf");
   await rename(f.path, moved);
-  const service = new PdfService({
-    dataDir: f.dataDir,
-    legacyDataDirs: [legacy],
-  });
+  const service = new PdfService({ dataDir: f.dataDir, legacyDataDirs: [legacyDir] });
   try {
     const opened: any = await service.invoke("pdf_open", { path: moved });
-    const recovered: any = await service.invoke("annotations_load", {
-      docId: opened.id,
-      expectedRevision: 0,
-      path: moved,
-    });
-    assert.equal(recovered.status, "recovered");
-    assert.equal(recovered.sidecar.sourcePath, moved);
-    await service.invoke("pdf_close", { docId: opened.id });
+    assert.equal(opened.annotations, null);
+    assert.equal(opened.legacy.annotations[0].id, "old");
+    // A later identical copy is not linked automatically.
     const copy = join(f.dir, "copy.pdf");
-    await copyFile(moved, copy);
-    const copied: any = await service.invoke("pdf_open", { path: copy });
-    const rejected: any = await service.invoke("annotations_load", {
-      docId: copied.id,
-      expectedRevision: 0,
-      path: copy,
-    });
-    assert.equal(rejected.status, "ambiguous");
-    assert.equal(rejected.sidecar, null);
-    const current = new AnnotationStore(join(f.dataDir, "annotations"));
-    assert.equal((await current.load(moved, f.bytes)).status, "exact");
-    const old = new AnnotationStore(join(legacy, "annotations"));
-    assert.equal((await old.load(copy, f.bytes)).sidecar, null);
-  } finally {
-    await service.dispose();
-  }
-});
-test("durable staged sidecar wins stale alias after interrupted alias publication", async () => {
-  const f = await fixture();
-  const store = new AnnotationStore(join(f.dataDir, "annotations"));
-  await store.save(f.path, f.bytes, sidecar(f.path, "old"));
-  await store.stage(f.path, f.bytes, sidecar(f.path, "new-durable"));
-  const service = new PdfService({ dataDir: f.dataDir });
-  try {
-    const opened: any = await service.invoke("pdf_open", { path: f.path });
-    const loaded: any = await service.invoke("annotations_load", {
-      docId: opened.id,
-      expectedRevision: 0,
-      path: f.path,
-    });
-    assert.equal(loaded.status, "exact");
-    assert.equal(loaded.sidecar.annotations[0].id, "new-durable");
+    await writeFile(copy, f.bytes);
+    const copied = await loadLegacy(copy, f.bytes, [root]);
+    assert.equal(copied?.annotations[0].id ?? null, "old", "moved owner is unique while the source is missing");
+    await writeFile(f.path, f.bytes);
+    assert.equal(await loadLegacy(copy, f.bytes, [root]), null, "ambiguous once the source exists again");
   } finally {
     await service.dispose();
   }

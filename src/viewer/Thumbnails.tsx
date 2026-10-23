@@ -6,7 +6,8 @@ import {
   createSignal,
   onCleanup,
 } from "solid-js";
-import { renderPage } from "../ipc/pdf";
+import { pdfEngine } from "../platform/pdf-engine";
+import "./thumbnails.css";
 import { activeTab, type PageMeta } from "../state/document";
 import { clampSidebarWidth, setUiStore, uiStore } from "../state/ui";
 import {
@@ -15,6 +16,9 @@ import {
   deleteSelectedPages,
   duplicateSelectedPages,
   extendPageSelection,
+  extractSelectedPages,
+  insertPdfAfter,
+  moveSelectedPages,
   pageClipboard,
   pastePagesAfter,
   setSinglePageSelection,
@@ -22,6 +26,8 @@ import {
 } from "./pageClipboard";
 
 import { shortcutLabel } from "../platform/shortcuts";
+import { clampMenuPosition, dropSlotForPointer } from "./pageUi";
+import { rotateSelectedPages } from "./pageRotation";
 
 interface ThumbnailCanvasProps {
   page: PageMeta;
@@ -29,44 +35,18 @@ interface ThumbnailCanvasProps {
   docId: string;
   revision: number;
   contentVersion: number;
-  rotation: 0 | 90 | 180 | 270;
+  /** CSS width shown right now. */
   thumbWidth: number;
+  /** CSS width to render at; trails thumbWidth by 200 ms while resizing. */
+  renderWidth: number;
 }
 
 const HORIZONTAL_PADDING = 32;
 const MIN_THUMB_WIDTH = 80;
+const RERENDER_DELAY_MS = 200;
 
-const thumbnailScale = (
-  page: PageMeta,
-  rotation: 0 | 90 | 180 | 270,
-  thumbWidth: number,
-) => {
-  const displayWidth =
-    rotation === 90 || rotation === 270 ? page.height : page.width;
-  return thumbWidth / displayWidth;
-};
-
-const thumbnailHeight = (
-  page: PageMeta,
-  rotation: 0 | 90 | 180 | 270,
-  thumbWidth: number,
-) => {
-  const displayHeight =
-    rotation === 90 || rotation === 270 ? page.width : page.height;
-  return displayHeight * thumbnailScale(page, rotation, thumbWidth);
-};
-
-function paintRgba(canvas: HTMLCanvasElement, buf: ArrayBuffer) {
-  const view = new DataView(buf);
-  const w = view.getUint32(0, false);
-  const h = view.getUint32(4, false);
-  const pixels = new Uint8ClampedArray(buf, 8, w * h * 4);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  if (canvas.width !== w) canvas.width = w;
-  if (canvas.height !== h) canvas.height = h;
-  ctx.putImageData(new ImageData(pixels, w, h), 0, 0);
-}
+const thumbnailHeight = (page: PageMeta, width: number) =>
+  (page.height * width) / page.width;
 
 let thumbnailObserver: IntersectionObserver | null = null;
 const thumbnailVisibility = new WeakMap<Element, (visible: boolean) => void>();
@@ -94,12 +74,7 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
   const [error, setError] = createSignal(false);
   const [retry, setRetry] = createSignal(0);
   const [visible, setVisible] = createSignal(false);
-  const scale = createMemo(() =>
-    thumbnailScale(props.page, props.rotation, props.thumbWidth),
-  );
-  const height = createMemo(() =>
-    thumbnailHeight(props.page, props.rotation, props.thumbWidth),
-  );
+  const height = createMemo(() => thumbnailHeight(props.page, props.thumbWidth));
 
   createEffect(() => {
     onCleanup(observeThumbnail(canvas, setVisible));
@@ -114,27 +89,25 @@ function ThumbnailCanvas(props: ThumbnailCanvasProps) {
     setError(false);
     // Same docId can point at new bytes after overwrite-save.
     props.contentVersion;
-    const currentScale = scale();
-    const docId = props.docId;
-    const idx = props.index;
-    const rot = props.rotation;
+    const cssWidth = props.renderWidth;
+    const cssHeight = thumbnailHeight(props.page, cssWidth);
+    const job = pdfEngine().renderPage(canvas, {
+      docId: props.docId,
+      revision: props.revision,
+      pageIndex: props.index,
+      cssWidth,
+      cssHeight,
+      dpr: window.devicePixelRatio || 1,
+    });
     let cancelled = false;
-    (async () => {
-      try {
-        const buf = await renderPage(
-          docId,
-          props.revision,
-          idx,
-          currentScale,
-          rot,
-        );
-        if (!cancelled) paintRgba(canvas, buf);
-      } catch (error) {
-        if (!cancelled) { setError(true); console.error("render thumbnail failed", idx, error); }
-      }
-    })();
+    job.promise.catch((err) => {
+      if (cancelled) return;
+      setError(true);
+      console.error("render thumbnail failed", props.index, err);
+    });
     onCleanup(() => {
       cancelled = true;
+      job.cancel();
     });
   });
 
@@ -154,6 +127,7 @@ interface MenuState {
   x: number;
   y: number;
   pageIndex: number;
+  clamped?: boolean;
 }
 
 export function Thumbnails() {
@@ -163,6 +137,43 @@ export function Thumbnails() {
     Math.max(MIN_THUMB_WIDTH, sidebarWidth() - HORIZONTAL_PADDING),
   );
   const [menu, setMenu] = createSignal<MenuState | null>(null);
+  const [renderWidth, setRenderWidth] = createSignal(thumbWidth());
+  const [dropSlot, setDropSlot] = createSignal<number | null>(null);
+  let menuEl: HTMLUListElement | undefined;
+  let listEl: HTMLDivElement | undefined;
+
+  // Re-render thumbnails 200 ms after the width stops changing.
+  createEffect(() => {
+    const width = thumbWidth();
+    const timer = setTimeout(() => setRenderWidth(width), RERENDER_DELAY_MS);
+    onCleanup(() => clearTimeout(timer));
+  });
+
+  // Keep the active thumbnail in view.
+  createEffect(() => {
+    const index = tab().currentPage;
+    queueMicrotask(() => {
+      listEl
+        ?.querySelector<HTMLElement>(`[data-page-index="${index}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  });
+
+  // Clamp the context menu to the viewport once its size is known.
+  createEffect(() => {
+    const state = menu();
+    if (!state || state.clamped || !menuEl) return;
+    const rect = menuEl.getBoundingClientRect();
+    const pos = clampMenuPosition(
+      state.x,
+      state.y,
+      rect.width,
+      rect.height,
+      window.innerWidth,
+      window.innerHeight,
+    );
+    setMenu({ ...state, ...pos, clamped: true });
+  });
 
   const closeMenu = () => setMenu(null);
 
@@ -228,6 +239,29 @@ export function Thumbnails() {
     setUiStore("sidebarWidth", clampSidebarWidth(168));
   };
 
+  const onDragStart = (event: DragEvent, index: number) => {
+    if (tab().readOnly) {
+      event.preventDefault();
+      return;
+    }
+    if (!tab().selectedPageIndices.includes(index)) setSinglePageSelection(index);
+    event.dataTransfer?.setData("application/x-rustypdf-pages", "1");
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  };
+  const onDragOver = (event: DragEvent, index: number) => {
+    if (!event.dataTransfer?.types.includes("application/x-rustypdf-pages")) return;
+    event.preventDefault();
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    setDropSlot(dropSlotForPointer(index, event.clientY, rect.top, rect.height));
+  };
+  const onDrop = (event: DragEvent) => {
+    const slot = dropSlot();
+    setDropSlot(null);
+    if (slot === null) return;
+    event.preventDefault();
+    void moveSelectedPages(slot);
+  };
+
   const selectedSet = createMemo(() => new Set(tab().selectedPageIndices));
 
   const runMenuAction = async (action: () => unknown) => {
@@ -239,12 +273,8 @@ export function Thumbnails() {
     <aside
       class="thumbnail-sidebar"
       aria-label="page thumbnails"
-      style={{
-        width: `${sidebarWidth()}px`,
-        flex: `0 0 ${sidebarWidth()}px`,
-      }}
     >
-      <div class="thumbnail-list">
+      <div class="thumbnail-list" ref={listEl}>
         <For each={tab().pages}>
           {(page, index) => (
             <button
@@ -253,7 +283,17 @@ export function Thumbnails() {
               classList={{
                 active: tab().currentPage === index(),
                 selected: selectedSet().has(index()),
+                "drop-before": dropSlot() === index(),
+                "drop-after":
+                  dropSlot() === index() + 1 && index() === tab().pageCount - 1,
               }}
+              data-page-index={index()}
+              draggable={!tab().readOnly}
+              onDragStart={(event) => onDragStart(event, index())}
+              onDragOver={(event) => onDragOver(event, index())}
+              onDragLeave={() => setDropSlot(null)}
+              onDragEnd={() => setDropSlot(null)}
+              onDrop={onDrop}
               onClick={(event) => {
                 const retry = event.currentTarget.querySelector<HTMLElement>(".thumbnail-error");
                 if (retry) { retry.click(); return; }
@@ -267,8 +307,8 @@ export function Thumbnails() {
                 docId={tab().docId}
                 revision={tab().revision}
                 contentVersion={tab().contentVersion}
-                rotation={tab().rotation}
                 thumbWidth={thumbWidth()}
+                renderWidth={renderWidth()}
               />
               <span>{index() + 1}</span>
             </button>
@@ -288,6 +328,7 @@ export function Thumbnails() {
         {(state) => (
           <ul
             class="thumbnail-context-menu"
+            ref={menuEl}
             style={{ left: `${state().x}px`, top: `${state().y}px` }}
             onPointerDown={(e) => e.stopPropagation()}
           >
@@ -319,6 +360,31 @@ export function Thumbnails() {
               <button onClick={() => runMenuAction(duplicateSelectedPages)}>
                 복제
                 <span class="kbd">{shortcutLabel("D")}</span>
+              </button>
+            </li>
+            <li>
+              <button onClick={() => runMenuAction(() => rotateSelectedPages(1))}>
+                시계 방향 회전
+              </button>
+            </li>
+            <li>
+              <button onClick={() => runMenuAction(() => rotateSelectedPages(-1))}>
+                반시계 방향 회전
+              </button>
+            </li>
+            <li class="separator" />
+            <li>
+              <button onClick={() => runMenuAction(extractSelectedPages)}>
+                새 PDF로 추출
+              </button>
+            </li>
+            <li>
+              <button
+                onClick={() =>
+                  runMenuAction(() => insertPdfAfter(state().pageIndex))
+                }
+              >
+                다른 PDF 삽입…
               </button>
             </li>
             <li class="separator" />

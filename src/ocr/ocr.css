@@ -36,3 +36,11 @@
   width: min(260px, calc(100vw - 16px));
   overflow-wrap: anywhere;
 }
+
+.ocr-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}

@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import {
   ChevronLeft,
   ChevronRight,
@@ -14,17 +14,21 @@ import {
   MoveHorizontal,
   Maximize,
   Search,
+  Printer,
+  List,
+  Contrast,
   Sun,
 } from "lucide-solid";
 import { activeTab, updateActiveTab } from "../state/document";
 import { applyTheme, setUiStore, uiStore } from "../state/ui";
-import { requestOpenPdfDialog, saveActivePdf } from "../ipc/pdf";
+import { openPdfDialog, saveActivePdf } from "../ipc/pdf";
+import { printActiveDocument } from "../print/print";
 import { OcrButton } from "../ocr/OcrButton";
 import { AnnotationToolbar } from "../annotations/AnnotationToolbar";
-import { rotateDocument } from "../viewer/pageRotation";
+import { rotateSelectedPages } from "../viewer/pageRotation";
 import "./toolbar.css";
 import { shortcutLabel } from "../platform/shortcuts";
-import { navigateToPage, navigationMode, parsePageEntry, parseZoomEntry, setManualZoom, setNavigationMode } from "../viewer/navigation";
+import { navigateToPage, navigationMode, parsePageEntry, parseZoomEntry, setManualZoom, setNavigationMode, zoomIn, zoomOut } from "../viewer/navigation";
 
 function cycleTheme() {
   const next =
@@ -37,26 +41,6 @@ function cycleTheme() {
   applyTheme(next);
 }
 
-const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
-
-function zoomIn() {
-  const tab = activeTab();
-  if (!tab) return;
-  setNavigationMode("manual");
-  const next = ZOOM_STEPS.find((z) => z > tab.zoom);
-  if (next)
-    setManualZoom(next);
-}
-
-function zoomOut() {
-  const tab = activeTab();
-  if (!tab) return;
-  setNavigationMode("manual");
-  const prev = [...ZOOM_STEPS].reverse().find((z) => z < tab.zoom);
-  if (prev)
-    setManualZoom(prev);
-}
-
 const ICON_SIZE = 16;
 
 function ThemeIcon() {
@@ -65,13 +49,26 @@ function ThemeIcon() {
   return <Monitor size={ICON_SIZE} />;
 }
 
+function useSystemDark() {
+  const mq = typeof window !== "undefined" ? window.matchMedia?.("(prefers-color-scheme: dark)") : undefined;
+  const [dark, setDark] = createSignal(mq?.matches ?? false);
+  onMount(() => {
+    const h = (e: MediaQueryListEvent) => setDark(e.matches);
+    mq?.addEventListener?.("change", h);
+    onCleanup(() => mq?.removeEventListener?.("change", h));
+  });
+  return dark;
+}
+
 export function Toolbar() {
+  const systemDark = useSystemDark();
+  const effectiveDark = () => uiStore.theme === "dark" || (uiStore.theme === "auto" && systemDark());
   return (
     <header class="toolbar">
       <div class="toolbar-group">
         <button
           class="toolbar-btn"
-          onClick={requestOpenPdfDialog}
+          onClick={() => void openPdfDialog()}
           title={`PDF 열기 (${shortcutLabel("O")})`}
         >
           <FolderOpen size={ICON_SIZE} />
@@ -84,24 +81,37 @@ export function Toolbar() {
           <div class="toolbar-group">
             <button
               class="toolbar-btn icon-only"
-              onClick={() => setUiStore("sidebarOpen", (open) => !open)}
+              onClick={() => { const close = uiStore.sidebarOpen && uiStore.sidebarMode === "thumbnails"; setUiStore("sidebarMode", "thumbnails"); setUiStore("sidebarOpen", !close); }}
               title={`썸네일 (${shortcutLabel("\\")})`}
-              classList={{ active: uiStore.sidebarOpen }}
+              classList={{ active: uiStore.sidebarOpen && uiStore.sidebarMode === "thumbnails" }}
             >
               <PanelLeft size={ICON_SIZE} />
             </button>
             <button
               class="toolbar-btn icon-only"
+              onClick={() => { setUiStore("sidebarMode", "outline"); setUiStore("sidebarOpen", true); }}
+              aria-label="목차"
+              aria-pressed={uiStore.sidebarOpen && uiStore.sidebarMode === "outline"}
+              title="목차"
+              classList={{ active: uiStore.sidebarOpen && uiStore.sidebarMode === "outline" }}
+            >
+              <List size={ICON_SIZE} />
+            </button>
+            <button
+              class="toolbar-btn icon-only"
               classList={{
-                "save-dirty": tab().pageDirty || tab().annotations.dirty,
+                "save-dirty": tab().pageDirty || tab().formDirty || tab().annotations.dirty,
               }}
+              disabled={tab().readOnly}
               onClick={(event) => void saveActivePdf(event.shiftKey)}
               title={`저장 — 다음에도 주석을 편집할 수 있습니다 (${shortcutLabel("S")})`}
               aria-label="저장"
             >
               <Save size={ICON_SIZE} />
             </button>
-            <button class="toolbar-btn icon-only" onClick={() => void saveActivePdf(true)} aria-label="다른 이름으로 저장" title={`다른 이름으로 저장 (${shortcutLabel("S", true)})`}><SaveAll size={ICON_SIZE} /></button>
+            <button class="toolbar-btn icon-only" disabled={tab().readOnly} onClick={() => void saveActivePdf(true)} aria-label="다른 이름으로 저장" title={`다른 이름으로 저장 (${shortcutLabel("S", true)})`}><SaveAll size={ICON_SIZE} /></button>
+            <button class="toolbar-btn icon-only" onClick={() => void printActiveDocument()} aria-label="인쇄" title={`인쇄 (${shortcutLabel("P")})`}><Printer size={ICON_SIZE} /></button>
+            <Show when={tab().readOnly}><span class="readonly-badge" title="이 문서는 읽기 전용입니다">읽기 전용</span></Show>
             <button class="toolbar-btn icon-only" onClick={() => setUiStore("searchOpen", v => !v)} aria-label="문서 검색" aria-pressed={uiStore.searchOpen} title={`검색 (${shortcutLabel("F")})`}><Search size={ICON_SIZE} /></button>
           </div>
         )}
@@ -116,6 +126,18 @@ export function Toolbar() {
         >
           <ThemeIcon />
         </button>
+        <Show when={effectiveDark()}>
+          <button
+            class="toolbar-btn icon-only"
+            aria-label="페이지 색 반전"
+            aria-pressed={uiStore.invertPagesInDark}
+            classList={{ active: uiStore.invertPagesInDark }}
+            onClick={() => setUiStore("invertPagesInDark", (v) => !v)}
+            title="어두운 테마에서 페이지 색 반전"
+          >
+            <Contrast size={ICON_SIZE} />
+          </button>
+        </Show>
       </div>
 
       <Show when={activeTab()}>
@@ -180,8 +202,9 @@ export function Toolbar() {
               <button class="toolbar-btn icon-only" aria-pressed={navigationMode() === "page"} onClick={() => setNavigationMode("page")} aria-label="페이지 맞춤" title="페이지 맞춤"><Maximize size={ICON_SIZE} /></button>
               <button
                 class="toolbar-btn icon-only"
-                onClick={() => void rotateDocument(1)}
-                title="문서 시계 방향 회전 (R)"
+                disabled={tab().readOnly}
+                onClick={() => void rotateSelectedPages(1)}
+                title="선택 페이지 회전 (R)"
               >
                 <RotateCw size={ICON_SIZE} />
               </button>

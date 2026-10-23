@@ -1,0 +1,23 @@
+.thumbnail-item {
+  position: relative;
+}
+
+.thumbnail-item.drop-before::before,
+.thumbnail-item.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent, #3b82f6);
+  pointer-events: none;
+}
+
+.thumbnail-item.drop-before::before {
+  top: -3px;
+}
+
+.thumbnail-item.drop-after::after {
+  bottom: -3px;
+}

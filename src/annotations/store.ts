@@ -1,9 +1,7 @@
-import { recordAnnotationDocumentHistory } from "../viewer/documentHistoryState";
+import { historyBusy, recordAnnotationDocumentHistory, pushHistoryEntry, cloneHistoryValue } from "../viewer/documentHistoryState";
 import {
   activeTab,
   documentStore,
-  emptyAnnotationTabState,
-  findTabIndex,
   setDocumentStore,
   updateActiveTab,
   updateTabById,
@@ -12,8 +10,6 @@ import {
 } from "../state/document";
 import type { Annotation, AnnotationTool } from "./types";
 import { sanitizeAnnotationHtml } from "./sanitize";
-
-const HISTORY_LIMIT = 80;
 
 const isTextColorContext = () => {
   if (documentStore.annotationUi.tool === "text") return true;
@@ -29,6 +25,7 @@ const cloneAnnotations = (items: Annotation[]) =>
     ...item,
     rect: item.rect ? { ...item.rect } : undefined,
     points: item.points?.map((point) => ({ ...point })),
+    quads: item.quads?.map((quad) => ({ ...quad })),
     style: { ...item.style },
     payload: item.payload ? { ...item.payload } : undefined,
   }));
@@ -59,12 +56,6 @@ export const annotationStore = {
   },
   get lastSavedAt(): string | null {
     return activeTab()?.annotations.lastSavedAt ?? null;
-  },
-  get history(): Annotation[][] {
-    return activeTab()?.annotations.history ?? [];
-  },
-  get future(): Annotation[][] {
-    return activeTab()?.annotations.future ?? [];
   },
   get tool(): AnnotationTool {
     return documentStore.annotationUi.tool;
@@ -99,6 +90,7 @@ export const createAnnotationId = () => {
 const mutateActiveAnnotations = (
   mutator: (state: AnnotationTabState) => void,
 ) => {
+  if (historyBusy()) return;
   updateActiveTab((tab) => {
     mutator(tab.annotations);
   });
@@ -106,17 +98,11 @@ const mutateActiveAnnotations = (
 
 export const recordAnnotationHistory = () => {
   const tab = activeTab();
-  if (tab) recordAnnotationDocumentHistory(tab.tabId);
-  mutateActiveAnnotations((state) => {
-    state.history.push(cloneAnnotations(state.items));
-    if (state.history.length > HISTORY_LIMIT) {
-      state.history.shift();
-    }
-    state.future = [];
-  });
+  if (tab && !historyBusy()) recordAnnotationDocumentHistory(tab.tabId);
 };
 
 const markDirty = () => {
+  if (historyBusy()) return;
   updateActiveTab(tab => { tab.editFuture = []; });
   mutateActiveAnnotations((state) => {
     state.editVersion += 1;
@@ -127,20 +113,26 @@ const markDirty = () => {
 };
 
 /**
- * Reset annotations for a specific tab — used on initial load and on doc
- * reload. Pass `tabId` because the active tab may already have changed by the
- * time async loads resolve.
+ * Add an annotation to a specific tab (the active tab may have changed by the
+ * time async work resolves). Records undo history on that tab. Returns false
+ * when the tab is gone or a history restore is in flight.
  */
-export const replaceAnnotationsForTab = (
-  tabId: string,
-  items: Annotation[],
-) => {
-  if (findTabIndex(tabId) < 0) return;
+export const addAnnotationToTab = (tabId: string, annotation: Annotation): boolean => {
+  if (historyBusy() || findTabIndexSafe(tabId) < 0) return false;
   updateTabById(tabId, (tab) => {
-    tab.annotations = emptyAnnotationTabState();
-    tab.annotations.items = cloneAnnotations(items);
+    pushHistoryEntry(tab.editHistory ??= [], { kind: "annotation", items: cloneHistoryValue(tab.annotations.items) });
+    tab.editFuture = [];
+    tab.annotations.items.push(annotation);
+    tab.annotations.selectedIds = [annotation.id];
+    tab.annotations.editVersion += 1;
+    tab.annotations.dirty = true;
+    tab.annotations.saveStatus = "idle";
+    tab.annotations.saveError = null;
   });
+  return true;
 };
+
+const findTabIndexSafe = (tabId: string) => documentStore.tabs.findIndex((tab) => tab.tabId === tabId);
 
 export const startEditingAnnotation = (id: string) => {
   mutateActiveAnnotations((state) => {
@@ -445,6 +437,7 @@ export const updateAnnotationTextLive = (
   html: string,
   text: string,
 ) => {
+  if (historyBusy()) return;
   updateActiveTab(tab => { tab.editFuture = []; });
   mutateActiveAnnotations((state) => {
     const item = state.items.find((a) => a.id === id);
@@ -472,6 +465,7 @@ export const finalizeAnnotationText = (
   text: string,
   stylePatch: Partial<Annotation["style"]> = {},
 ) => {
+  if (historyBusy()) return;
   updateActiveTab(tab => { tab.editFuture = []; });
   mutateActiveAnnotations((state) => {
     const item = state.items.find((a) => a.id === id);
@@ -545,9 +539,30 @@ export const cutSelectedAnnotations = (): boolean => {
   return true;
 };
 
+const annotationBounds = (item: Annotation) => {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  if (item.rect) {
+    xs.push(item.rect.x, item.rect.x + item.rect.w);
+    ys.push(item.rect.y, item.rect.y + item.rect.h);
+  }
+  for (const p of item.points ?? []) { xs.push(p.x); ys.push(p.y); }
+  if (xs.length === 0) return null;
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+};
+
+/** Shift along one axis, limited so [start, start + size] stays inside [0, limit]. */
+const clampShift = (start: number, size: number, shift: number, limit: number) => {
+  const max = Math.max(0, limit - size);
+  const target = Math.min(Math.max(start + shift, 0), max);
+  return target - start;
+};
+
 export const pasteAnnotations = (): boolean => {
   const tab = activeTab();
-  if (!tab || !annotationClipboard || annotationClipboard.items.length === 0) {
+  if (historyBusy() || !tab || !annotationClipboard || annotationClipboard.items.length === 0) {
     return false;
   }
   const targetPage = tab.currentPage;
@@ -555,22 +570,28 @@ export const pasteAnnotations = (): boolean => {
   const shift = PASTE_OFFSET * annotationClipboard.pasteCount;
   // Clone again so the pasted objects never share nested references with the
   // buffer — repeated pastes (and later moves/resizes) stay independent.
+  const meta = tab.pages[targetPage];
   const fresh = cloneAnnotations(annotationClipboard.items).map((item) => {
     item.id = createAnnotationId();
     item.page = targetPage;
+    let dx = shift;
+    let dy = shift;
+    if (meta) {
+      const bounds = annotationBounds(item);
+      if (bounds) {
+        dx = clampShift(bounds.x, bounds.w, shift, meta.width);
+        dy = clampShift(bounds.y, bounds.h, shift, meta.height);
+      }
+    }
     if (item.rect) {
-      item.rect = {
-        ...item.rect,
-        x: item.rect.x + shift,
-        y: item.rect.y + shift,
-      };
+      item.rect = { ...item.rect, x: item.rect.x + dx, y: item.rect.y + dy };
+      if (meta && !item.points) {
+        item.rect.w = Math.min(item.rect.w, meta.width);
+        item.rect.h = Math.min(item.rect.h, meta.height);
+      }
     }
-    if (item.points) {
-      item.points = item.points.map((p) => ({
-        x: p.x + shift,
-        y: p.y + shift,
-      }));
-    }
+    if (item.points) item.points = item.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+    if (item.quads) item.quads = item.quads.map((q) => ({ ...q, x: q.x + dx, y: q.y + dy }));
     return item;
   });
   recordAnnotationHistory();
@@ -589,69 +610,12 @@ export const duplicateSelectedAnnotations = (): boolean => {
   return pasteAnnotations();
 };
 
-export const undoAnnotations = (tabId = activeTab()?.tabId) => {
-  const tab = documentStore.tabs.find(candidate => candidate.tabId === tabId);
-  if (!tab || tab.annotations.history.length === 0 || tab.editHistory?.at(-1)?.kind === "page") return;
-  updateTabById(tab.tabId, current => {
-    if (current.editHistory?.at(-1)?.kind === "annotation") {
-      current.editHistory.pop();
-      (current.editFuture ??= []).push({kind:"annotation"});
-    }
-  });
-  updateTabById(tab.tabId, current => {
-    const state = current.annotations;
-    const previous = state.history.pop();
-    if (!previous) return;
-    state.future.push(cloneAnnotations(state.items));
-    state.items = previous;
-    state.selectedIds = [];
-    state.editingId = null;
-    state.editVersion += 1;
-    state.dirty = true;
-    state.saveStatus = "idle";
-    state.saveError = null;
-  });
-};
-
-export const redoAnnotations = (tabId = activeTab()?.tabId) => {
-  const tab = documentStore.tabs.find(candidate => candidate.tabId === tabId);
-  if (!tab || tab.annotations.future.length === 0 || tab.editFuture?.at(-1)?.kind === "page") return;
-  updateTabById(tab.tabId, current => {
-    if (current.editFuture?.at(-1)?.kind === "annotation") {
-      current.editFuture.pop();
-      (current.editHistory ??= []).push({kind:"annotation"});
-    }
-  });
-  updateTabById(tab.tabId, current => {
-    const state = current.annotations;
-    const next = state.future.pop();
-    if (!next) return;
-    state.history.push(cloneAnnotations(state.items));
-    state.items = next;
-    state.selectedIds = [];
-    state.editingId = null;
-    state.editVersion += 1;
-    state.dirty = true;
-    state.saveStatus = "idle";
-    state.saveError = null;
-  });
-};
-
 export const setAnnotationSaveStatusForTab = (
   tabId: string,
   saveStatus: SaveStatus,
 ) => {
   updateTabById(tabId, (tab) => {
     tab.annotations.saveStatus = saveStatus;
-  });
-};
-
-export const markAnnotationsSavedForTab = (tabId: string) => {
-  updateTabById(tabId, (tab) => {
-    tab.annotations.dirty = false;
-    tab.annotations.saveStatus = "saved";
-    tab.annotations.saveError = null;
-    tab.annotations.lastSavedAt = new Date().toISOString();
   });
 };
 
@@ -669,7 +633,6 @@ export const markAnnotationSaveErrorForTab = (
  * Remap annotation page indices after page-level edits. `mapping[oldPage]`
  * gives the new page index, or `null` if the page was removed. Annotations on
  * removed pages are dropped; surviving annotations are shifted accordingly.
- * Clears history because positions no longer line up with prior snapshots.
  */
 export const remapAnnotationsForTab = (
   tabId: string,
@@ -689,8 +652,6 @@ export const remapAnnotationsForTab = (
     // can observe a half-updated annotation layout.
     remapped.push(...cloneAnnotations(insertedAnnotations));
     tab.annotations.items = remapped;
-    tab.annotations.history = [];
-    tab.annotations.future = [];
     tab.annotations.selectedIds = [];
     tab.annotations.editingId = null;
     tab.annotations.editVersion += 1;

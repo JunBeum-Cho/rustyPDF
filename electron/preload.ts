@@ -19,7 +19,11 @@ contextBridge.exposeInMainWorld("desktop", {
   readFile: (path: string) => ipcRenderer.invoke("desktop:read", path),
   writeFile: (path: string, bytes: Uint8Array) =>
     ipcRenderer.invoke("desktop:write", path, bytes),
-  filePath: (file: File) => webUtils.getPathForFile(file),
+  filePath: (file: File) => {
+    const path = webUtils.getPathForFile(file);
+    if (path) ipcRenderer.send("desktop:grant", path);
+    return path;
+  },
   listen: (name: string, callback: (payload: unknown) => void) => {
     if (!EVENTS.has(name)) throw new Error("Unknown desktop event");
     const handler = (_event: unknown, payload: unknown) => callback(payload);

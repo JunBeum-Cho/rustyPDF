@@ -1,25 +1,22 @@
 import { Show, createEffect, createSignal, onCleanup } from "solid-js";
 import type { PageMeta } from "../state/document";
-import { renderPage } from "../ipc/pdf";
+import { pdfEngine } from "../platform/pdf-engine";
 import { AnnotationLayer } from "../annotations/AnnotationLayer";
 import { TextLayer } from "../ocr/TextLayer";
+import { PdfAnnotationOverlay } from "./PdfAnnotationOverlay";
 
 interface Props {
   page: PageMeta;
   index: number;
-  width: number; // rendered px
+  width: number; // rendered CSS px
   height: number;
   docId: string;
   revision: number;
   contentVersion: number;
-  zoom: number;
-  rotation: 0 | 90 | 180 | 270;
+  scale: number; // CSS px per PDF point
 }
 
-// Bucket the zoom so we don't re-render for every tiny change.
-function zoomBucket(z: number): number {
-  return Math.round(z * 4) / 4; // 25% steps
-}
+const RERENDER_DELAY_MS = 150;
 
 let observer: IntersectionObserver | null = null;
 const visibleHandlers = new WeakMap<Element, (visible: boolean) => void>();
@@ -32,39 +29,28 @@ function getObserver(): IntersectionObserver {
         visibleHandlers.get(entry.target)?.(entry.isIntersecting);
       }
     },
-    // Generous margin so the high-res render kicks off well before the page
-    // scrolls into view. The bounded PDF.js cache reuses nearby bitmaps.
+    // Generous margin so the render starts well before the page scrolls in.
     { rootMargin: "1200px 0px", threshold: 0 },
   );
   return observer;
 }
 
-function paintRgba(canvas: HTMLCanvasElement, buf: ArrayBuffer) {
-  if (buf.byteLength < 8) throw new Error("Incomplete page image");
-  const view = new DataView(buf);
-  const w = view.getUint32(0, false);
-  const h = view.getUint32(4, false);
-  // Guard against a header that disagrees with the payload length — otherwise
-  // the Uint8ClampedArray view below throws a RangeError.
-  if (w === 0 || h === 0 || buf.byteLength < 8 + w * h * 4) throw new Error("Invalid page image");
-  const pixels = new Uint8ClampedArray(buf, 8, w * h * 4);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  if (canvas.width !== w) canvas.width = w;
-  if (canvas.height !== h) canvas.height = h;
-  // putImageData is the fastest path here: no decode, no scaling, no alpha
-  // composite — just a straight blit into the backing store.
-  const imageData = new ImageData(pixels, w, h);
-  ctx.putImageData(imageData, 0, 0);
-}
-
 export function PageCanvas(props: Props) {
   let canvas!: HTMLCanvasElement;
   let frame!: HTMLDivElement;
-  let renderSeq = 0;
   const [error, setError] = createSignal(false);
   const [retry, setRetry] = createSignal(0);
   const [visible, setVisible] = createSignal(false);
+  let handle: { promise: Promise<void>; cancel(): void } | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rendered = false;
+
+  const cancelRender = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    handle?.cancel();
+    handle = null;
+  };
 
   createEffect(() => {
     const el = frame;
@@ -76,12 +62,13 @@ export function PageCanvas(props: Props) {
     });
   });
 
-  // Render at the bucketed zoom whenever this page is near the viewport.
-  // While the new render is in flight the canvas keeps the previous bitmap;
-  // CSS stretches it to the new size — better than a blank frame and much
-  // sharper than a half-resolution placeholder.
+  // Draw at CSS size x devicePixelRatio. The first render is immediate; later
+  // size changes wait for the zoom to settle, and the previous bitmap stays
+  // stretched by CSS in the meantime.
   createEffect(() => {
     if (!visible()) {
+      cancelRender();
+      rendered = false;
       if (canvas) {
         canvas.width = 0;
         canvas.height = 0;
@@ -89,31 +76,31 @@ export function PageCanvas(props: Props) {
       return;
     }
     retry();
-    setError(false);
-    // Same docId can point at new bytes after overwrite-save.
     props.contentVersion;
-    const bucket = zoomBucket(props.zoom);
-    const rot = props.rotation;
-    const idx = props.index;
-    const id = props.docId;
-
-    let cancelled = false;
-    const seq = ++renderSeq;
-    (async () => {
-      try {
-        const buf = await renderPage(id, props.revision, idx, bucket, rot);
-        // Skip if this run was superseded — a newer render (zoom/rotation/
-        // visibility change) must not be overwritten by an older one that
-        // resolves late.
-        if (cancelled || seq !== renderSeq) return;
-        paintRgba(canvas, buf);
-      } catch (err) {
-        if (!cancelled && seq === renderSeq) { setError(true); console.error("render page failed", idx, err); }
-      }
-    })();
-    onCleanup(() => {
-      cancelled = true;
-    });
+    const request = {
+      docId: props.docId,
+      revision: props.revision,
+      pageIndex: props.index,
+      cssWidth: props.width,
+      cssHeight: props.height,
+      dpr: window.devicePixelRatio || 1,
+    };
+    cancelRender();
+    const run = () => {
+      timer = undefined;
+      setError(false);
+      const current = pdfEngine().renderPage(canvas, request);
+      handle = current;
+      rendered = true;
+      current.promise.catch((err) => {
+        if (handle !== current) return;
+        setError(true);
+        console.error("render page failed", request.pageIndex, err);
+      });
+    };
+    if (rendered) timer = setTimeout(run, RERENDER_DELAY_MS);
+    else run();
+    onCleanup(cancelRender);
   });
 
   return (
@@ -134,18 +121,27 @@ export function PageCanvas(props: Props) {
           page={props.page}
           revision={props.revision}
           contentVersion={props.contentVersion}
-          zoom={props.zoom}
-          rotation={props.rotation}
+          zoom={props.scale}
+        />
+        <PdfAnnotationOverlay
+          docId={props.docId}
+          revision={props.revision}
+          pageIndex={props.index}
+          scale={props.scale}
         />
         <AnnotationLayer
           page={props.page}
           width={props.width}
           height={props.height}
-          zoom={props.zoom}
-          rotation={props.rotation}
+          zoom={props.scale}
         />
       </Show>
-      <Show when={error()}><div class="render-error" role="alert"><span>페이지를 표시할 수 없습니다.</span><button onClick={() => setRetry(value => value + 1)}>다시 시도</button></div></Show>
+      <Show when={error()}>
+        <div class="render-error" role="alert">
+          <span>페이지를 표시할 수 없습니다.</span>
+          <button onClick={() => setRetry((value) => value + 1)}>다시 시도</button>
+        </div>
+      </Show>
       <div class="page-number">{props.index + 1}</div>
     </div>
   );

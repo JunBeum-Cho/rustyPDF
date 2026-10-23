@@ -9,6 +9,8 @@ import {
   realpath,
 } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+export const LOCKED_MESSAGE =
+  "다른 프로그램이 파일을 사용 중이라 저장하지 못했습니다. 그 프로그램을 닫고 다시 시도해 주세요.";
 export const fingerprint = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 export async function exists(path: string) {
@@ -39,7 +41,13 @@ export async function atomicWrite(path: string, bytes: Uint8Array | string) {
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await rename(temp, path);
+    try {
+      await rename(temp, path);
+    } catch (error: any) {
+      if (["EPERM", "EBUSY", "EACCES"].includes(error?.code))
+        throw new Error(LOCKED_MESSAGE);
+      throw error;
+    }
     try {
       const dir = await open(dirname(path), "r");
       await dir.sync();
