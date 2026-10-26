@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PDFDocument } from "pdf-lib";
@@ -88,6 +89,28 @@ test("createPdfFromImages makes one page per image", async () => {
   const p = join(dir, "a.png");
   await writeFile(p, png);
   assert.equal((await PDFDocument.load(await createPdfFromImages([p, p]))).getPageCount(), 2);
+});
+test("bundled createPdfFromImages reads EXIF orientation from JPEG", async () => {
+  // tsx's loader papers over exifr's UMD interop, so run the app's esbuild CJS
+  // bundle in a plain node child process, as the Electron worker does.
+  const { build } = await import("esbuild");
+  const { common, worker } = await import("../scripts/electron-build-options.mjs");
+  const out = join(process.cwd(), "dist-electron", `test-image-pdf-${process.pid}.cjs`);
+  await build({ ...common, ...worker, outdir: undefined, outfile: out, sourcemap: false, logLevel: "silent", entryPoints: ["electron/image-pdf.ts"] });
+  try {
+    // 8x4 landscape pixels tagged Orientation=6, i.e. displayed portrait.
+    const jpg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/4QAiRXhpZgAATU0AKgAAAAgAAQESAAMAAAABAAYAAAAAAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2P/wAARCAAEAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDFoooryz7w/9k=", "base64");
+    const dir = await mkdtemp(join(tmpdir(), "po-"));
+    const p = join(dir, "rotated.jpg");
+    await writeFile(p, jpg);
+    const script = "require(process.argv[1]).createPdfFromImages([process.argv[2]]).then((b) => process.stdout.write(Buffer.from(b).toString('base64')))";
+    const { NODE_OPTIONS: _, ...env } = process.env;
+    const pdf = execFileSync(process.execPath, ["-e", script, out, p], { env, encoding: "utf8" });
+    const { width, height } = (await PDFDocument.load(Buffer.from(pdf, "base64"))).getPage(0).getSize();
+    assert.ok(height > width, `expected portrait page, got ${width}x${height}`);
+  } finally {
+    await rm(out, { force: true });
+  }
 });
 test("createPdfFromImages handles tiny JPEG with pooled buffer offset", async () => {
   const jpg = Buffer.from("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=", "base64");

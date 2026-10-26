@@ -62,7 +62,9 @@ export async function createPdfFromImages(
     if (!png && !jpg) throw new Error("Invalid image format");
     let orientation = 1;
     if (jpg) {
-      const exifr = await import("exifr");
+      // exifr ships a UMD main; Node's ESM import of it exposes only `default`.
+      const mod = await import("exifr");
+      const exifr = mod.default ?? mod;
       orientation = (await exifr.orientation(bytes)) ?? 1;
     }
     if (
