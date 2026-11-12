@@ -294,3 +294,9 @@ body.resizing-sidebar * {
 .outline-title { flex: 1; min-width: 0; padding: 3px 4px; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font: inherit; text-align: left; overflow-wrap: anywhere; }
 .outline-title:hover, .outline-toggle:hover { background: rgba(127, 127, 127, 0.2); }
 .outline-empty { margin: 12px 8px; opacity: 0.7; font-size: 12px; }
+
+/* Full-resolution redraw of the visible part of a downscaled page bitmap. */
+.page-canvas.page-detail-canvas {
+  position: absolute;
+  pointer-events: none;
+}

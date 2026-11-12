@@ -25,6 +25,10 @@ mac:
   target:
     - target: dmg
       arch: [arm64, x64]
+# NSIS 3.12 bundle: ships a native arm64 makensis for macOS. The legacy
+# default (3.0.4.1) is x86_64-only and fails on Apple Silicon without Rosetta.
+toolsets:
+  nsis: "1.2.1"
 win:
   icon: resources/icons/icon.ico
   target:

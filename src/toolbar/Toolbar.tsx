@@ -10,7 +10,6 @@ import {
   Plus,
   RotateCw,
   Save,
-  SaveAll,
   MoveHorizontal,
   Maximize,
   Search,
@@ -109,7 +108,6 @@ export function Toolbar() {
             >
               <Save size={ICON_SIZE} />
             </button>
-            <button class="toolbar-btn icon-only" disabled={tab().readOnly} onClick={() => void saveActivePdf(true)} aria-label="다른 이름으로 저장" title={`다른 이름으로 저장 (${shortcutLabel("S", true)})`}><SaveAll size={ICON_SIZE} /></button>
             <button class="toolbar-btn icon-only" onClick={() => void printActiveDocument()} aria-label="인쇄" title={`인쇄 (${shortcutLabel("P")})`}><Printer size={ICON_SIZE} /></button>
             <Show when={tab().readOnly}><span class="readonly-badge" title="이 문서는 읽기 전용입니다">읽기 전용</span></Show>
             <button class="toolbar-btn icon-only" onClick={() => setUiStore("searchOpen", v => !v)} aria-label="문서 검색" aria-pressed={uiStore.searchOpen} title={`검색 (${shortcutLabel("F")})`}><Search size={ICON_SIZE} /></button>

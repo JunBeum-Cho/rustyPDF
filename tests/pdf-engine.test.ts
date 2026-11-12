@@ -108,6 +108,25 @@ test("renderPage bounds pixels to 16M", async () => {
   }
 });
 
+test("renderRegion draws the region at full dpr aside, then swaps it in", async () => {
+  const previous = globalThis.document;
+  const { calls, page, mk } = fixture();
+  const engine = await engineWith(page);
+  try {
+    const canvas = mk();
+    const req = { docId: "d", revision: 0, pageIndex: 0, cssWidth: 6120, cssHeight: 7920, dpr: 2 };
+    await engine.renderRegion(canvas, req, { x: 1000, y: 2000, w: 800, h: 600 }).promise;
+    assert.deepEqual([canvas.width, canvas.height], [1600, 1200]);
+    const options = calls.render[0];
+    assert.notEqual(options.canvas, canvas);
+    assert.equal(options.viewport.width, 12240);
+    assert.deepEqual(options.transform, [1, 0, 0, 1, -2000, -4000]);
+    assert.equal(options.canvas.width, 0);
+  } finally {
+    (globalThis as any).document = previous;
+  }
+});
+
 test("capture keeps 600dpi on a small region and rejects bad regions", async () => {
   const previous = globalThis.document;
   const { calls, page } = fixture();

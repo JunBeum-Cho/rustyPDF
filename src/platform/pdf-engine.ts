@@ -178,6 +178,26 @@ export class PdfEngine {
     canvas: HTMLCanvasElement,
     req: RenderRequest,
   ): { promise: Promise<void>; cancel(): void } {
+    return this.draw(canvas, req);
+  }
+  /**
+   * Draw only `region` (CSS px of the page at cssWidth x cssHeight) at full
+   * device resolution. Used over a page whose whole-page bitmap had to be
+   * downscaled by boundedViewport. Always draws aside, so the visible canvas
+   * keeps its old bitmap until the new one is ready.
+   */
+  renderRegion(
+    canvas: HTMLCanvasElement,
+    req: RenderRequest,
+    region: { x: number; y: number; w: number; h: number },
+  ): { promise: Promise<void>; cancel(): void } {
+    return this.draw(canvas, req, region);
+  }
+  private draw(
+    canvas: HTMLCanvasElement,
+    req: RenderRequest,
+    region?: { x: number; y: number; w: number; h: number },
+  ): { promise: Promise<void>; cancel(): void } {
     let cancelled = false;
     let task: { promise: Promise<unknown>; cancel(): void } | undefined;
     let scratch: HTMLCanvasElement | undefined;
@@ -185,14 +205,26 @@ export class PdfEngine {
       const page = await this.page(req.docId, req.revision, req.pageIndex);
       if (cancelled) return;
       const dpr = Number.isFinite(req.dpr) && req.dpr > 0 ? req.dpr : 1;
-      const size = boundedViewport(req.cssWidth * dpr, req.cssHeight * dpr);
       const base = page.getViewport({ scale: 1 });
-      const viewport = page.getViewport({ scale: size.width / base.width });
+      let size: { width: number; height: number };
+      let viewport: ReturnType<PDFPageProxy["getViewport"]>;
+      let transform: number[] | undefined;
+      if (region) {
+        const bounded = boundedViewport(region.w * dpr, region.h * dpr);
+        const k = dpr * bounded.ratio;
+        size = bounded;
+        viewport = page.getViewport({ scale: (req.cssWidth * k) / base.width });
+        transform = [1, 0, 0, 1, -region.x * k, -region.y * k];
+      } else {
+        size = boundedViewport(req.cssWidth * dpr, req.cssHeight * dpr);
+        viewport = page.getViewport({ scale: size.width / base.width });
+      }
       // Draw straight into the visible canvas unless that would blank an
       // existing bitmap (a resize clears it); then draw aside and swap.
       const aside =
-        canvas.width > 0 &&
-        (canvas.width !== size.width || canvas.height !== size.height);
+        !!region ||
+        (canvas.width > 0 &&
+          (canvas.width !== size.width || canvas.height !== size.height));
       const target = aside ? document.createElement("canvas") : canvas;
       if (aside) scratch = target;
       target.width = size.width;
@@ -205,6 +237,7 @@ export class PdfEngine {
         canvas: target,
         canvasContext: context,
         viewport,
+        ...(transform ? { transform } : {}),
         background: "white",
         annotationMode: AnnotationMode.ENABLE_FORMS,
       });
